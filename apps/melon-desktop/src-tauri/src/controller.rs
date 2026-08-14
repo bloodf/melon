@@ -316,7 +316,7 @@ mod tests {
         AuthStatus, ControllerError, HealthStatus, ProbeInput, ProbeLimits, probe_external,
     };
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -348,6 +348,7 @@ mod tests {
     }
 
     struct Server {
+        address: SocketAddr,
         port: u16,
         requests: Arc<Mutex<Vec<(String, Option<String>)>>>,
         stop: Arc<AtomicBool>,
@@ -356,9 +357,10 @@ mod tests {
 
     impl Server {
         fn start(health: Reply, auth: Reply, models: Reply) -> Self {
-            let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind fixture");
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fixture");
             listener.set_nonblocking(true).expect("nonblocking fixture");
-            let port = listener.local_addr().expect("fixture address").port();
+            let address = listener.local_addr().expect("fixture address");
+            let port = address.port();
             let requests = Arc::new(Mutex::new(Vec::new()));
             let observed = Arc::clone(&requests);
             let stop = Arc::new(AtomicBool::new(false));
@@ -374,7 +376,7 @@ mod tests {
                     }
                 }
             });
-            Self { port, requests, stop, thread: Some(thread) }
+            Self { address, port, requests, stop, thread: Some(thread) }
         }
 
         fn url(&self, host: &str, prefix: &str) -> String {
@@ -459,11 +461,6 @@ mod tests {
         }
     }
 
-    fn local_ip() -> std::net::IpAddr {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind UDP");
-        socket.connect("192.0.2.1:9").expect("select local route");
-        socket.local_addr().expect("local route").ip()
-    }
 
     fn input(base_url: String, api_key: Option<&str>, allow_insecure_http: bool) -> ProbeInput {
         ProbeInput {
@@ -479,13 +476,23 @@ mod tests {
     }
 
     #[test]
+    fn fixtures_bind_loopback_only() {
+        let server = Server::start(
+            Reply::json(r#"{"ok":true}"#),
+            Reply::status(200),
+            Reply::json(r#"{"data":[{"id":"model-a"}]}"#),
+        );
+        assert_eq!(server.address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
     fn blocks_insecure_non_loopback_http_before_request() {
         let server = Server::start(
             Reply::json(r#"{"ok":true}"#),
             Reply::status(200),
             Reply::json(r#"{"data":[{"id":"model-a"}]}"#),
         );
-        let result = run(&input(server.url(&local_ip().to_string(), ""), None, false));
+        let result = run(&input(server.url("192.0.2.1", ""), None, false));
         assert_eq!(result, Err(ControllerError::InsecureHttpConfirmationRequired));
         assert!(server.observed().is_empty());
     }
