@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "melonVersion": "0.1.0",
+  "harness": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "sourceSha": "47f943859bef60e4160492346772ded9b24f765a",
+    "nodeVersion": "24.19.0",
+    "nodeDownloads": "https://nodejs.org/download/release/v24.19.0/",
+    "nodeChecksums": "https://nodejs.org/download/release/v24.19.0/SHASUMS256.txt"
+  },
+  "durindoor": {
+    "repository": "https://github.com/bloodf/durindoor",
+    "version": "3.15.2",
+    "gitHead": "1c14989f8ec6a56cce1df1bb2806e8ba885012f7",
+    "package": "https://registry.npmjs.org/durindoor/-/durindoor-3.15.2.tgz",
+    "packageIntegrity": "sha512-SMvQbUUop8j9K+FoCDJfDiM3p1zZsVzevzJypxaDp2YZyeOdUpOF6YIv4u7t6mEgmNsHCqy5mDPmW0xar0PqVQ==",
+    "nodeVersion": "20.20.2",
+    "nodeDownloads": "https://nodejs.org/download/release/v20.20.2/",
+    "nodeChecksums": "https://nodejs.org/download/release/v20.20.2/SHASUMS256.txt"
+  }
+}

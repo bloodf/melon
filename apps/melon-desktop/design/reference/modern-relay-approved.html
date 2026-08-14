@@ -1,0 +1,81 @@
+<style>
+  .direction-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; margin-top:24px; }
+  .direction { border:1px solid var(--border); border-radius:18px; overflow:hidden; cursor:pointer; background:var(--surface); transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease; }
+  .direction:hover { transform:translateY(-3px); box-shadow:0 18px 50px rgba(0,0,0,.15); }
+  .direction.selected { border-color:var(--accent); box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 30%,transparent); }
+  .app { min-height:390px; padding:14px; display:grid; grid-template-columns:72px 1fr; gap:12px; font-size:11px; }
+  .rail { border-radius:14px; padding:14px 10px; display:flex; flex-direction:column; align-items:center; gap:13px; }
+  .mark { width:35px; height:35px; display:grid; place-items:center; margin-bottom:8px; }
+  .rail-dot { width:24px; height:24px; border-radius:8px; opacity:.8; }
+  .workspace { border-radius:14px; padding:18px; position:relative; overflow:hidden; }
+  .eyebrow { text-transform:uppercase; letter-spacing:.16em; font-size:9px; font-weight:700; opacity:.7; }
+  .title { font-size:23px; line-height:1.05; margin:8px 0 5px; font-weight:700; }
+  .sub { opacity:.68; line-height:1.45; }
+  .choices { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:20px; }
+  .choice { border-radius:12px; padding:14px; min-height:94px; }
+  .choice strong { display:block; font-size:12px; margin-bottom:6px; }
+  .button { display:inline-block; border-radius:999px; padding:8px 13px; margin-top:18px; font-weight:700; }
+  .label { padding:15px 16px 18px; }
+  .label h3 { margin:0 0 6px; }
+  .label p { margin:0; font-size:13px; line-height:1.45; opacity:.72; }
+  .moon .app { background:#071014; color:#e8f3ef; }
+  .moon .rail { background:#0d1a1d; border:1px solid #284247; }
+  .moon .mark { border:1.5px solid #93dacd; border-radius:50% 50% 45% 45%; box-shadow:inset 0 -8px 15px rgba(87,205,189,.1); color:#a7eee1; font-family:serif; font-size:19px; }
+  .moon .rail-dot { background:#173034; border:1px solid #31585b; }
+  .moon .workspace { background:radial-gradient(circle at 75% 8%,rgba(121,229,211,.17),transparent 33%),linear-gradient(145deg,#111d20,#091315); border:1px solid #243b3e; }
+  .moon .title { font-family:Georgia,serif; font-weight:500; letter-spacing:.01em; }
+  .moon .choice { background:rgba(7,16,20,.65); border:1px solid #34565a; }
+  .moon .button { background:#a8e9dc; color:#0a191a; }
+  .parchment .app { background:#eadcb9; color:#243525; }
+  .parchment .rail { background:#153b2c; color:#f2e2b7; box-shadow:inset 0 0 0 1px #41634c; }
+  .parchment .mark { border:2px solid #d7b65d; transform:rotate(45deg); border-radius:9px; }
+  .parchment .mark span { transform:rotate(-45deg); font-family:Georgia,serif; }
+  .parchment .rail-dot { background:#2c5642; }
+  .parchment .workspace { background:linear-gradient(rgba(255,252,239,.78),rgba(250,242,216,.88)),repeating-linear-gradient(0deg,transparent,transparent 19px,rgba(56,76,52,.07) 20px); border:1px solid #b79f6c; }
+  .parchment .title { font-family:Georgia,serif; font-weight:500; }
+  .parchment .choice { background:#f8efd6; border:1px solid #b89a59; box-shadow:0 5px 12px rgba(75,56,25,.08); }
+  .parchment .button { background:#173f2e; color:#f6e8c2; }
+  .relay .app { background:#0a0d16; color:#f4f5fa; }
+  .relay .rail { background:#111625; border:1px solid #252b3d; }
+  .relay .mark { background:#d7ff4f; color:#10130a; border-radius:12px 12px 12px 3px; font-size:18px; font-weight:900; }
+  .relay .rail-dot { background:#20283b; }
+  .relay .workspace { background:linear-gradient(150deg,#141928,#0c101b); border:1px solid #292f41; }
+  .relay .workspace:after { content:""; position:absolute; width:180px; height:180px; right:-75px; top:-75px; border:1px solid rgba(215,255,79,.35); border-radius:50%; box-shadow:0 0 0 24px rgba(215,255,79,.025),0 0 0 48px rgba(215,255,79,.02); }
+  .relay .title { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:-.06em; }
+  .relay .choice { background:#101625; border:1px solid #30394f; }
+  .relay .button { background:#d7ff4f; color:#121508; }
+  @media (max-width:900px) { .direction-grid{grid-template-columns:1fr;} }
+</style>
+
+<h2>Choose Melon’s visual direction</h2>
+<p class="subtitle">All three keep the upstream Harness layout intact. The choice changes only product identity, palette, logo, typography accents, and the first-run connection wizard.</p>
+
+<div class="direction-grid">
+  <div class="direction moon" data-choice="moonlit-gate" onclick="toggleSelect(this)">
+    <div class="app">
+      <div class="rail"><div class="mark">M</div><div class="rail-dot"></div><div class="rail-dot"></div><div class="rail-dot"></div></div>
+      <div class="workspace">
+        <div class="eyebrow">Welcome to Melon</div><div class="title">Your door to every model.</div><div class="sub">Choose how Melon should reach DurinDoor.</div>
+        <div class="choices"><div class="choice"><strong>Install locally</strong>Private, automatic, on this machine.</div><div class="choice"><strong>Connect instance</strong>Use an existing HTTPS endpoint.</div></div><div class="button">Continue</div>
+      </div>
+    </div><div class="label"><h3>A — Moonlit Gate</h3><p>Quiet, dark, architectural. Silver-teal linework nods to a hidden gate without copying franchise art.</p></div>
+  </div>
+  <div class="direction parchment" data-choice="living-manuscript" onclick="toggleSelect(this)">
+    <div class="app">
+      <div class="rail"><div class="mark"><span>M</span></div><div class="rail-dot"></div><div class="rail-dot"></div><div class="rail-dot"></div></div>
+      <div class="workspace">
+        <div class="eyebrow">Melon Desktop</div><div class="title">Speak, friend.</div><div class="sub">Set the path to your DurinDoor gateway.</div>
+        <div class="choices"><div class="choice"><strong>Keep it here</strong>Install a local runtime for this session.</div><div class="choice"><strong>Open a known door</strong>Connect a gateway you already run.</div></div><div class="button">Enter Melon</div>
+      </div>
+    </div><div class="label"><h3>B — Living Manuscript</h3><p>Warm parchment, forest green, restrained gold. The most literary and explicitly fantasy-adjacent direction.</p></div>
+  </div>
+  <div class="direction relay" data-choice="modern-relay" onclick="toggleSelect(this)">
+    <div class="app">
+      <div class="rail"><div class="mark">M</div><div class="rail-dot"></div><div class="rail-dot"></div><div class="rail-dot"></div></div>
+      <div class="workspace">
+        <div class="eyebrow">Melon / Setup</div><div class="title">ONE CLIENT. ANY MODEL.</div><div class="sub">Route the Harness through DurinDoor.</div>
+        <div class="choices"><div class="choice"><strong>Local runtime</strong>Download and run beside Melon.</div><div class="choice"><strong>Remote gateway</strong>Connect with URL and API key.</div></div><div class="button">Configure</div>
+      </div>
+    </div><div class="label"><h3>C — Modern Relay</h3><p>Technical, high-contrast, and least literal. Acid-lime becomes the memorable Melon signal.</p></div>
+  </div>
+</div>

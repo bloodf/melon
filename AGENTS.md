@@ -147,3 +147,7 @@ Docs accompany every code change: update affected README and JSDoc contracts tog
 ## Vendoring policy
 
 `vendor/` packages are pinned source copies (manifest with upstream SHAs in [vendor/README.md](vendor/README.md)). Update via the sync procedure there; re-apply or retire the logged local modifications; rerun `pnpm run test && pnpm run build`.
+
+## Melon downstream
+
+Melon is an additive desktop fork. Keep upstream package names, Cordis composition, and agent behavior intact; confine downstream changes to `apps/melon-desktop`, release and synchronization tooling, documented product-facing seams, and one central theme override. UI work must run the real Tauri surface through the checked-in Gauntlet process; mocks do not count as final evidence. Every Melon change includes current documentation and applicable tests, and upstream synchronization lands through reviewed pull requests rather than direct `master` writes.

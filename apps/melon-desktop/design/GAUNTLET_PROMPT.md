@@ -1,0 +1,5 @@
+Build Melon's desktop UI so the approved Modern Relay direction becomes a coherent, production-quality setup flow and branded DeepSeek Harness shell without changing upstream behavior.
+
+Quality bar: at 1440×960 and 1024×768, blind A/B reviewers must prefer the real Melon build to the checked-in Modern Relay reference for hierarchy, legibility, state clarity, and brand coherence, with zero WCAG 2.2 AA contrast failures.
+
+Use the real running app and real screenshots. Divide the UI into the smallest pieces that can be improved and judged independently. For each important piece, fan out an ultracode builder and a separate harsh critic with fresh context. Each critic must inspect the live output, compare it directly with the bar—blind A/B when possible—return the biggest remaining gap, and trigger another round. Keep looping until Melon wins or I stop the run. Maintain a simple live progress page showing the evolving screenshots, verdict, and next gap. Only change UI required by this goal; preserve the approved architecture and every existing Harness interaction.
