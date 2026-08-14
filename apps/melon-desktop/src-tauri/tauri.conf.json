@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Melon",
+  "version": "0.1.0",
+  "identifier": "com.bloodf.melon",
+  "build": {
+    "beforeBuildCommand": "pnpm run build:frontend",
+    "beforeDevCommand": "pnpm run dev:frontend",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "capabilities": ["setup"],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:1420"
+    },
+    "windows": [
+      {
+        "label": "setup",
+        "title": "Melon",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 880,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage", "dmg", "nsis"]
+  }
+}

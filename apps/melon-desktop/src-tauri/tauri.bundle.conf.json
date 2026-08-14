@@ -1,0 +1,6 @@
+{
+  "bundle": {
+    "externalBin": ["binaries/node"],
+    "resources": ["resources/harness"]
+  }
+}
