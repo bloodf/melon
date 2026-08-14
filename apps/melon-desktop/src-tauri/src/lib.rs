@@ -1,4 +1,5 @@
 mod controller;
+mod config;
 
 use controller::{ConnectionController, activate, probe, shutdown, status};
 
