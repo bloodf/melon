@@ -294,4 +294,37 @@ mod tests {
         assert_eq!(store.load("endpoint").as_deref(), Some("secret"));
     }
 
+    #[test]
+    fn native_recovery_clears_session_secret_and_get_failure_is_empty() {
+        use super::{CredentialBackend, CredentialStore, Persistence};
+        use std::cell::{Cell, RefCell};
+        use std::collections::HashMap;
+
+        struct Recovering {
+            fail_next_set: Cell<bool>,
+            native: RefCell<HashMap<String, String>>,
+        }
+        impl CredentialBackend for Recovering {
+            fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+                if self.fail_next_set.replace(false) {
+                    Err("locked".into())
+                } else {
+                    self.native.borrow_mut().insert(account.into(), secret.into());
+                    Ok(())
+                }
+            }
+
+            fn get(&self, account: &str) -> Result<String, String> {
+                self.native.borrow().get(account).cloned().ok_or_else(|| "locked".into())
+            }
+        }
+
+        let backend = Recovering { fail_next_set: Cell::new(true), native: RefCell::new(HashMap::new()) };
+        let mut store = CredentialStore::new(backend);
+        assert_eq!(store.save("endpoint", "old-secret"), Persistence::SessionOnly);
+        assert_eq!(store.save("endpoint", "new-secret"), Persistence::Native);
+        assert_eq!(store.load("endpoint").as_deref(), Some("new-secret"));
+        assert_eq!(store.load("missing"), None);
+    }
+
 }
