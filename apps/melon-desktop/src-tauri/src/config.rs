@@ -1,5 +1,68 @@
 use url::{Host, Url};
 
+const CREDENTIAL_SERVICE: &str = "com.bloodf.melon";
+
+/// Secure credential operations keyed by a deterministic endpoint account.
+pub trait CredentialBackend {
+    fn set(&self, account: &str, secret: &str) -> Result<(), String>;
+    fn get(&self, account: &str) -> Result<String, String>;
+}
+
+/// OS-native credential storage for Melon API keys.
+pub struct NativeCredentialBackend;
+
+impl CredentialBackend for NativeCredentialBackend {
+    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+        keyring::Entry::new(CREDENTIAL_SERVICE, account)
+            .and_then(|entry| entry.set_password(secret))
+            .map_err(|error| error.to_string())
+    }
+
+    fn get(&self, account: &str) -> Result<String, String> {
+        keyring::Entry::new(CREDENTIAL_SERVICE, account)
+            .and_then(|entry| entry.get_password())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Persistence {
+    Native,
+    SessionOnly,
+}
+
+/// Keeps a key in memory when native credential storage is unavailable or locked.
+pub struct CredentialStore<B> {
+    backend: B,
+    session: std::collections::HashMap<String, String>,
+}
+
+impl<B: CredentialBackend> CredentialStore<B> {
+    pub fn new(backend: B) -> Self {
+        Self { backend, session: std::collections::HashMap::new() }
+    }
+
+    pub fn save(&mut self, account: &str, secret: &str) -> Persistence {
+        if self.backend.set(account, secret).is_ok() {
+            self.session.remove(account);
+            Persistence::Native
+        } else {
+            self.session.insert(account.to_owned(), secret.to_owned());
+            Persistence::SessionOnly
+        }
+    }
+
+    pub fn load(&self, account: &str) -> Option<String> {
+        self.session.get(account).cloned().or_else(|| self.backend.get(account).ok())
+    }
+}
+
+impl CredentialStore<NativeCredentialBackend> {
+    pub fn native() -> Self {
+        Self::new(NativeCredentialBackend)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EndpointError {
     Invalid,
@@ -19,6 +82,11 @@ pub struct NormalizedEndpoint {
 impl NormalizedEndpoint {
     pub fn as_str(&self) -> &str {
         self.url.as_str()
+    }
+
+    /// Returns stable non-secret keyring account text from this normalized endpoint.
+    pub fn credential_account(&self) -> String {
+        self.as_str().to_owned()
     }
 }
 
@@ -174,6 +242,14 @@ mod tests {
     }
 
     #[test]
+    fn credential_account_uses_normalized_endpoint() {
+        let origin = normalize_endpoint("https://EXAMPLE.com/").unwrap();
+        let explicit = normalize_endpoint("https://example.com/v1/").unwrap();
+        assert_eq!(origin.credential_account(), explicit.credential_account());
+        assert_eq!(origin.credential_account(), "https://example.com/v1");
+    }
+
+    #[test]
     fn writes_non_secret_connection_atomically() {
         use super::{ConnectionDocument, ConnectionMode, ModelRecord, write_connection};
         let root = std::env::temp_dir().join(format!("melon-config-test-{}", std::process::id()));
@@ -203,6 +279,19 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keyring_failure_uses_session_only_storage() {
+        use super::{CredentialBackend, CredentialStore, Persistence};
+        struct Locked;
+        impl CredentialBackend for Locked {
+            fn set(&self, _account: &str, _secret: &str) -> Result<(), String> { Err("locked".into()) }
+            fn get(&self, _account: &str) -> Result<String, String> { Err("locked".into()) }
+        }
+        let mut store = CredentialStore::new(Locked);
+        assert_eq!(store.save("endpoint", "secret"), Persistence::SessionOnly);
+        assert_eq!(store.load("endpoint").as_deref(), Some("secret"));
     }
 
 }
