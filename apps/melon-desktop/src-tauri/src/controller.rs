@@ -30,6 +30,12 @@ struct ProbeLimits {
 }
 
 const PROCESS_STOP_GRACE: Duration = Duration::from_secs(2);
+const SHUTDOWN_BUDGET: Duration = Duration::from_millis(10_250 + 4 * 6_000);
+const MAX_OWNED_TREES: u32 = 4;
+const RECOVERABLE_CLEANUP: &str = "A started process could not be stopped; retry shutdown";
+const RECOVERABLE_QUERY: &str = "A started process could not be checked; retry shutdown";
+const RECOVERABLE_SHUTDOWN: &str = "Started process shutdown did not complete; retry shutdown";
+
 
 trait OwnedTree: Send {
     fn is_running(&mut self) -> io::Result<bool>;
@@ -82,6 +88,7 @@ pub struct ConnectionController {
     state: Mutex<ControllerState>,
     key_persistence_available: bool,
     stop_grace: Duration,
+    shutdown_budget: Duration,
 }
 
 impl Default for ConnectionController {
@@ -90,6 +97,7 @@ impl Default for ConnectionController {
             state: Mutex::new(ControllerState::default()),
             key_persistence_available: false,
             stop_grace: PROCESS_STOP_GRACE,
+            shutdown_budget: SHUTDOWN_BUDGET,
         }
     }
 }
@@ -103,6 +111,9 @@ impl ConnectionController {
         let mut state = self.lock();
         if state.shutting_down {
             return Err(ControllerError::ShuttingDown);
+        }
+        if state.retirement_active || !state.retiring.is_empty() {
+            return Err(ControllerError::CleanupPending);
         }
         if state.mutating {
             return Err(ControllerError::Busy);
@@ -121,7 +132,7 @@ impl ConnectionController {
 
     fn status_snapshot(&self) -> ControllerStatus {
         let mut state = self.lock();
-        let mut query_error = None;
+        let mut query_error = false;
         let mut running = state.teardown_harness
             || state.teardown_managed
             || state.teardown_retiring
@@ -131,8 +142,8 @@ impl ConnectionController {
             query_owned_processes(owned, &mut running, &mut query_error);
         }
         state.retiring.retain(|owned| !owned.is_empty());
-        if query_error.is_some() {
-            state.recoverable_error = query_error;
+        if query_error && state.recoverable_error.is_none() {
+            state.recoverable_error = Some(RECOVERABLE_QUERY.into());
         }
         ControllerStatus {
             key_persistence_available: self.key_persistence_available,
@@ -141,9 +152,7 @@ impl ConnectionController {
         }
     }
     pub fn shutdown(&self) -> Result<(), ControllerError> {
-        let retirement_deadline = std::time::Instant::now()
-            + self.stop_grace.saturating_mul(4)
-            + Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + self.shutdown_budget;
         let mut owns_shutdown = false;
         let mut owned_sets = loop {
             let mut state = self.lock();
@@ -157,10 +166,10 @@ impl ConnectionController {
             }
             if state.retirement_active || state.mutating {
                 drop(state);
-                if std::time::Instant::now() >= retirement_deadline {
+                if std::time::Instant::now() >= deadline {
                     let mut state = self.lock();
                     state.shutdown_active = false;
-                    state.recoverable_error = Some("Connection operation did not finish before shutdown deadline".into());
+                    state.recoverable_error = Some(RECOVERABLE_SHUTDOWN.into());
                     return Err(ControllerError::ShutdownFailed);
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -179,7 +188,7 @@ impl ConnectionController {
 
         let mut first_error = None;
         for owned in &mut owned_sets {
-            if let Some(error) = stop_and_prune(owned, self.stop_grace) {
+            if let Some(error) = stop_and_prune_until(owned, self.stop_grace, deadline) {
                 first_error.get_or_insert(error);
             }
         }
@@ -190,40 +199,54 @@ impl ConnectionController {
         state.teardown_retiring = false;
         state.teardown_managed = false;
         state.retiring = owned_sets;
-        match first_error {
-            Some(error) => {
-                state.recoverable_error = Some(error.to_string());
-                Err(ControllerError::ShutdownFailed)
-            }
-            None => {
-                state.recoverable_error = None;
-                Ok(())
-            }
+        if first_error.is_some() {
+            state.recoverable_error = Some(RECOVERABLE_SHUTDOWN.into());
+            Err(ControllerError::ShutdownFailed)
+        } else {
+            state.recoverable_error = None;
+            Ok(())
         }
     }
 
     #[cfg(test)]
     fn for_test(key_persistence_available: bool, stop_grace: Duration) -> Self {
-        Self { state: Mutex::new(ControllerState::default()), key_persistence_available, stop_grace }
+        Self {
+            state: Mutex::new(ControllerState::default()),
+            key_persistence_available,
+            stop_grace,
+            shutdown_budget: stop_grace.saturating_mul(4) + Duration::from_millis(250),
+        }
     }
 }
 
 fn query_owned_processes(
     owned: &mut OwnedProcesses,
     running: &mut bool,
-    query_error: &mut Option<String>,
+    query_error: &mut bool,
 ) {
     for tree in [&mut owned.harness, &mut owned.managed_durindoor] {
         match tree.as_mut().map(|tree| tree.is_running()) {
             Some(Ok(true)) => *running = true,
             Some(Ok(false)) => *tree = None,
-            Some(Err(error)) => {
+            Some(Err(_)) => {
                 *running = true;
-                query_error.get_or_insert_with(|| error.to_string());
+                *query_error = true;
             }
             None => {}
         }
     }
+}
+
+
+fn stop_tree_until(
+    tree: &mut Option<Box<dyn OwnedTree>>,
+    grace: Duration,
+    deadline: std::time::Instant,
+) -> Option<io::Error> {
+    if tree.is_some() && std::time::Instant::now() >= deadline {
+        return Some(io::Error::new(io::ErrorKind::TimedOut, "controller shutdown budget exhausted"));
+    }
+    stop_tree(tree, grace)
 }
 
 fn stop_tree(tree: &mut Option<Box<dyn OwnedTree>>, grace: Duration) -> Option<io::Error> {
@@ -247,14 +270,39 @@ fn stop_and_prune(owned: &mut OwnedProcesses, grace: Duration) -> Option<io::Err
     first_error
 }
 
+fn stop_and_prune_until(
+    owned: &mut OwnedProcesses,
+    grace: Duration,
+    deadline: std::time::Instant,
+) -> Option<io::Error> {
+    let mut first_error = stop_tree_until(&mut owned.harness, grace, deadline);
+    if let Some(error) = stop_tree_until(&mut owned.managed_durindoor, grace, deadline) {
+        first_error.get_or_insert(error);
+    }
+    first_error
+}
+
 fn retain_cleanup_survivors(
     controller: &ConnectionController,
     attempted: &mut OwnedProcesses,
 ) -> Option<io::Error> {
-    let error = stop_and_prune(attempted, controller.stop_grace);
-    if !attempted.is_empty() {
-        let survivor = std::mem::take(attempted);
-        controller.lock().retiring.push(survivor);
+    let mut detached = std::mem::take(attempted);
+    {
+        let mut state = controller.lock();
+        state.retirement_active = true;
+        state.teardown_harness |= detached.harness.is_some();
+        state.teardown_managed |= detached.managed_durindoor.is_some();
+    }
+    let error = stop_and_prune(&mut detached, controller.stop_grace);
+    let mut state = controller.lock();
+    if !detached.is_empty() {
+        state.retiring.push(detached);
+    }
+    state.retirement_active = false;
+    state.teardown_harness = false;
+    state.teardown_managed = false;
+    if error.is_some() {
+        state.recoverable_error = Some(RECOVERABLE_CLEANUP.into());
     }
     error
 }
@@ -282,32 +330,31 @@ impl Operation<'_> {
             }
             let replaced = std::mem::replace(&mut state.owned, attempted);
             state.retirement_active = !replaced.is_empty();
+            state.teardown_harness = replaced.harness.is_some();
+            state.teardown_managed = replaced.managed_durindoor.is_some();
+            state.teardown_retiring = !replaced.is_empty();
             replaced
         };
         let error = stop_and_prune(&mut replaced, self.controller.stop_grace);
         let mut state = self.controller.lock();
-        if state.shutting_down {
-            state.mutating = false;
-            self.active = false;
-            if let Some(error) = error {
-                state.recoverable_error = Some(error.to_string());
-            }
-            if !replaced.is_empty() {
-                state.retiring.push(replaced);
-            }
-            state.retirement_active = false;
-            return Err(ControllerError::ShuttingDown);
-        }
-        if let Some(error) = error {
-            state.recoverable_error = Some(error.to_string());
+        let shutting_down = state.shutting_down;
+        if error.is_some() {
+            state.recoverable_error = Some(RECOVERABLE_CLEANUP.into());
         }
         if !replaced.is_empty() {
             state.retiring.push(replaced);
         }
         state.retirement_active = false;
+        state.teardown_harness = false;
+        state.teardown_managed = false;
+        state.teardown_retiring = false;
         state.mutating = false;
         self.active = false;
-        Ok(())
+        if shutting_down {
+            Err(ControllerError::ShuttingDown)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -402,6 +449,7 @@ pub enum ControllerError {
     Busy,
     ShutdownFailed,
     ShuttingDown,
+    CleanupPending,
 }
 
 impl Serialize for ControllerError {
@@ -416,6 +464,7 @@ impl Serialize for ControllerError {
             Self::Busy => ("busy", "Another connection operation is already running"),
             Self::AuthProbeFailed => ("auth-unverified", "API key could not be verified"),
             Self::EmptyModels => ("empty-models", "DurinDoor returned no models"),
+            Self::CleanupPending => ("cleanup-pending", "Started process cleanup is pending"),
             Self::HealthProbeFailed => ("health-failed", "DurinDoor health check failed"),
             Self::InsecureHttpConfirmationRequired => {
                 ("insecure-http", "Insecure HTTP requires explicit confirmation")
@@ -956,6 +1005,7 @@ mod ownership_tests {
         running: bool,
         stops: usize,
         stop_results: VecDeque<io::Result<()>>,
+        running_results: VecDeque<io::Result<bool>>,
     }
 
     struct FakeTree(Arc<Mutex<FakeState>>);
@@ -978,7 +1028,9 @@ mod ownership_tests {
 
     impl OwnedTree for FakeTree {
         fn is_running(&mut self) -> io::Result<bool> {
-            Ok(self.0.lock().expect("fake state").running)
+            let mut state = self.0.lock().expect("fake state");
+            let fallback = state.running;
+            state.running_results.pop_front().unwrap_or(Ok(fallback))
         }
 
         fn stop(&mut self, _grace: Duration) -> io::Result<()> {
@@ -1047,6 +1099,64 @@ mod ownership_tests {
         assert_eq!(controller.shutdown(), Ok(()));
         assert_eq!(controller.begin_operation().unwrap_err(), ControllerError::ShuttingDown);
     }
+    #[test]
+    fn status_query_error_is_redacted_conservative_and_retained() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(20));
+        let (tree, state) = FakeTree::running();
+        state.lock().expect("state").running_results.push_back(Err(io::Error::other("RAW-SENTINEL")));
+        controller.begin_operation().expect("operation").adopt(processes(Some(tree), None), true).expect("adopt");
+
+        let status = controller.status_snapshot();
+        assert!(status.running);
+        assert_eq!(status.recoverable_error.as_deref(), Some(super::RECOVERABLE_QUERY));
+        assert!(!serde_json::to_string(&status).expect("status JSON").contains("RAW-SENTINEL"));
+        assert!(!controller.lock().owned.is_empty());
+    }
+
+    #[test]
+    fn stop_and_query_errors_retain_first_and_eventually_clear() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(20));
+        let (tree, state) = FakeTree::with_results(vec![
+            Err(io::Error::other("RAW-FIRST-STOP")),
+            Ok(()),
+            Ok(()),
+        ]);
+        {
+            let mut state = state.lock().expect("state");
+            state.running_results.extend([
+                Err(io::Error::other("RAW-QUERY-ONE")),
+                Err(io::Error::other("RAW-QUERY-TWO")),
+                Ok(false),
+            ]);
+        }
+        controller.begin_operation().expect("operation").adopt(processes(Some(tree), None), true).expect("adopt");
+
+        assert_eq!(controller.shutdown(), Err(ControllerError::ShutdownFailed));
+        let status = controller.status_snapshot();
+        assert!(status.running);
+        let json = serde_json::to_string(&status).expect("status JSON");
+        assert_eq!(status.recoverable_error.as_deref(), Some(super::RECOVERABLE_SHUTDOWN));
+        assert!(!json.contains("RAW-FIRST-STOP") && !json.contains("RAW-QUERY"));
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert!(!controller.status_snapshot().running);
+    }
+
+    #[test]
+    fn cleanup_pending_blocks_new_mutation_and_bounds_owned_tree_count() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(20));
+        let (attempt, _state) = FakeTree::with_results(vec![Err(io::Error::other("cleanup fail"))]);
+        assert_eq!(
+            controller.begin_operation().expect("operation").adopt(processes(Some(attempt), None), false),
+            Err(ControllerError::ActivationFailed),
+        );
+        assert_eq!(controller.begin_operation().unwrap_err(), ControllerError::CleanupPending);
+        let state = controller.lock();
+        let count = usize::from(state.owned.harness.is_some())
+            + usize::from(state.owned.managed_durindoor.is_some())
+            + state.retiring.iter().map(|owned| usize::from(owned.harness.is_some()) + usize::from(owned.managed_durindoor.is_some())).sum::<usize>();
+        assert!(count <= super::MAX_OWNED_TREES as usize);
+    }
+
     #[test]
     fn shutdown_blocks_new_operations_and_late_adoption_rolls_back_attempt() {
         let controller = ConnectionController::for_test(false, Duration::from_millis(50));
@@ -1186,6 +1296,101 @@ mod ownership_tests {
     }
 
     #[test]
+    fn status_reports_detached_old_tree_during_blocked_empty_replacement() {
+        let controller = Arc::new(ConnectionController::for_test(false, Duration::from_millis(100)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let old_state = Arc::new(Mutex::new(FakeState {
+            running: true,
+            stop_results: vec![Err(io::Error::other("blocked replacement failure")), Ok(())].into(),
+            ..Default::default()
+        }));
+        controller
+            .begin_operation().expect("old operation")
+            .adopt(
+                processes(Some(Box::new(BlockingFailureTree {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    state: Arc::clone(&old_state),
+                })), None),
+                true,
+            )
+            .expect("adopt old tree");
+
+        let adopting_controller = Arc::clone(&controller);
+        let adoption = thread::spawn(move || {
+            adopting_controller
+                .begin_operation().expect("replacement operation")
+                .adopt(processes(None, None), true)
+        });
+        entered.wait();
+
+        assert!(controller.lock().owned.is_empty(), "attempted ownership is empty");
+        let started = Instant::now();
+        assert!(controller.status_snapshot().running, "detached old live tree remains visible");
+        assert!(started.elapsed() < Duration::from_millis(100), "status does not wait for teardown");
+        release.wait();
+
+        assert_eq!(adoption.join().expect("adoption thread"), Ok(()));
+        assert!(controller.status_snapshot().running, "failed old tree remains retiring");
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert!(!controller.status_snapshot().running);
+    }
+    /// Verifies that when a successful replacement adopts with an old tree live,
+    /// the status correctly reports `running=true` and any concurrent mutation is
+    /// rejected with `CleanupPending` while the old tree is being torn down.
+    #[test]
+    fn successful_replacement_with_old_live_blocks_mutation_during_teardown() {
+        let controller = Arc::new(ConnectionController::for_test(false, Duration::from_millis(50)));
+        let old_entered = Arc::new(Barrier::new(2));
+        let old_release = Arc::new(Barrier::new(2));
+        let old_state = Arc::new(Mutex::new(FakeState {
+            running: true,
+            stop_results: vec![
+                Err(io::Error::other("old teardown blocked")),
+                Ok(()),
+            ].into(),
+            ..Default::default()
+        }));
+        controller
+            .begin_operation().expect("old operation")
+            .adopt(
+                processes(Some(Box::new(BlockingFailureTree {
+                    entered: Arc::clone(&old_entered),
+                    release: Arc::clone(&old_release),
+                    state: Arc::clone(&old_state),
+                })), None),
+                true,
+            )
+            .expect("adopt old tree");
+
+        let (new_tree, _new_state) = FakeTree::running();
+        let adopting_controller = Arc::clone(&controller);
+        let adoption = thread::spawn(move || {
+            adopting_controller
+                .begin_operation().expect("replacement operation")
+                .adopt(processes(Some(new_tree), None), true)
+        });
+        old_entered.wait();
+
+        // Status must report running while the old tree is being torn down.
+        let started = Instant::now();
+        assert!(controller.status_snapshot().running, "status reports running during teardown");
+        assert!(started.elapsed() < Duration::from_millis(100), "status is instantaneous");
+
+        // Any new mutation attempt must be blocked while teardown is in progress.
+        drop(controller.begin_operation().expect_err("must be an error"));
+        let result = controller.begin_operation().expect_err("must be an error");
+        assert_eq!(result, ControllerError::CleanupPending, "new mutation rejected during teardown");
+
+        old_release.wait();
+        assert_eq!(adoption.join().expect("adoption thread"), Ok(()));
+        assert!(controller.status_snapshot().running, "new tree is running after adoption");
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert!(!controller.status_snapshot().running);
+    }
+
+    #[test]
     fn shutdown_drains_replacement_teardown_that_started_before_shutdown() {
         let controller = Arc::new(ConnectionController::for_test(false, Duration::from_millis(100)));
         let entered = Arc::new(Barrier::new(2));
@@ -1221,9 +1426,15 @@ mod ownership_tests {
         entered.wait();
         let shutdown_controller = Arc::clone(&controller);
         let shutdown = thread::spawn(move || shutdown_controller.shutdown());
-        thread::sleep(Duration::from_millis(20));
-        assert!(!shutdown.is_finished(), "shutdown escaped active replacement teardown");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !controller.lock().shutting_down && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let shutdown_started = controller.lock().shutting_down;
+        let shutdown_waiting = !shutdown.is_finished();
         release.wait();
+        assert!(shutdown_started, "shutdown entered before replacement release");
+        assert!(shutdown_waiting, "shutdown waited for active replacement teardown");
 
         assert_eq!(adoption.join().expect("adoption thread"), Err(ControllerError::ShuttingDown));
         assert_eq!(shutdown.join().expect("shutdown thread"), Err(ControllerError::ShutdownFailed));
