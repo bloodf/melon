@@ -14,6 +14,10 @@ pnpm run melon:check
 
 `pnpm run melon:dev` starts the Vite setup page and Tauri application. Generated Node sidecars and staged Harness resources are ignored; packaging scripts create them from pinned, verified runtime inputs.
 
+## Harness runtime
+
+`pnpm run melon:stage-harness-runtime` builds the upstream packages and Web frontend, verifies the current packed-install release path, deploys the `@deepseek-ai/dsh` production closure, validates package metadata and dependencies, then atomically publishes the generated closure under `src-tauri/resources/harness/`. Run `pnpm run melon:test:harness-runtime` for the fixture-based staging contract.
+
 ## DurinDoor payload
 
 Release runners build one target-native DurinDoor payload with committed CLI, shipped runtime-seed, and build-only npm locks. `runtime-pins.json` owns the DurinDoor version/package integrity, exact Node 20.20.2 runtime archives, and shared official headers archive. Builder authenticates inputs and exact build-only `node-gyp@10.1.0`, then invokes it under verified Node 20 inside the positively probed OS network sandbox. Release runner supplies absolute Python/C/C++ executables under non-world-writable allowlisted directories; only those directories enter build `PATH`. Private paths remain build-only. `payload.json` records deterministic tool basenames, normalized first-line versions, executable SHA-256 values, and a hash-bound `metadata/runtime-seed-manifest.json`; that sorted sidecar gives each locked seed file's destination-relative path, size, SHA-256, and executable bit for a future non-destructive app-data merge. It carries module paths and locked versions but no executable script or argument data. The payload remains marked `managedLaunchReady: false` until native installation consumes this authority—never PATH, realpaths, home, workspace, or user-data paths.

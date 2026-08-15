@@ -27,6 +27,8 @@
     "melon:check": "pnpm --filter @bloodf/melon-desktop run check",
     "melon:dev": "pnpm --filter @bloodf/melon-desktop run dev",
     "melon:gauntlet": "node scripts/melon/serve-gauntlet.mjs",
+    "melon:stage-harness-runtime": "tsx scripts/melon/stage-harness-runtime.mts",
+    "melon:test:harness-runtime": "vitest run scripts/melon/stage-harness-runtime.spec.ts",
     "test:durindoor-payload": "vitest run scripts/melon/build-durindoor-payload.spec.ts",
     "melon:test": "pnpm --filter @bloodf/melon-desktop run test",
     "clean": "tsx scripts/clean.ts",

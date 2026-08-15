@@ -14,6 +14,10 @@ pnpm run melon:check
 
 `pnpm run melon:dev` 启动 Vite 设置页面和 Tauri 应用。生成的 Node sidecar 与暂存 Harness 资源均被忽略；打包脚本根据固定并验证的运行时输入创建它们。
 
+## Harness 运行时
+
+`pnpm run melon:stage-harness-runtime` 构建上游包和 Web 前端，验证当前发布流程的打包安装，部署 `@deepseek-ai/dsh` 生产依赖闭包，检查包元数据和依赖项，然后将生成的闭包原子发布到 `src-tauri/resources/harness/`。运行 `pnpm run melon:test:harness-runtime` 检查基于夹具的暂存约定。
+
 ## DurinDoor 负载
 
 原生发布运行器使用已提交的 npm 锁构建 DurinDoor CLI 与运行时种子。`payload.json` 通过 SHA-256 绑定按可移植路径排序的 `metadata/runtime-seed-manifest.json`；该清单记录每个锁定种子文件在未来应用数据运行时根目录下的相对路径、大小、SHA-256 与可执行位，并固定 `better-sqlite3`、`sql.js` 的包和本机文件路径及版本。描述符不携带可执行脚本或参数，且在原生安装安全合并种子前继续标记 `managedLaunchReady: false`。
