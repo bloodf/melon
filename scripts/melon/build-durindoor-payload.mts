@@ -4,9 +4,9 @@ import { createHash } from 'node:crypto'
 import { deflateRawSync, gunzipSync } from 'node:zlib'
 import {
   chmodSync, closeSync, cpSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, mkdtempSync,
-  openSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync, writeSync,
+  openSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { arch as hostArch, platform as hostPlatform, tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -25,7 +25,6 @@ export interface InspectedEntry {
   type: 'file' | 'symlink'
 }
 interface Target {
-  archive: string
   archiveRoot: string
   nodePath: string
   npmCli: string
@@ -33,24 +32,38 @@ interface Target {
   architecture: 'linux-x64' | 'darwin-x64' | 'darwin-arm64' | 'windows-x64'
   tray?: string
 }
-const VERSION = '20.20.2'
+interface PinnedArchive {
+  filename: string
+  sha256: string
+}
+
+interface RuntimePins {
+  durindoor: {
+    nodeVersion: string
+    nodeArchives: Record<string, PinnedArchive>
+  }
+}
+const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+const RUNTIME_PINS = readJson(join(SCRIPT_ROOT, 'apps/melon-desktop/runtime/runtime-pins.json')) as unknown as RuntimePins
+const VERSION = RUNTIME_PINS.durindoor.nodeVersion
 const FIXED_DOS_DATE = 0x0021
 const TARGETS: Record<string, Target> = {
-  'x86_64-unknown-linux-gnu': { archive: `node-v${VERSION}-linux-x64.tar.gz`, archiveRoot: `node-v${VERSION}-linux-x64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0x7f, 0x45, 0x4c, 0x46], architecture: 'linux-x64', tray: 'tray_linux_release' },
-  'x86_64-apple-darwin': { archive: `node-v${VERSION}-darwin-x64.tar.gz`, archiveRoot: `node-v${VERSION}-darwin-x64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0xcf, 0xfa, 0xed, 0xfe], architecture: 'darwin-x64', tray: 'tray_darwin_release' },
-  'aarch64-apple-darwin': { archive: `node-v${VERSION}-darwin-arm64.tar.gz`, archiveRoot: `node-v${VERSION}-darwin-arm64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0xcf, 0xfa, 0xed, 0xfe], architecture: 'darwin-arm64', tray: 'tray_darwin_release' },
-  'x86_64-pc-windows-msvc': { archive: `node-v${VERSION}-win-x64.zip`, archiveRoot: `node-v${VERSION}-win-x64`, nodePath: 'node.exe', npmCli: 'node_modules/npm/bin/npm-cli.js', magic: [0x4d, 0x5a], architecture: 'windows-x64' },
+  'x86_64-unknown-linux-gnu': { archiveRoot: `node-v${VERSION}-linux-x64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0x7f, 0x45, 0x4c, 0x46], architecture: 'linux-x64', tray: 'tray_linux_release' },
+  'x86_64-apple-darwin': { archiveRoot: `node-v${VERSION}-darwin-x64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0xcf, 0xfa, 0xed, 0xfe], architecture: 'darwin-x64', tray: 'tray_darwin_release' },
+  'aarch64-apple-darwin': { archiveRoot: `node-v${VERSION}-darwin-arm64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0xcf, 0xfa, 0xed, 0xfe], architecture: 'darwin-arm64', tray: 'tray_darwin_release' },
+  'x86_64-pc-windows-msvc': { archiveRoot: `node-v${VERSION}-win-x64`, nodePath: 'node.exe', npmCli: 'node_modules/npm/bin/npm-cli.js', magic: [0x4d, 0x5a], architecture: 'windows-x64' },
 }
 const MAX_ZIP_ENTRIES = 16_384
 const MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 const UINT32_MAX = 0xffff_ffff
 const FORBIDDEN_SEGMENTS = new Set(['.env', '.9router', '.durindoor'])
 
-/** Resolves one supported Rust target and rejects a mismatched official Node archive name. */
+/** Resolves one supported Rust target and rejects an archive not named by the committed pins. */
 export function targetSpec(target: string, archive?: string): Target {
   const spec = TARGETS[target]
-  if (spec === undefined) throw new Error(`unsupported payload target: ${target}`)
-  if (archive !== undefined && basename(archive) !== spec.archive) throw new Error(`Node archive does not match target ${target}`)
+  const pin = RUNTIME_PINS.durindoor.nodeArchives[target]
+  if (spec === undefined || pin === undefined) throw new Error(`unsupported payload target: ${target}`)
+  if (archive !== undefined && basename(archive) !== pin.filename) throw new Error(`Node archive does not match target ${target}`)
   return spec
 }
 
@@ -301,11 +314,51 @@ function collectFiles(root: string, prefix: string, omit: (path: string) => bool
   return entries
 }
 
-export function verifyChecksum(archive: string, checksums: string, expectedName: string): void {
-  const expected = readFileSync(checksums, 'utf8').split(/\r?\n/).find(line => line.endsWith(`  ${expectedName}`))?.slice(0, 64)
-  if (expected === undefined) throw new Error(`official checksum missing for ${expectedName}`)
+/** Verifies supplied checksum metadata and archive bytes against one committed digest.
+ * @param archive - Downloaded Node archive.
+ * @param checksums - Supplied official checksum document.
+ * @param expectedName - Exact committed archive filename.
+ * @param pinnedSha256 - Exact committed archive digest. */
+export function verifyChecksum(archive: string, checksums: string, expectedName: string, pinnedSha256: string): void {
+  const supplied = readFileSync(checksums, 'utf8').split(/\r?\n/).find(line => line.endsWith(`  ${expectedName}`))?.slice(0, 64)
+  if (supplied === undefined) throw new Error(`official checksum missing for ${expectedName}`)
+  if (supplied !== pinnedSha256) throw new Error(`Node pinned checksum mismatch for ${expectedName}`)
   const actual = createHash('sha256').update(readFileSync(archive)).digest('hex')
-  if (actual !== expected) throw new Error(`Node archive checksum mismatch for ${expectedName}`)
+  if (actual !== pinnedSha256) throw new Error(`Node archive checksum mismatch for ${expectedName}`)
+}
+
+type SandboxProbe = (command: string, args: string[]) => string
+
+/** Selects a native network sandbox after proving a distinct Linux network namespace.
+ * @param target - Rust target being packaged.
+ * @param runner - Explicit OS sandbox executable.
+ * @param host - Injectable native host identity.
+ * @param probe - Injectable sandbox behavior probe.
+ * @param parentNetworkNamespace - Parent process network namespace identifier.
+ * @returns command prefix for sandboxed validation. */
+export function nativeSandboxPrefix(
+  target: string,
+  runner: string | undefined,
+  host: { platform: NodeJS.Platform; arch: string } = { platform: hostPlatform(), arch: hostArch() },
+  probe: SandboxProbe = (command, args) => {
+    const result = spawnSync(command, args, { encoding: 'utf8' })
+    if (result.status !== 0) throw new Error(`sandbox runner behavior probe failed\n${result.stdout}\n${result.stderr}`)
+    return result.stdout
+  },
+  parentNetworkNamespace = host.platform === 'linux' ? readlinkSync('/proc/self/ns/net') : '',
+): string[] {
+  const nativeTarget = host.platform === 'linux' && host.arch === 'x64' ? 'x86_64-unknown-linux-gnu'
+    : host.platform === 'darwin' && host.arch === 'x64' ? 'x86_64-apple-darwin'
+      : host.platform === 'darwin' && host.arch === 'arm64' ? 'aarch64-apple-darwin'
+        : host.platform === 'win32' && host.arch === 'x64' ? 'x86_64-pc-windows-msvc' : undefined
+  if (target !== nativeTarget) throw new Error(`payload build requires native target ${nativeTarget ?? `${host.platform}-${host.arch}`}`)
+  if (runner === undefined) throw new Error('payload build requires --sandbox-runner')
+  if (host.platform !== 'linux') throw new Error(`offline sandbox is not implemented for native ${host.platform} payload builds`)
+  if (basename(runner) !== 'unshare') throw new Error('Linux sandbox runner must be unshare')
+  const prefix = [runner, '--user', '--map-root-user', '--net', '--']
+  const isolated = probe(runner, [...prefix.slice(1), process.execPath, '-e', "process.stdout.write(require('fs').readlinkSync('/proc/self/ns/net'))"])
+  if (isolated.trim() === parentNetworkNamespace.trim()) throw new Error('sandbox runner did not isolate network namespace')
+  return prefix
 }
 
 interface ArchiveEntry { name: string; type: 'file' | 'directory'; linkName?: string }
@@ -423,7 +476,11 @@ export function writeOfflineGuard(path: string): void {
   ].join(';'))
 }
 
-function validateOffline(staging: string, dataDir: string, target: string): void {
+function runSandboxed(prefix: string[], command: string, args: string[], cwd: string, dataDir: string, path: string, extraEnv: Record<string, string>): string {
+  return run(prefix[0]!, [...prefix.slice(1), command, ...args], cwd, dataDir, path, extraEnv)
+}
+
+function validateOffline(staging: string, dataDir: string, target: string, sandboxPrefix: string[]): void {
   copyRuntimeSeed(join(staging, 'runtime-seed'), dataDir)
   const node = join(staging, 'bin', target.includes('windows') ? 'node.exe' : 'node')
   const cli = join(staging, 'app/node_modules/durindoor/cli.js')
@@ -433,8 +490,9 @@ function validateOffline(staging: string, dataDir: string, target: string): void
   const guard = join(dataDir, 'offline-guard.cjs')
   writeOfflineGuard(guard)
   const offlineEnv = { NODE_PATH: runtimeModules, NODE_OPTIONS: `--require=${guard}` }
-  if (!run(node, [cli, '--version'], staging, dataDir, emptyPath, offlineEnv).includes('3.15.2')) throw new Error('offline CLI version failed')
-  if (!run(node, [cli, '--help'], staging, dataDir, emptyPath, offlineEnv).includes('--skip-update')) throw new Error('offline CLI help failed')
+  const validate = (args: string[]) => runSandboxed(sandboxPrefix, node, args, staging, dataDir, emptyPath, offlineEnv)
+  if (!validate([cli, '--version']).includes('3.15.2')) throw new Error('offline CLI version failed')
+  if (!validate([cli, '--help']).includes('--skip-update')) throw new Error('offline CLI help failed')
   const smoke = [
     "const Database=require('better-sqlite3')",
     "const db=new Database(':memory:')",
@@ -444,21 +502,21 @@ function validateOffline(staging: string, dataDir: string, target: string): void
     "const wasm=require.resolve('sql.js/dist/sql-wasm.wasm')",
     "init({locateFile:()=>wasm}).then(SQL=>{const db=new SQL.Database();const rows=db.exec('select 42 as value');db.close();if(rows[0].values[0][0]!==42)process.exit(3)}).catch(()=>process.exit(4))",
   ].join(';')
-  run(node, ['-e', smoke], staging, dataDir, emptyPath, offlineEnv)
+  validate(['-e', smoke])
   const sqliteHook = join(staging, 'app/node_modules/durindoor/hooks/sqliteRuntime.js')
   const trayHook = join(staging, 'app/node_modules/durindoor/hooks/trayRuntime.js')
   const bootstrap = target.includes('windows')
     ? `const s=require(${JSON.stringify(sqliteHook)}).ensureSqliteRuntime({silent:true});if(!s.sqlJs||!s.betterSqlite)process.exit(5)`
     : `const s=require(${JSON.stringify(sqliteHook)}).ensureSqliteRuntime({silent:true});const t=require(${JSON.stringify(trayHook)}).ensureTrayRuntime({silent:true});if(!s.sqlJs||!s.betterSqlite||!t.systray)process.exit(5)`
-  run(node, ['-e', bootstrap], staging, dataDir, emptyPath, offlineEnv)
+  validate(['-e', bootstrap])
 }
 
-function assertNativeLoadGateRejectsCorruption(staging: string, dataDir: string, target: string): void {
+function assertNativeLoadGateRejectsCorruption(staging: string, dataDir: string, target: string, sandboxPrefix: string[]): void {
   const native = join(staging, 'runtime-seed/node_modules/better-sqlite3/build/Release/better_sqlite3.node')
   const magic = targetSpec(target).magic
   writeFileSync(native, Uint8Array.from([...magic, 0, 0, 0, 0]))
   try {
-    validateOffline(staging, dataDir, target)
+    validateOffline(staging, dataDir, target, sandboxPrefix)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (/better-sqlite3|better_sqlite3\.node|file too short|invalid ELF|not a valid Win32|mach-o/i.test(message)) return
@@ -467,8 +525,18 @@ function assertNativeLoadGateRejectsCorruption(staging: string, dataDir: string,
   throw new Error('offline native load gate accepted a truncated wrong-ABI module')
 }
 
-/** Writes validated bytes completely before atomically claiming an absent final path with a hard link. */
-export function publishExclusive(output: string, bytes: Uint8Array, beforeClaim?: (output: string) => void, link = linkSync): void {
+/** Writes validated bytes, atomically claims an absent final path, and durably syncs its directory on Unix. */
+export function publishExclusive(
+  output: string,
+  bytes: Uint8Array,
+  beforeClaim?: (output: string) => void,
+  link = linkSync,
+  syncDirectory: (directory: string) => void = directory => {
+    if (process.platform === 'win32') return
+    const descriptor = openSync(directory, 'r')
+    try { fsyncSync(descriptor) } finally { closeSync(descriptor) }
+  },
+): void {
   const temporary = `${output}.part-${process.pid}-${createHash('sha256').update(bytes).digest('hex').slice(0, 12)}`
   let descriptor: number | undefined
   try {
@@ -479,20 +547,23 @@ export function publishExclusive(output: string, bytes: Uint8Array, beforeClaim?
     descriptor = undefined
     beforeClaim?.(output)
     link(temporary, output)
+    syncDirectory(dirname(output))
   } finally {
     if (descriptor !== undefined) closeSync(descriptor)
     rmSync(temporary, { force: true })
   }
 }
-interface BuildOptions { target: string; nodeArchive: string; checksums: string; output: string }
+/** Inputs for one target-native authenticated payload build. */
+export interface BuildOptions { target: string; nodeArchive: string; checksums: string; output: string; sandboxRunner?: string; sandboxProbe?: SandboxProbe; parentNetworkNamespace?: string }
 
 /** Builds one locked, verified, deterministic DurinDoor payload on its native target runner. */
 export function buildPayload(options: BuildOptions): { archive: string; sha256: string } {
-  const scriptRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
-  const manifests = join(scriptRoot, 'apps/melon-desktop/runtime/durindoor')
+  const manifests = join(SCRIPT_ROOT, 'apps/melon-desktop/runtime/durindoor')
   validateLockedManifests(manifests)
   const spec = targetSpec(options.target, options.nodeArchive)
-  verifyChecksum(options.nodeArchive, options.checksums, spec.archive)
+  const pin = RUNTIME_PINS.durindoor.nodeArchives[options.target]!
+  verifyChecksum(options.nodeArchive, options.checksums, pin.filename, pin.sha256)
+  const sandboxPrefix = nativeSandboxPrefix(options.target, options.sandboxRunner, undefined, options.sandboxProbe, options.parentNetworkNamespace)
   const work = mkdtempSync(join(tmpdir(), 'melon-durindoor-build-'))
   const dataDir = join(work, 'data')
   try {
@@ -537,10 +608,10 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
     const staging = join(work, 'offline')
     mkdirSync(staging)
     for (const entry of entries) { const path = join(staging, entry.path); mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, entry.data, { mode: entry.mode }) }
-    validateOffline(staging, join(work, 'offline-data'), options.target)
+    validateOffline(staging, join(work, 'offline-data'), options.target, sandboxPrefix)
     const corruptStaging = join(work, 'offline-corrupt')
     cpSync(staging, corruptStaging, { recursive: true })
-    assertNativeLoadGateRejectsCorruption(corruptStaging, join(work, 'offline-corrupt-data'), options.target)
+    assertNativeLoadGateRejectsCorruption(corruptStaging, join(work, 'offline-corrupt-data'), options.target, sandboxPrefix)
     mkdirSync(dirname(options.output), { recursive: true })
     publishExclusive(options.output, bytes)
     return { archive: options.output, sha256: createHash('sha256').update(bytes).digest('hex') }
@@ -552,7 +623,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
 function main(): void {
   const args = process.argv.slice(2)
   const value = (flag: string) => { const index = args.indexOf(flag); if (index < 0 || args[index + 1] === undefined) throw new Error(`missing ${flag}`); return args[index + 1] }
-  const result = buildPayload({ target: value('--target'), nodeArchive: resolve(value('--node-archive')), checksums: resolve(value('--checksums')), output: resolve(value('--output')) })
+  const result = buildPayload({ target: value('--target'), nodeArchive: resolve(value('--node-archive')), checksums: resolve(value('--checksums')), output: resolve(value('--output')), sandboxRunner: resolve(value('--sandbox-runner')) })
   process.stdout.write(`${JSON.stringify(result)}\n`)
 }
 

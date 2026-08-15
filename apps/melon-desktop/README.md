@@ -16,17 +16,18 @@ pnpm run melon:check
 
 ## DurinDoor payload
 
-Release runners build one target-native DurinDoor payload with committed CLI and runtime-seed npm locks. The builder verifies the official Node 20.20.2 archive checksum, installs the DurinDoor closure with scripts disabled, installs the native runtime seed with its reviewed `better-sqlite3` lifecycle enabled under an isolated `DATA_DIR`, excludes npm shims and all symlinks, validates the staged CLI offline, and writes a deterministic ZIP.
+Release runners build one target-native DurinDoor payload with committed CLI and runtime-seed npm locks. `runtime-pins.json` owns each exact Node 20.20.2 archive filename and SHA-256; the builder requires both the supplied official `SHASUMS256.txt` value and actual archive digest to equal that pin. It installs the DurinDoor closure with scripts disabled, installs the native runtime seed with its reviewed `better-sqlite3` lifecycle enabled under an isolated `DATA_DIR`, excludes npm shims and all symlinks, validates the staged CLI inside a positively probed OS network sandbox, and writes a deterministic ZIP with durable Unix directory publication.
 
 ```sh
 pnpm run build:durindoor-payload -- \
   --target x86_64-unknown-linux-gnu \
   --node-archive /path/to/node-v20.20.2-linux-x64.tar.gz \
   --checksums /path/to/SHASUMS256.txt \
+  --sandbox-runner /usr/bin/unshare \
   --output /path/to/melon-durindoor-x86_64-unknown-linux-gnu.zip
 ```
 
-Run `pnpm run test:durindoor-payload` for canonical ZIP, target policy, locked-version, native/WASM, license-notice, and Rust activation fixture coverage. Native release evidence remains target-runner specific: Linux cannot prove the macOS or Windows `better-sqlite3` and tray binaries. Payload generation does not make managed launch ready: `payload.json` records `runtimeSeedPath` and `managedLaunchReady: false`; managed start must remain disabled until Rust installs missing locked seed files non-destructively and validates them with bundled Node.
+Run `pnpm run test:durindoor-payload` for authenticated input, sandbox behavior, canonical ZIP, target policy, locked-version, native/WASM, license-notice, durable publication, and Rust activation fixture coverage. Linux builds require `unshare` with working user and network namespaces; the builder probes namespace isolation before any payload work and fails closed otherwise. macOS and Windows builders remain blocked until native runners provide and prove equivalent positive network sandboxes, so Linux evidence cannot be represented as macOS or Windows offline proof. Payload generation does not make managed launch ready: `payload.json` records `runtimeSeedPath` and `managedLaunchReady: false`; managed start must remain disabled until Rust installs missing locked seed files non-destructively and validates them with bundled Node.
 
 ## Trust model
 

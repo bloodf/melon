@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   canonicalZip,
   inspectZip,
+  nativeSandboxPrefix,
   preflightNodeArchive,
   publishExclusive,
   thirdPartyNotices,
@@ -123,6 +124,13 @@ describe('canonical DurinDoor payload', () => {
     expect(readFileSync(output, 'utf8')).toBe('racer')
   })
 
+  it('reports parent-directory durability failures after publication', () => {
+    const work = root()
+    const output = join(work, 'payload.zip')
+    expect(() => publishExclusive(output, text('ours'), undefined, undefined, () => { throw new Error('directory fsync failed') })).toThrow(/directory fsync failed/)
+    expect(readFileSync(output, 'utf8')).toBe('ours')
+  })
+
   it.each([['symlink', '2'], ['hardlink', '1']] as const)('structurally rejects selected %s entries with spaces', (_label, type) => {
     const work = root()
     const archive = join(work, 'node links.tar')
@@ -188,7 +196,40 @@ describe('canonical DurinDoor payload', () => {
     const checksums = join(work, 'SHASUMS256.txt')
     writeFileSync(archive, 'wrong bytes')
     writeFileSync(checksums, `${'0'.repeat(64)}  node-v20.20.2-linux-x64.tar.gz\n`)
-    expect(() => verifyChecksum(archive, checksums, 'node-v20.20.2-linux-x64.tar.gz')).toThrow(/checksum mismatch/i)
+    expect(() => verifyChecksum(archive, checksums, 'node-v20.20.2-linux-x64.tar.gz', '19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b')).toThrow(/pinned checksum mismatch|archive checksum mismatch/i)
+  })
+
+  it('rejects a forged archive even when its forged checksum file agrees', () => {
+    const work = root()
+    const archive = join(work, 'node-v20.20.2-linux-x64.tar.gz')
+    const checksums = join(work, 'SHASUMS256.txt')
+    const forged = Buffer.from('attacker-controlled archive')
+    const forgedHash = createHash('sha256').update(forged).digest('hex')
+    writeFileSync(archive, forged)
+    writeFileSync(checksums, `${forgedHash}  node-v20.20.2-linux-x64.tar.gz\n`)
+    expect(() => verifyChecksum(archive, checksums, 'node-v20.20.2-linux-x64.tar.gz', '19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b')).toThrow(/pinned checksum mismatch/i)
+  })
+
+  it('requires a positively probed Linux network namespace sandbox', () => {
+    expect(() => nativeSandboxPrefix('x86_64-unknown-linux-gnu', undefined, { platform: 'linux', arch: 'x64' }, () => 'net:[2]', 'net:[1]')).toThrow(/sandbox-runner/i)
+    expect(nativeSandboxPrefix('x86_64-unknown-linux-gnu', '/usr/bin/unshare', { platform: 'linux', arch: 'x64' }, () => 'net:[2]', 'net:[1]')).toEqual(['/usr/bin/unshare', '--user', '--map-root-user', '--net', '--'])
+    expect(() => nativeSandboxPrefix('x86_64-unknown-linux-gnu', '/usr/bin/unshare', { platform: 'linux', arch: 'x64' }, () => 'net:[1]', 'net:[1]')).toThrow(/did not isolate network/i)
+  })
+
+  it('fails closed on cross-target and unsupported native sandbox builds', () => {
+    expect(() => nativeSandboxPrefix('aarch64-apple-darwin', '/usr/bin/unshare', { platform: 'linux', arch: 'x64' }, () => 'net:[2]', 'net:[1]')).toThrow(/native target/i)
+    expect(() => nativeSandboxPrefix('x86_64-apple-darwin', '/usr/bin/sandbox-exec', { platform: 'darwin', arch: 'x64' }, () => '', '')).toThrow(/not implemented/i)
+    expect(() => nativeSandboxPrefix('x86_64-pc-windows-msvc', 'sandbox.exe', { platform: 'win32', arch: 'x64' }, () => '', '')).toThrow(/not implemented/i)
+  })
+
+  it('commits exact official Node archives and digests for every release target', () => {
+    const pins = JSON.parse(readFileSync(join(process.cwd(), 'apps/melon-desktop/runtime/runtime-pins.json'), 'utf8')) as { durindoor: { nodeArchives: Record<string, { filename: string; sha256: string }> } }
+    expect(pins.durindoor.nodeArchives).toEqual({
+      'x86_64-unknown-linux-gnu': { filename: 'node-v20.20.2-linux-x64.tar.gz', sha256: '19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b' },
+      'x86_64-apple-darwin': { filename: 'node-v20.20.2-darwin-x64.tar.gz', sha256: '8be6f5e4bb128c82774f8a0b8d7a1cc1365a7977d9657cece0ca647b3fe04e61' },
+      'aarch64-apple-darwin': { filename: 'node-v20.20.2-darwin-arm64.tar.gz', sha256: '466e05f3477c20dfb723054dfebffe55bc74660ee77f612166fca121dacb65b6' },
+      'x86_64-pc-windows-msvc': { filename: 'node-v20.20.2-win-x64.zip', sha256: 'dc3700fdd57a63eedb8fd7e3c7baaa32e6a740a1b904167ff4204bc68ed8bf77' },
+    })
   })
 
 

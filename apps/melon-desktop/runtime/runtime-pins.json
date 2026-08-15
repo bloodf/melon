@@ -16,6 +16,24 @@
     "packageIntegrity": "sha512-SMvQbUUop8j9K+FoCDJfDiM3p1zZsVzevzJypxaDp2YZyeOdUpOF6YIv4u7t6mEgmNsHCqy5mDPmW0xar0PqVQ==",
     "nodeVersion": "20.20.2",
     "nodeDownloads": "https://nodejs.org/download/release/v20.20.2/",
-    "nodeChecksums": "https://nodejs.org/download/release/v20.20.2/SHASUMS256.txt"
+    "nodeChecksums": "https://nodejs.org/download/release/v20.20.2/SHASUMS256.txt",
+    "nodeArchives": {
+      "x86_64-unknown-linux-gnu": {
+        "filename": "node-v20.20.2-linux-x64.tar.gz",
+        "sha256": "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b"
+      },
+      "x86_64-apple-darwin": {
+        "filename": "node-v20.20.2-darwin-x64.tar.gz",
+        "sha256": "8be6f5e4bb128c82774f8a0b8d7a1cc1365a7977d9657cece0ca647b3fe04e61"
+      },
+      "aarch64-apple-darwin": {
+        "filename": "node-v20.20.2-darwin-arm64.tar.gz",
+        "sha256": "466e05f3477c20dfb723054dfebffe55bc74660ee77f612166fca121dacb65b6"
+      },
+      "x86_64-pc-windows-msvc": {
+        "filename": "node-v20.20.2-win-x64.zip",
+        "sha256": "dc3700fdd57a63eedb8fd7e3c7baaa32e6a740a1b904167ff4204bc68ed8bf77"
+      }
+    }
   }
 }
