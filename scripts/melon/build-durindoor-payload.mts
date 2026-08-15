@@ -505,35 +505,44 @@ export function validateNativeBuildLog(log: string): void {
 }
 
 export interface NativeToolchainOptions { directories: string[]; python: string; cc: string; cxx: string }
-interface ToolEvidence { realpath: string; version: string }
-export interface NativeToolchainEvidence { path: string; python: ToolEvidence; cc: ToolEvidence; cxx: ToolEvidence }
+interface ResolvedTool { realpath: string }
+interface PublicToolEvidence { name: string; version: string; sha256: string }
+export interface PublicToolchainEvidence { python: PublicToolEvidence; cc: PublicToolEvidence; cxx: PublicToolEvidence }
+export interface NativeToolchain { path: string; python: ResolvedTool; cc: ResolvedTool; cxx: ResolvedTool; evidence: PublicToolchainEvidence }
 type ToolProbe = (command: string, args: string[]) => string
 
-/** Resolves an explicit native toolchain and records non-secret executable evidence. */
+/** Resolves private execution paths and reproducible non-secret tool evidence. */
 export function resolveNativeToolchain(options: NativeToolchainOptions, probe: ToolProbe = (command, args) => {
   const result = spawnSync(command, args, { encoding: 'utf8', env: { PATH: options.directories.join(delimiter) } })
   if (result.status !== 0) throw new Error(`native toolchain probe failed for ${command}`)
-  return `${result.stdout}${result.stderr}`.trim()
-}): NativeToolchainEvidence {
+  return `${result.stdout}${result.stderr}`
+}): NativeToolchain {
   if (options.directories.length === 0) throw new Error('native toolchain requires at least one directory')
-  for (const directory of options.directories) {
+  const directories = options.directories.map(directory => {
     if (!isAbsolute(directory)) throw new Error('native toolchain directories must be absolute')
-    const info = statSync(directory)
+    const realpath = realpathSync(directory)
+    const info = statSync(realpath)
     if (!info.isDirectory()) throw new Error(`native toolchain directory is not a directory: ${directory}`)
     if (process.platform !== 'win32' && (info.mode & 0o002) !== 0) throw new Error(`native toolchain directory is world-writable: ${directory}`)
-  }
-  const executable = (path: string, args: string[]): ToolEvidence => {
+    return realpath
+  })
+  const executable = (role: string, path: string, args: string[]): { execution: ResolvedTool; evidence: PublicToolEvidence } => {
     if (!isAbsolute(path)) throw new Error('native toolchain executables must be absolute')
     const realpath = realpathSync(path)
     if (!statSync(realpath).isFile()) throw new Error(`native toolchain executable is not a file: ${path}`)
-    if (!options.directories.some(directory => realpath === directory || realpath.startsWith(`${realpathSync(directory)}${sep}`))) throw new Error(`native toolchain executable outside allowlisted directories: ${path}`)
-    return { realpath, version: probe(realpath, args).slice(0, 512) }
+    if (!directories.some(directory => realpath.startsWith(`${directory}${sep}`))) throw new Error(`native toolchain executable outside allowlisted directories: ${path}`)
+    const line = probe(realpath, args).split(/\r?\n/).map(value => value.trim()).find(Boolean)?.replace(/\s+/g, ' ')
+    if (line === undefined || line.includes('/') || line.includes('\\')) throw new Error(`native toolchain version is empty or contains a path: ${role}`)
+    return { execution: { realpath }, evidence: { name: role, version: line.slice(0, 256), sha256: createHash('sha256').update(readFileSync(realpath)).digest('hex') } }
   }
-  return { path: options.directories.map(directory => realpathSync(directory)).join(delimiter), python: executable(options.python, ['--version']), cc: executable(options.cc, ['--version']), cxx: executable(options.cxx, ['--version']) }
+  const python = executable('python', options.python, ['--version'])
+  const cc = executable('cc', options.cc, ['--version'])
+  const cxx = executable('cxx', options.cxx, ['--version'])
+  return { path: directories.join(delimiter), python: python.execution, cc: cc.execution, cxx: cxx.execution, evidence: { python: python.evidence, cc: cc.evidence, cxx: cxx.evidence } }
 }
 
 /** Builds better-sqlite3 from locked source under the positively-probed sandbox. */
-export function buildNativeSeed(nodeRoot: string, headersRoot: string, buildTools: string, spec: Target, seedProject: string, dataDir: string, sandboxPrefix: string[], toolchain: NativeToolchainEvidence, runner: NativeBuildRunner = run): void {
+export function buildNativeSeed(nodeRoot: string, headersRoot: string, buildTools: string, spec: Target, seedProject: string, dataDir: string, sandboxPrefix: string[], toolchain: NativeToolchain, runner: NativeBuildRunner = run): void {
   if (sandboxPrefix.length === 0) throw new Error('native seed build requires sandbox prefix')
   for (const header of ['include/node/node.h', 'include/node/common.gypi', 'include/node/config.gypi']) {
     if (!lstatSync(join(headersRoot, header), { throwIfNoEntry: false })?.isFile()) throw new Error(`verified Node headers missing ${header}`)
@@ -740,7 +749,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
       node: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/node-LICENSE')!.data).digest('hex'),
       notices: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/THIRD_PARTY_NOTICES.json')!.data).digest('hex'),
     }
-    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: DURINDOOR_VERSION, nodeVersion: VERSION, nodeAbi, toolchain, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
+    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: DURINDOOR_VERSION, nodeVersion: VERSION, nodeAbi, toolchain: toolchain.evidence, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
     entries.push({ path: 'payload.json', data: Buffer.from(`${JSON.stringify(descriptor, null, 2)}\n`), mode: 0o644 })
     validatePayloadEntries(entries, options.target)
     const bytes = canonicalZip(entries)

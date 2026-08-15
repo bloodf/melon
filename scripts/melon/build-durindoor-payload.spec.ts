@@ -285,7 +285,7 @@ describe('canonical DurinDoor payload', () => {
     const buildTools = join(work, 'build-tools')
     mkdirSync(join(buildTools, 'node_modules/node-gyp/bin'), { recursive: true })
     writeFileSync(join(buildTools, 'node_modules/node-gyp/bin/node-gyp.js'), 'node-gyp')
-    const toolchain = resolveNativeToolchain({ directories: [nodeRoot], python: join(nodeRoot, 'bin/node'), cc: join(nodeRoot, 'bin/node'), cxx: join(nodeRoot, 'bin/node') }, command => `${command} version`)
+    const toolchain = resolveNativeToolchain({ directories: [nodeRoot], python: join(nodeRoot, 'bin/node'), cc: join(nodeRoot, 'bin/node'), cxx: join(nodeRoot, 'bin/node') }, () => 'Node tool 1.0')
     const calls: Array<{ command: string; args: string[]; env: Record<string, string> }> = []
     buildNativeSeed(nodeRoot, nodeRoot, buildTools, targetSpec('x86_64-unknown-linux-gnu'), seed, work, ['/usr/bin/unshare', '--net', '--'], toolchain, (command, args, _cwd, _dataDir, path, env) => {
       expect(path).toBe(toolchain.path)
@@ -303,7 +303,8 @@ describe('canonical DurinDoor payload', () => {
 
   it('rejects missing verified headers and prebuilt/download build logs', () => {
     const work = root()
-    const invalidToolchain = { path: '', python: { realpath: '', version: '' }, cc: { realpath: '', version: '' }, cxx: { realpath: '', version: '' } }
+    const emptyEvidence = { python: { name: '', version: '', sha256: '' }, cc: { name: '', version: '', sha256: '' }, cxx: { name: '', version: '', sha256: '' } }
+    const invalidToolchain = { path: '', python: { realpath: '' }, cc: { realpath: '' }, cxx: { realpath: '' }, evidence: emptyEvidence }
     expect(() => buildNativeSeed(work, work, work, targetSpec('x86_64-unknown-linux-gnu'), work, work, ['/usr/bin/unshare', '--net', '--'], invalidToolchain, () => '')).toThrow(/headers/i)
     for (const log of ['prebuild-install info begin', 'download https://github.com/example/prebuilt.tar.gz', 'using prebuilt binary']) {
       expect(() => validateNativeBuildLog(log)).toThrow(/locked source/i)
@@ -323,11 +324,31 @@ describe('canonical DurinDoor payload', () => {
     chmodSync(tools, 0o777)
     expect(() => resolveNativeToolchain({ directories: [tools], python, cc, cxx })).toThrow(/world-writable/i)
     chmodSync(tools, 0o755)
-    const evidence = resolveNativeToolchain({ directories: [tools], python, cc, cxx }, (command, args) => `${command}:${args.join(' ')}`)
+    const evidence = resolveNativeToolchain({ directories: [tools], python, cc, cxx }, (_command, args) => `Tool 1.0   ${args.join(' ')}\nignored path ${work}`)
     expect(evidence.path).toBe(tools)
     expect(evidence.python.realpath).toBe(python)
-    expect(evidence.python.version).toContain('--version')
-    expect(JSON.stringify(evidence)).not.toContain('SECRET')
+    expect(evidence.evidence.python).toEqual({ name: 'python', version: 'Tool 1.0 --version', sha256: createHash('sha256').update('tool').digest('hex') })
+    expect(JSON.stringify(evidence.evidence)).not.toContain(work)
+    expect(JSON.stringify(evidence.evidence)).not.toContain('SECRET')
+  })
+
+  it('emits byte-identical public tool evidence across different private roots', () => {
+    const evidence = (prefix: string) => {
+      const tools = join(prefix, 'tools')
+      mkdirSync(tools, { recursive: true, mode: 0o755 })
+      for (const name of ['python3', 'cc', 'c++']) { writeFileSync(join(tools, name), 'identical-tool'); chmodSync(join(tools, name), 0o755) }
+      return resolveNativeToolchain({ directories: [tools], python: join(tools, 'python3'), cc: join(tools, 'cc'), cxx: join(tools, 'c++') }, () => 'Tool 1.0\nprivate second line').evidence
+    }
+    const firstRoot = root()
+    const secondRoot = root()
+    const first = evidence(firstRoot)
+    const second = evidence(secondRoot)
+    expect(first).toEqual(second)
+    const descriptor = JSON.stringify({ toolchain: first })
+    expect(descriptor).not.toContain(firstRoot)
+    expect(descriptor).not.toContain(secondRoot)
+    expect(descriptor).not.toContain(process.env.HOME ?? 'HOME_NOT_SET')
+    expect(Buffer.compare(canonicalZip([{ path: 'payload.json', data: text(descriptor), mode: 0o644 }]), canonicalZip([{ path: 'payload.json', data: text(JSON.stringify({ toolchain: second })), mode: 0o644 }]))).toBe(0)
   })
 
   it('requires the Rust gate before publication and leaves no final or gate cache on failure', () => {
