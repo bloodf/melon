@@ -1,4 +1,6 @@
-use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+#[cfg(not(windows))]
+use cap_fs_ext::DirExt;
 #[cfg(not(windows))]
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -27,12 +29,14 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    RtlNtStatusToDosError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
+    CloseHandle, RtlNtStatusToDosError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    CreateFileW, GetFileInformationByHandleEx, SetFileInformationByHandle, DELETE,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
     FileDispositionInfo, FileRenameInfo, OPEN_EXISTING,
 };
 #[cfg(windows)]
@@ -326,7 +330,7 @@ fn open_runtime_directory(path: &Path) -> Result<Dir, RuntimeError> {
 
 #[cfg(windows)]
 fn open_runtime_directory(path: &Path) -> Result<Dir, RuntimeError> {
-    let path = wide_path(path)?;
+    let path = wide_path_without_final_resolution(path)?;
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
@@ -341,19 +345,51 @@ fn open_runtime_directory(path: &Path) -> Result<Dir, RuntimeError> {
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error().into());
     }
+    if let Err(error) = validate_windows_directory_handle(handle) {
+        unsafe { CloseHandle(handle) };
+        return Err(error);
+    }
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     Ok(Dir::from_std_file(file))
 }
 
 #[cfg(windows)]
-fn wide_path(path: &Path) -> Result<Vec<u16>, RuntimeError> {
-    let path = fs::canonicalize(path)?;
+fn wide_path_without_final_resolution(path: &Path) -> Result<Vec<u16>, RuntimeError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RuntimeError::UnsafePath(path.display().to_string()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| RuntimeError::UnsafePath(path.display().to_string()))?;
+    let path = fs::canonicalize(parent)?.join(name);
     let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
     if wide.contains(&0) {
         return Err(RuntimeError::UnsafePath(path.display().to_string()));
     }
     wide.push(0);
     Ok(wide)
+}
+
+#[cfg(windows)]
+fn validate_windows_directory_handle(handle: HANDLE) -> Result<(), RuntimeError> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            ptr::from_mut(&mut info).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(RuntimeError::StagingNotEmpty);
+    }
+    Ok(())
 }
 
 fn preflight_archive(reader: &mut (impl Read + Seek)) -> Result<ArchivePreflight, RuntimeError> {
@@ -727,6 +763,10 @@ fn nt_create_directory(parent: &Dir, component: &OsStr, disposition: u32) -> Res
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::other("NtCreateFile returned an invalid directory handle").into());
     }
+    if let Err(error) = validate_windows_directory_handle(handle) {
+        unsafe { CloseHandle(handle) };
+        return Err(error);
+    }
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     Ok(Dir::from_std_file(file))
 }
@@ -944,7 +984,7 @@ fn remove_directory_contents(dir: &Dir) -> Result<(), RuntimeError> {
         let name = entry.file_name();
         let metadata = dir.symlink_metadata(&name)?;
         if metadata.is_dir() && !metadata.is_symlink() {
-            let child = dir.open_dir_nofollow(&name)?;
+            let child = open_child_directory(dir, &name)?;
             remove_directory_contents(&child)?;
             windows_mark_delete(child.as_raw_handle() as HANDLE)?;
             drop(child);
@@ -1653,6 +1693,28 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
+    fn windows_rejects_staging_junction_without_touching_target() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let outside = temp.0.join("outside");
+        fs::create_dir(&outside).expect("outside target");
+        fs::remove_dir(&staging).expect("replace staging with junction");
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&staging)
+            .arg(&outside)
+            .output()
+            .expect("create staging junction");
+        assert!(output.status.success(), "mklink failed: {}", String::from_utf8_lossy(&output.stderr));
+
+        let error = extract_zip(&mut Cursor::new(archive(&[("node", b"owned")])), &staging)
+            .expect_err("staging junction must fail closed");
+        assert!(matches!(error, RuntimeError::StagingNotEmpty), "{error:?}");
+        assert_empty(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_handle_publication_succeeds() {
         let temp = TempDir::new();
         let staging = temp.staging();
@@ -1680,6 +1742,9 @@ mod tests {
         let staging_dir = open_empty_staging(&staging).expect("staging handle");
         let mut candidate = CandidateDir::create(&staging, &staging_dir).expect("candidate");
         candidate.dir().create_dir("nested").expect("nested candidate content");
+        let nested = open_child_directory(candidate.dir(), OsStr::new("nested")).expect("nested handle");
+        nested.create_dir("deeper").expect("deeper candidate content");
+        drop(nested);
         let path = candidate.path().to_path_buf();
         candidate.cleanup().expect("handle cleanup");
         assert!(!path.exists());
