@@ -46,6 +46,12 @@ struct OwnedProcesses {
     harness: Option<Box<dyn OwnedTree>>,
     managed_durindoor: Option<Box<dyn OwnedTree>>,
 }
+impl OwnedProcesses {
+    fn is_empty(&self) -> bool {
+        self.harness.is_none() && self.managed_durindoor.is_none()
+    }
+}
+
 
 impl std::fmt::Debug for OwnedProcesses {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,7 +70,9 @@ struct ControllerState {
     shutdown_active: bool,
     teardown_harness: bool,
     teardown_managed: bool,
+    teardown_retiring: bool,
     owned: OwnedProcesses,
+    retiring: Vec<OwnedProcesses>,
     recoverable_error: Option<String>,
 }
 
@@ -113,29 +121,12 @@ impl ConnectionController {
     fn status_snapshot(&self) -> ControllerStatus {
         let mut state = self.lock();
         let mut query_error = None;
-        let mut running = state.teardown_harness || state.teardown_managed;
-        for tree in [&mut state.owned.harness] {
-            match tree.as_mut().map(|tree| tree.is_running()) {
-                Some(Ok(true)) => running = true,
-                Some(Ok(false)) => *tree = None,
-                Some(Err(error)) => {
-                    running = true;
-                    query_error.get_or_insert_with(|| error.to_string());
-                }
-                None => {}
-            }
+        let mut running = state.teardown_harness || state.teardown_managed || state.teardown_retiring;
+        query_owned_processes(&mut state.owned, &mut running, &mut query_error);
+        for owned in &mut state.retiring {
+            query_owned_processes(owned, &mut running, &mut query_error);
         }
-        for tree in [&mut state.owned.managed_durindoor] {
-            match tree.as_mut().map(|tree| tree.is_running()) {
-                Some(Ok(true)) => running = true,
-                Some(Ok(false)) => *tree = None,
-                Some(Err(error)) => {
-                    running = true;
-                    query_error.get_or_insert_with(|| error.to_string());
-                }
-                None => {}
-            }
-        }
+        state.retiring.retain(|owned| !owned.is_empty());
         if query_error.is_some() {
             state.recoverable_error = query_error;
         }
@@ -147,30 +138,37 @@ impl ConnectionController {
     }
 
     pub fn shutdown(&self) -> Result<(), ControllerError> {
-        let mut owned = {
+        let mut owned_sets = {
             let mut state = self.lock();
             state.shutting_down = true;
             if state.shutdown_active {
                 return Err(ControllerError::Busy);
             }
             state.shutdown_active = true;
-            let owned = std::mem::take(&mut state.owned);
-            state.teardown_harness = owned.harness.is_some();
-            state.teardown_managed = owned.managed_durindoor.is_some();
-            owned
+            let current = std::mem::take(&mut state.owned);
+            let mut owned_sets = std::mem::take(&mut state.retiring);
+            if !current.is_empty() {
+                owned_sets.push(current);
+            }
+            state.teardown_harness = owned_sets.iter().any(|owned| owned.harness.is_some());
+            state.teardown_managed = owned_sets.iter().any(|owned| owned.managed_durindoor.is_some());
+            state.teardown_retiring = !owned_sets.is_empty();
+            owned_sets
         };
 
-        let (first_error, harness_stopped, managed_stopped) = stop_owned_processes(&mut owned, self.stop_grace);
+        let mut first_error = None;
+        for owned in &mut owned_sets {
+            if let Some(error) = stop_and_prune(owned, self.stop_grace) {
+                first_error.get_or_insert(error);
+            }
+        }
+        owned_sets.retain(|owned| !owned.is_empty());
         let mut state = self.lock();
         state.shutdown_active = false;
         state.teardown_harness = false;
+        state.teardown_retiring = false;
         state.teardown_managed = false;
-        if !harness_stopped {
-            state.owned.harness = owned.harness.take();
-        }
-        if !managed_stopped {
-            state.owned.managed_durindoor = owned.managed_durindoor.take();
-        }
+        state.retiring = owned_sets;
         match first_error {
             Some(error) => {
                 state.recoverable_error = Some(error.to_string());
@@ -189,30 +187,53 @@ impl ConnectionController {
     }
 }
 
-fn stop_tree(tree: &mut Option<Box<dyn OwnedTree>>, grace: Duration) -> (Option<io::Error>, bool) {
-    let Some(tree) = tree.as_mut() else { return (None, true) };
-    let stop_error = tree.stop(grace).err();
-    match tree.is_running() {
-        Ok(false) => (stop_error, true),
-        Ok(true) => (
-            stop_error.or_else(|| Some(io::Error::new(io::ErrorKind::TimedOut, "owned process tree remains running"))),
-            false,
-        ),
-        Err(error) => (stop_error.or(Some(error)), false),
+fn query_owned_processes(
+    owned: &mut OwnedProcesses,
+    running: &mut bool,
+    query_error: &mut Option<String>,
+) {
+    for tree in [&mut owned.harness, &mut owned.managed_durindoor] {
+        match tree.as_mut().map(|tree| tree.is_running()) {
+            Some(Ok(true)) => *running = true,
+            Some(Ok(false)) => *tree = None,
+            Some(Err(error)) => {
+                *running = true;
+                query_error.get_or_insert_with(|| error.to_string());
+            }
+            None => {}
+        }
     }
+}
+
+fn stop_tree(tree: &mut Option<Box<dyn OwnedTree>>, grace: Duration) -> Option<io::Error> {
+    let Some(owned) = tree.as_mut() else { return None };
+    let stop_error = owned.stop(grace).err();
+    match owned.is_running() {
+        Ok(false) => {
+            *tree = None;
+            stop_error
+        }
+        Ok(true) => stop_error.or_else(|| Some(io::Error::new(io::ErrorKind::TimedOut, "owned process tree remains running"))),
+        Err(error) => stop_error.or(Some(error)),
+    }
+}
+
+fn stop_and_prune(owned: &mut OwnedProcesses, grace: Duration) -> Option<io::Error> {
+    let mut first_error = stop_tree(&mut owned.harness, grace);
+    if let Some(error) = stop_tree(&mut owned.managed_durindoor, grace) {
+        first_error.get_or_insert(error);
+    }
+    first_error
 }
 
 fn stop_owned_processes(
     owned: &mut OwnedProcesses,
     grace: Duration,
 ) -> (Option<io::Error>, bool, bool) {
-    let (mut first_error, harness_stopped) = stop_tree(&mut owned.harness, grace);
-    let (managed_error, managed_stopped) = stop_tree(&mut owned.managed_durindoor, grace);
-    if first_error.is_none() {
-        first_error = managed_error;
-    }
-    (first_error, harness_stopped, managed_stopped)
+    let error = stop_and_prune(owned, grace);
+    (error, owned.harness.is_none(), owned.managed_durindoor.is_none())
 }
+
 
 #[derive(Debug)]
 struct Operation<'a> {
@@ -235,10 +256,13 @@ impl Operation<'_> {
             }
             std::mem::replace(&mut state.owned, attempted)
         };
-        let (error, _, _) = stop_owned_processes(&mut replaced, self.controller.stop_grace);
+        let error = stop_and_prune(&mut replaced, self.controller.stop_grace);
         let mut state = self.controller.lock();
         if let Some(error) = error {
             state.recoverable_error = Some(error.to_string());
+        }
+        if !replaced.is_empty() {
+            state.retiring.push(replaced);
         }
         state.mutating = false;
         self.active = false;
@@ -1033,6 +1057,41 @@ mod ownership_tests {
         assert_eq!(prior_state.lock().expect("prior").stops, 0);
         assert!(controller.status_snapshot().running);
     }
+    #[test]
+    fn successful_replacement_retains_and_retries_every_failed_prior_tree() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(50));
+        let (old_harness, old_harness_state) = FakeTree::with_results(vec![
+            Err(io::Error::other("old harness replacement failure")),
+            Ok(()),
+        ]);
+        let (old_managed, old_managed_state) = FakeTree::with_results(vec![
+            Err(io::Error::other("old managed replacement failure")),
+            Ok(()),
+        ]);
+        controller
+            .begin_operation().expect("old operation")
+            .adopt(processes(Some(old_harness), Some(old_managed)), true).expect("adopt old trees");
+
+        let (new_harness, new_harness_state) = FakeTree::running();
+        let (new_managed, new_managed_state) = FakeTree::running();
+        controller
+            .begin_operation().expect("replacement operation")
+            .adopt(processes(Some(new_harness), Some(new_managed)), true).expect("adopt new trees");
+
+        assert!(controller.status_snapshot().running);
+        assert_eq!(old_harness_state.lock().expect("old harness").stops, 1);
+        assert_eq!(old_managed_state.lock().expect("old managed").stops, 1);
+        assert_eq!(new_harness_state.lock().expect("new harness").stops, 0);
+        assert_eq!(new_managed_state.lock().expect("new managed").stops, 0);
+
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert_eq!(old_harness_state.lock().expect("old harness").stops, 2);
+        assert_eq!(old_managed_state.lock().expect("old managed").stops, 2);
+        assert_eq!(new_harness_state.lock().expect("new harness").stops, 1);
+        assert_eq!(new_managed_state.lock().expect("new managed").stops, 1);
+        assert!(!controller.status_snapshot().running);
+    }
+
 
     struct BlockingTree {
         entered: Arc<Barrier>,
