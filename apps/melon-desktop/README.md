@@ -16,7 +16,7 @@ pnpm run melon:check
 
 ## DurinDoor payload
 
-Release runners build one target-native DurinDoor payload with committed CLI, shipped runtime-seed, and build-only npm locks. `runtime-pins.json` owns the DurinDoor version/package integrity, each exact Node 20.20.2 runtime archive, and the shared official headers archive with SHA-256. The builder requires supplied official checksum metadata and actual archive bytes to match those pins. It installs runtime closures with scripts disabled, installs exact build-only `node-gyp@10.1.0` separately, then invokes it directly under verified Node 20 inside the positively probed OS network sandbox with empty `PATH` and authenticated headers. Build tools never enter the payload, and logs reject prebuild/download evidence. After bundled-Node native/WASM validation, actual payload bytes must positively report the production Rust activation test passing before durable publication.
+Release runners build one target-native DurinDoor payload with committed CLI, shipped runtime-seed, and build-only npm locks. `runtime-pins.json` owns the DurinDoor version/package integrity, each exact Node 20.20.2 runtime archive, and the shared official headers archive with SHA-256. Builder authenticates all archive inputs and exact build-only `node-gyp@10.1.0`, then invokes it directly under verified Node 20 inside the positively probed OS network sandbox. Release runner must supply absolute Python/C/C++ executables under non-world-writable allowlisted directories; builder resolves their real paths, records bounded version evidence in `payload.json`, and exposes only those directories through child `PATH`. Host Node/npm and ambient `PATH` cannot satisfy the build. Build tools never enter payload, and logs reject prebuild/download evidence. Actual payload bytes must positively report production Rust activation before durable publication.
 
 ```sh
 pnpm run build:durindoor-payload -- \
@@ -25,6 +25,10 @@ pnpm run build:durindoor-payload -- \
   --headers-archive /path/to/node-v20.20.2-headers.tar.gz \
   --checksums /path/to/SHASUMS256.txt \
   --sandbox-runner /usr/bin/unshare \
+  --toolchain-dir /usr/bin \
+  --python /usr/bin/python3 \
+  --cc /usr/bin/cc \
+  --cxx /usr/bin/c++ \
   --output /path/to/melon-durindoor-x86_64-unknown-linux-gnu.zip
 ```
 

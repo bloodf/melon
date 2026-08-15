@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   buildNativeSeed,
   buildPayload,
+  resolveNativeToolchain,
   canonicalZip,
   inspectZip,
   nativeSandboxPrefix,
@@ -284,9 +285,10 @@ describe('canonical DurinDoor payload', () => {
     const buildTools = join(work, 'build-tools')
     mkdirSync(join(buildTools, 'node_modules/node-gyp/bin'), { recursive: true })
     writeFileSync(join(buildTools, 'node_modules/node-gyp/bin/node-gyp.js'), 'node-gyp')
+    const toolchain = resolveNativeToolchain({ directories: [nodeRoot], python: join(nodeRoot, 'bin/node'), cc: join(nodeRoot, 'bin/node'), cxx: join(nodeRoot, 'bin/node') }, command => `${command} version`)
     const calls: Array<{ command: string; args: string[]; env: Record<string, string> }> = []
-    buildNativeSeed(nodeRoot, nodeRoot, buildTools, targetSpec('x86_64-unknown-linux-gnu'), seed, work, ['/usr/bin/unshare', '--net', '--'], (command, args, _cwd, _dataDir, path, env) => {
-      expect(path).toBe('')
+    buildNativeSeed(nodeRoot, nodeRoot, buildTools, targetSpec('x86_64-unknown-linux-gnu'), seed, work, ['/usr/bin/unshare', '--net', '--'], toolchain, (command, args, _cwd, _dataDir, path, env) => {
+      expect(path).toBe(toolchain.path)
       calls.push({ command, args, env }); return 'gyp info ok\n'
     })
     expect(calls).toHaveLength(1)
@@ -295,16 +297,37 @@ describe('canonical DurinDoor payload', () => {
     expect(calls[0]?.args).toContain(join(buildTools, 'node_modules/node-gyp/bin/node-gyp.js'))
     expect(calls[0]?.args).toContain(`--nodedir=${nodeRoot}`)
     expect(calls[0]?.env.npm_config_build_from_source).toBe('true')
-    expect(calls[0]?.env.npm_config_nodedir).toBe(nodeRoot)
-    expect(() => buildNativeSeed(nodeRoot, nodeRoot, buildTools, targetSpec('x86_64-unknown-linux-gnu'), seed, work, [], () => '')).toThrow(/sandbox/i)
+    expect(calls[0]?.env.npm_config_python).toBe(join(nodeRoot, 'bin/node'))
+    expect(() => buildNativeSeed(nodeRoot, nodeRoot, buildTools, targetSpec('x86_64-unknown-linux-gnu'), seed, work, [], toolchain, () => '')).toThrow(/sandbox/i)
   })
 
   it('rejects missing verified headers and prebuilt/download build logs', () => {
     const work = root()
-    expect(() => buildNativeSeed(work, work, work, targetSpec('x86_64-unknown-linux-gnu'), work, work, ['/usr/bin/unshare', '--net', '--'], () => '')).toThrow(/headers/i)
+    const invalidToolchain = { path: '', python: { realpath: '', version: '' }, cc: { realpath: '', version: '' }, cxx: { realpath: '', version: '' } }
+    expect(() => buildNativeSeed(work, work, work, targetSpec('x86_64-unknown-linux-gnu'), work, work, ['/usr/bin/unshare', '--net', '--'], invalidToolchain, () => '')).toThrow(/headers/i)
     for (const log of ['prebuild-install info begin', 'download https://github.com/example/prebuilt.tar.gz', 'using prebuilt binary']) {
       expect(() => validateNativeBuildLog(log)).toThrow(/locked source/i)
     }
+  })
+
+  it('requires absolute non-world-writable native toolchain paths and ignores ambient PATH', () => {
+    const work = root()
+    const tools = join(work, 'tools')
+    mkdirSync(tools, { mode: 0o755 })
+    const python = join(tools, 'python3')
+    const cc = join(tools, 'cc')
+    const cxx = join(tools, 'c++')
+    for (const executable of [python, cc, cxx]) { writeFileSync(executable, 'tool'); chmodSync(executable, 0o755) }
+    expect(() => resolveNativeToolchain({ directories: [], python, cc, cxx })).toThrow(/directory/i)
+    expect(() => resolveNativeToolchain({ directories: [tools], python: 'python3', cc, cxx })).toThrow(/absolute/i)
+    chmodSync(tools, 0o777)
+    expect(() => resolveNativeToolchain({ directories: [tools], python, cc, cxx })).toThrow(/world-writable/i)
+    chmodSync(tools, 0o755)
+    const evidence = resolveNativeToolchain({ directories: [tools], python, cc, cxx }, (command, args) => `${command}:${args.join(' ')}`)
+    expect(evidence.path).toBe(tools)
+    expect(evidence.python.realpath).toBe(python)
+    expect(evidence.python.version).toContain('--version')
+    expect(JSON.stringify(evidence)).not.toContain('SECRET')
   })
 
   it('requires the Rust gate before publication and leaves no final or gate cache on failure', () => {
@@ -356,12 +379,17 @@ describe('canonical DurinDoor payload', () => {
     const headersArchive = process.env.MELON_NODE_HEADERS_ARCHIVE
     const checksums = process.env.MELON_NODE_CHECKSUMS
     const sandboxRunner = process.env.MELON_SANDBOX_RUNNER
-    if (nodeArchive === undefined || headersArchive === undefined || checksums === undefined || sandboxRunner === undefined) {
-      skip('requires authenticated Node runtime/headers archives, checksums, and working native sandbox')
+    const toolchainDir = process.env.MELON_TOOLCHAIN_DIR
+    const python = process.env.MELON_PYTHON
+    const cc = process.env.MELON_CC
+    const cxx = process.env.MELON_CXX
+    if ([nodeArchive, headersArchive, checksums, sandboxRunner, toolchainDir, python, cc, cxx].some(value => value === undefined)) {
+      skip('requires authenticated runtime/header inputs, working sandbox, and explicit native toolchain')
       return
     }
     const output = join(root(), 'actual-payload.zip')
-    const result = buildPayload({ target: 'x86_64-unknown-linux-gnu', nodeArchive, headersArchive, checksums, sandboxRunner, output })
+    const toolchain = { directories: [toolchainDir!], python: python!, cc: cc!, cxx: cxx! }
+    const result = buildPayload({ target: 'x86_64-unknown-linux-gnu', nodeArchive: nodeArchive!, headersArchive: headersArchive!, checksums: checksums!, sandboxRunner: sandboxRunner!, output, toolchain })
     expect(result.archive).toBe(output)
     expect(existsSync(output)).toBe(true)
   })

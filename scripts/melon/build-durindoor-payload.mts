@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { deflateRawSync, gunzipSync } from 'node:zlib'
 import {
   chmodSync, closeSync, cpSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, mkdtempSync,
-  openSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync, writeSync,
+  openSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { arch as hostArch, platform as hostPlatform, tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -504,8 +504,36 @@ export function validateNativeBuildLog(log: string): void {
   if (/prebuild-install|\bdownload(?:ing|ed)?\b|https?:\/\/github\.com|\bprebuilt\b/i.test(log)) throw new Error('native seed must build from locked source')
 }
 
+export interface NativeToolchainOptions { directories: string[]; python: string; cc: string; cxx: string }
+interface ToolEvidence { realpath: string; version: string }
+export interface NativeToolchainEvidence { path: string; python: ToolEvidence; cc: ToolEvidence; cxx: ToolEvidence }
+type ToolProbe = (command: string, args: string[]) => string
+
+/** Resolves an explicit native toolchain and records non-secret executable evidence. */
+export function resolveNativeToolchain(options: NativeToolchainOptions, probe: ToolProbe = (command, args) => {
+  const result = spawnSync(command, args, { encoding: 'utf8', env: { PATH: options.directories.join(delimiter) } })
+  if (result.status !== 0) throw new Error(`native toolchain probe failed for ${command}`)
+  return `${result.stdout}${result.stderr}`.trim()
+}): NativeToolchainEvidence {
+  if (options.directories.length === 0) throw new Error('native toolchain requires at least one directory')
+  for (const directory of options.directories) {
+    if (!isAbsolute(directory)) throw new Error('native toolchain directories must be absolute')
+    const info = statSync(directory)
+    if (!info.isDirectory()) throw new Error(`native toolchain directory is not a directory: ${directory}`)
+    if (process.platform !== 'win32' && (info.mode & 0o002) !== 0) throw new Error(`native toolchain directory is world-writable: ${directory}`)
+  }
+  const executable = (path: string, args: string[]): ToolEvidence => {
+    if (!isAbsolute(path)) throw new Error('native toolchain executables must be absolute')
+    const realpath = realpathSync(path)
+    if (!statSync(realpath).isFile()) throw new Error(`native toolchain executable is not a file: ${path}`)
+    if (!options.directories.some(directory => realpath === directory || realpath.startsWith(`${realpathSync(directory)}${sep}`))) throw new Error(`native toolchain executable outside allowlisted directories: ${path}`)
+    return { realpath, version: probe(realpath, args).slice(0, 512) }
+  }
+  return { path: options.directories.map(directory => realpathSync(directory)).join(delimiter), python: executable(options.python, ['--version']), cc: executable(options.cc, ['--version']), cxx: executable(options.cxx, ['--version']) }
+}
+
 /** Builds better-sqlite3 from locked source under the positively-probed sandbox. */
-export function buildNativeSeed(nodeRoot: string, headersRoot: string, buildTools: string, spec: Target, seedProject: string, dataDir: string, sandboxPrefix: string[], runner: NativeBuildRunner = run): void {
+export function buildNativeSeed(nodeRoot: string, headersRoot: string, buildTools: string, spec: Target, seedProject: string, dataDir: string, sandboxPrefix: string[], toolchain: NativeToolchainEvidence, runner: NativeBuildRunner = run): void {
   if (sandboxPrefix.length === 0) throw new Error('native seed build requires sandbox prefix')
   for (const header of ['include/node/node.h', 'include/node/common.gypi', 'include/node/config.gypi']) {
     if (!lstatSync(join(headersRoot, header), { throwIfNoEntry: false })?.isFile()) throw new Error(`verified Node headers missing ${header}`)
@@ -514,8 +542,8 @@ export function buildNativeSeed(nodeRoot: string, headersRoot: string, buildTool
   const nodeGyp = join(buildTools, 'node_modules/node-gyp/bin/node-gyp.js')
   if (!lstatSync(nodeGyp, { throwIfNoEntry: false })?.isFile()) throw new Error('locked node-gyp build tool missing')
   const nativeProject = join(seedProject, 'node_modules/better-sqlite3')
-  const env = { npm_config_build_from_source: 'true', npm_config_nodedir: headersRoot, npm_config_tarball: '' }
-  const log = runner(sandboxPrefix[0]!, [...sandboxPrefix.slice(1), node, nodeGyp, 'rebuild', '--release', `--nodedir=${headersRoot}`], nativeProject, dataDir, '', env)
+  const env = { npm_config_build_from_source: 'true', npm_config_nodedir: headersRoot, npm_config_tarball: '', npm_config_python: toolchain.python.realpath, PYTHON: toolchain.python.realpath, CC: toolchain.cc.realpath, CXX: toolchain.cxx.realpath }
+  const log = runner(sandboxPrefix[0]!, [...sandboxPrefix.slice(1), node, nodeGyp, 'rebuild', '--release', `--nodedir=${headersRoot}`], nativeProject, dataDir, toolchain.path, env)
   validateNativeBuildLog(log)
 }
 function copyRuntimeSeed(seed: string, dataDir: string): void {
@@ -650,7 +678,7 @@ export function runRustPayloadGate(bytes: Uint8Array, target: string, work: stri
   }
 }
 /** Inputs for one target-native authenticated payload build. */
-export interface BuildOptions { target: string; nodeArchive: string; headersArchive: string; checksums: string; output: string; sandboxRunner?: string; sandboxProbe?: SandboxProbe; parentNetworkNamespace?: string; nativeBuildRunner?: NativeBuildRunner; rustGateRunner?: RustGateRunner }
+export interface BuildOptions { target: string; nodeArchive: string; headersArchive: string; checksums: string; output: string; sandboxRunner?: string; sandboxProbe?: SandboxProbe; parentNetworkNamespace?: string; toolchain: NativeToolchainOptions; toolProbe?: ToolProbe; nativeBuildRunner?: NativeBuildRunner; rustGateRunner?: RustGateRunner }
 
 /** Requires Rust activation acceptance before creating the final payload path. */
 export function publishValidatedPayload(bytes: Uint8Array, target: string, work: string, output: string, runner?: RustGateRunner): void {
@@ -670,6 +698,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
   if (basename(options.headersArchive) !== headersPin.filename) throw new Error('Node headers archive does not match runtime pins')
   verifyChecksum(options.headersArchive, options.checksums, headersPin.filename, headersPin.sha256)
   const sandboxPrefix = nativeSandboxPrefix(options.target, options.sandboxRunner, undefined, options.sandboxProbe, options.parentNetworkNamespace)
+  const toolchain = resolveNativeToolchain(options.toolchain, options.toolProbe)
   const work = mkdtempSync(join(tmpdir(), 'melon-durindoor-build-'))
   const dataDir = join(work, 'data')
   try {
@@ -685,7 +714,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
     runNpm(nodeRoot, spec, ['ci', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund'], cliProject, dataDir)
     runNpm(nodeRoot, spec, ['ci', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund'], seedProject, dataDir)
     runNpm(nodeRoot, spec, ['ci', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund'], buildProject, dataDir)
-    buildNativeSeed(nodeRoot, headersRoot, buildProject, spec, seedProject, dataDir, sandboxPrefix, options.nativeBuildRunner)
+    buildNativeSeed(nodeRoot, headersRoot, buildProject, spec, seedProject, dataDir, sandboxPrefix, toolchain, options.nativeBuildRunner)
     if (spec.tray === undefined) rmSync(join(seedProject, 'node_modules/systray2'), { recursive: true, force: true })
     else {
       const tray = join(seedProject, 'node_modules/systray2/traybin', spec.tray)
@@ -711,7 +740,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
       node: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/node-LICENSE')!.data).digest('hex'),
       notices: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/THIRD_PARTY_NOTICES.json')!.data).digest('hex'),
     }
-    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: DURINDOOR_VERSION, nodeVersion: VERSION, nodeAbi, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
+    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: DURINDOOR_VERSION, nodeVersion: VERSION, nodeAbi, toolchain, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
     entries.push({ path: 'payload.json', data: Buffer.from(`${JSON.stringify(descriptor, null, 2)}\n`), mode: 0o644 })
     validatePayloadEntries(entries, options.target)
     const bytes = canonicalZip(entries)
@@ -732,7 +761,8 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
 function main(): void {
   const args = process.argv.slice(2)
   const value = (flag: string) => { const index = args.indexOf(flag); if (index < 0 || args[index + 1] === undefined) throw new Error(`missing ${flag}`); return args[index + 1] }
-  const result = buildPayload({ target: value('--target'), nodeArchive: resolve(value('--node-archive')), headersArchive: resolve(value('--headers-archive')), checksums: resolve(value('--checksums')), output: resolve(value('--output')), sandboxRunner: resolve(value('--sandbox-runner')) })
+  const toolchain = { directories: value('--toolchain-dir').split(delimiter).map(directory => resolve(directory)), python: resolve(value('--python')), cc: resolve(value('--cc')), cxx: resolve(value('--cxx')) }
+  const result = buildPayload({ target: value('--target'), nodeArchive: resolve(value('--node-archive')), headersArchive: resolve(value('--headers-archive')), checksums: resolve(value('--checksums')), output: resolve(value('--output')), sandboxRunner: resolve(value('--sandbox-runner')), toolchain })
   process.stdout.write(`${JSON.stringify(result)}\n`)
 }
 
