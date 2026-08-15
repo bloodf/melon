@@ -142,11 +142,11 @@ pub(crate) fn activate_runtime(
         .ok_or_else(|| RuntimeError::UnsafePath(final_dir.display().to_string()))?;
     let target_key = validate_target_key(target_id, final_name)?;
     let parent = open_private_directory(parent_path)?;
+    let _target_lock = TargetLock::acquire(&parent, &target_key)?;
     let existing_final = open_optional_private_child(parent_path, &parent, final_name)?;
     let cache = open_private_directory(cache_dir)?;
     validate_cache_disjointness(cache_dir, &cache, parent_path, &parent, existing_final.as_ref())?;
     validate_archive_control_name(archive_name, final_name, &target_key)?;
-    let _target_lock = TargetLock::acquire(&parent, &target_key)?;
     let mut archive = OwnedCacheArtifact::claim(cache, archive_name)?;
     let digest = match parse_sha256(expected_sha256).and_then(|digest| {
         validate_required_paths(required_entries)?;
@@ -205,6 +205,8 @@ fn activate_claimed(
         let tree_digest = hash_runtime_tree(staging.dir())?;
         let record_name = activation_record_name(target_key);
         write_activation_record(parent, target_key, digest, &tree_digest)?;
+        #[cfg(test)]
+        pause_subprocess_activation_before_publish()?;
         let staging_name = staging
             .path()
             .file_name()
@@ -220,6 +222,27 @@ fn activate_claimed(
         return combine_activation_cleanup(result, staging.cleanup());
     }
     result
+}
+
+#[cfg(test)]
+fn pause_subprocess_activation_before_publish() -> Result<(), RuntimeError> {
+    if std::env::var_os("MELON_ACTIVATION_RACE_ROLE").as_deref() != Some(OsStr::new("a")) {
+        return Ok(());
+    }
+    let root = PathBuf::from(
+        std::env::var_os("MELON_ACTIVATION_RACE_ROOT")
+            .ok_or_else(|| io::Error::other("activation race root missing"))?,
+    );
+    fs::write(root.join("a-before-publish"), b"ready")?;
+    let release = root.join("release-a");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !release.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "activation race release timed out").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn combine_activation_cleanup(
@@ -245,12 +268,9 @@ fn validate_required_paths(required_entries: &[&str]) -> Result<(), RuntimeError
     }
     let mut seen = HashMap::with_capacity(required_entries.len());
     for path in required_entries {
-        let (validated, components) = validate_path(path)?;
+        let (_, components) = validate_path(path)?;
         let collision_key = components.join("/");
-        if validated
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(is_reserved_activation_name)
+        if components.last().is_some_and(|component| is_reserved_activation_name(component))
             || seen.insert(collision_key, ()).is_some()
         {
             return Err(RuntimeError::UnsafePath((*path).into()));
@@ -259,18 +279,32 @@ fn validate_required_paths(required_entries: &[&str]) -> Result<(), RuntimeError
     Ok(())
 }
 
-fn validate_target_key(target_id: &str, final_name: &OsStr) -> Result<String, RuntimeError> {
-    let (_, components) = validate_path(target_id)?;
-    if components.len() != 1 || target_id != components[0] || final_name != OsStr::new(target_id) {
-        return Err(RuntimeError::UnsafePath(target_id.into()));
+const MAX_PORTABLE_COMPONENT_BYTES: usize = 128;
+
+fn portable_component_key(component: &str) -> Result<String, RuntimeError> {
+    if component.is_empty()
+        || component.len() > MAX_PORTABLE_COMPONENT_BYTES
+        || !component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+    {
+        return Err(RuntimeError::UnsafePath(component.into()));
     }
-    Ok(components.into_iter().next().expect("one target component"))
+    windows_component_key(component)
 }
 
-fn is_reserved_activation_name(name: &str) -> bool {
-    name.starts_with(".melon-activate-")
-        || name.starts_with(".melon-activation-lock-")
-        || name.starts_with(ACTIVATION_RECORD_PREFIX)
+fn validate_target_key(target_id: &str, final_name: &OsStr) -> Result<String, RuntimeError> {
+    let key = portable_component_key(target_id)?;
+    if target_id != key || final_name != OsStr::new(target_id) || is_reserved_activation_name(&key) {
+        return Err(RuntimeError::UnsafePath(target_id.into()));
+    }
+    Ok(key)
+}
+
+fn is_reserved_activation_name(collision_key: &str) -> bool {
+    collision_key.starts_with(".melon-activate-")
+        || collision_key.starts_with(".melon-activation-lock-")
+        || collision_key.starts_with(ACTIVATION_RECORD_PREFIX)
 }
 
 fn validate_archive_control_name(
@@ -278,15 +312,10 @@ fn validate_archive_control_name(
     final_name: &OsStr,
     target_key: &str,
 ) -> Result<(), RuntimeError> {
-    let (archive, components) = validate_path(archive_name)?;
-    let archive = archive
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| RuntimeError::UnsafePath(archive_name.into()))?;
-    if components.len() != 1
-        || archive == target_key
-        || OsStr::new(archive) == final_name
-        || is_reserved_activation_name(archive)
+    let archive_key = portable_component_key(archive_name)?;
+    if archive_key == target_key
+        || OsStr::new(archive_name) == final_name
+        || is_reserved_activation_name(&archive_key)
     {
         return Err(RuntimeError::UnsafePath(archive_name.into()));
     }
@@ -595,12 +624,27 @@ impl Drop for OwnedCacheArtifact {
 struct TargetLock(fs::File);
 
 impl TargetLock {
+    /// Opens one canonical target lock without following links and validates the live file before locking it.
     fn acquire(parent: &Dir, target_key: &str) -> Result<Self, RuntimeError> {
         let digest = Sha256::digest(target_key.as_bytes());
         let name = format!(".melon-activation-lock-{digest:x}");
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).follow(FollowSymlinks::No);
-        let file = parent.open_with(name, &options)?.into_std();
+        let file = parent.open_with(name, &options)?;
+        if !file.metadata()?.is_file() {
+            return Err(RuntimeError::StagingNotEmpty);
+        }
+        #[cfg(unix)]
+        {
+            file.set_permissions(Permissions::from_mode(0o600))?;
+            let metadata = file.metadata()?;
+            if cap_std::fs::MetadataExt::uid(&metadata) != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o177 != 0
+            {
+                return Err(RuntimeError::StagingNotEmpty);
+            }
+        }
+        let file = file.into_std();
         file.lock()?;
         Ok(Self(file))
     }
@@ -2614,6 +2658,66 @@ mod tests {
     }
 
     #[test]
+    fn target_keys_use_one_bounded_portable_ascii_namespace() {
+        let final_name = OsStr::new("x86_64-pc-windows-gnu.v1");
+        let first = validate_target_key("x86_64-pc-windows-gnu.v1", final_name).expect("portable target");
+        let second = validate_target_key("aarch64-apple-darwin.v1", OsStr::new("aarch64-apple-darwin.v1"))
+            .expect("second portable target");
+        assert_eq!(first, "x86_64-pc-windows-gnu.v1");
+        assert_ne!(first, second, "accepted target keys remain unique");
+
+        for target in [
+            "",
+            "runtime?",
+            "runtime*",
+            "runtime|",
+            "runtime<",
+            "runtime>",
+            "runtime\"",
+            "runtime:\u{1f}",
+            "runtime\\child",
+            "Ä",
+            "ä",
+            ".MELON-ACTIVATION-LOCK-DEADBEEF",
+            ".MELON-ACTIVATION-RECORD-DEADBEEF",
+            ".MELON-ACTIVATE-STAGING-DEADBEEF",
+        ] {
+            validate_target_key(target, OsStr::new(target)).expect_err("nonportable target must reject");
+        }
+
+        let maximum = "a".repeat(128);
+        assert_eq!(
+            validate_target_key(&maximum, OsStr::new(&maximum)).expect("maximum target length"),
+            maximum,
+        );
+        let too_long = "a".repeat(129);
+        validate_target_key(&too_long, OsStr::new(&too_long)).expect_err("oversized target must reject");
+        assert_ne!(activation_record_name(&first), activation_record_name(&second));
+        for control in ["archive?.zip", "Ä.zip", "ä.zip", &too_long] {
+            validate_archive_control_name(control, OsStr::new("runtime"), "runtime")
+                .expect_err("nonportable control component must reject");
+        }
+        validate_required_paths(&["bin/.MELON-ACTIVATION-LOCK-DEADBEEF"])
+            .expect_err("uppercase reserved required component must reject");
+    }
+
+    #[test]
+    fn activation_rejects_uppercase_reserved_control_aliases() {
+        let temp = TempDir::new();
+        for name in [
+            ".MELON-ACTIVATE-ARCHIVE-DEADBEEF",
+            ".MELON-ACTIVATION-LOCK-DEADBEEF",
+            ".MELON-ACTIVATION-RECORD-DEADBEEF",
+        ] {
+            let path = temp.0.join(name);
+            fs::write(&path, b"sentinel").expect("control sentinel");
+            activate_runtime(&temp.0, name, "runtime", "00", &temp.0.join("runtime"), REQUIRED_RUNTIME_ENTRIES)
+                .expect_err("uppercase control alias must reject");
+            assert_eq!(fs::read(path).expect("control sentinel remains"), b"sentinel");
+        }
+    }
+
+    #[test]
     fn owned_cache_cleanup_never_unlinks_replacement_name() {
         let temp = TempDir::new();
         let archive = write_archive_candidate(&temp, "runtime.zip", b"archive");
@@ -2661,6 +2765,105 @@ mod tests {
 
         assert!(archive.exists(), "cache artifact remains unclaimed");
         assert_eq!(fs::read_dir(&parent).expect("unsafe parent").count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_lock_is_a_private_regular_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TempDir::new();
+        let lock_name = format!(".melon-activation-lock-{:x}", Sha256::digest(b"runtime"));
+        let lock_path = temp.0.join(&lock_name);
+        fs::write(&lock_path, b"").expect("precreate lock");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).expect("loosen lock");
+        let parent = open_private_directory(&temp.0).expect("parent");
+        let lock = TargetLock::acquire(&parent, "runtime").expect("target lock");
+        let metadata = lock.0.metadata().expect("live lock metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.permissions().mode() & 0o177, 0);
+        drop(lock);
+
+        parent.remove_file(&lock_name).expect("remove regular lock");
+        let path = std::ffi::CString::new(lock_path.as_os_str().as_encoded_bytes()).expect("lock path");
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "create lock FIFO");
+        assert!(TargetLock::acquire(&parent, "runtime").is_err(), "nonregular lock must reject");
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn subprocess_activation_waits_then_reuses_published_runtime() {
+        if let Some(role) = std::env::var_os("MELON_ACTIVATION_RACE_ROLE") {
+            let role = role.to_str().expect("ASCII race role");
+            let root = PathBuf::from(std::env::var_os("MELON_ACTIVATION_RACE_ROOT").expect("race root"));
+            fs::write(root.join(format!("{role}-started")), b"yes").expect("child start signal");
+            let cache = root.join(format!("cache-{role}"));
+            let outcome = activate_runtime(
+                &cache,
+                "runtime.zip",
+                "runtime",
+                &fs::read_to_string(root.join("digest")).expect("digest"),
+                &root.join("runtime"),
+                REQUIRED_RUNTIME_ENTRIES,
+            )
+            .expect("subprocess activation");
+            fs::write(root.join(format!("{role}-outcome")), format!("{outcome:?}"))
+                .expect("child outcome");
+            return;
+        }
+
+        fn wait_for(path: &Path) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !path.exists() {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {}", path.display());
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let temp = TempDir::new();
+        let bytes = runtime_archive(b"same", b"same-cli");
+        fs::write(temp.0.join("digest"), format!("{:x}", Sha256::digest(&bytes))).expect("digest");
+        for role in ["a", "b"] {
+            let cache = temp.0.join(format!("cache-{role}"));
+            fs::create_dir(&cache).expect("cache");
+            #[cfg(unix)]
+            fs::set_permissions(&cache, <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+                .expect("private cache");
+            fs::write(cache.join("runtime.zip"), &bytes).expect("archive candidate");
+        }
+        let spawn = |role: &str| {
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("runtime::tests::subprocess_activation_waits_then_reuses_published_runtime")
+                .arg("--exact")
+                .env("MELON_ACTIVATION_RACE_ROLE", role)
+                .env("MELON_ACTIVATION_RACE_ROOT", &temp.0)
+                .spawn()
+                .expect("spawn activation child")
+        };
+
+        let mut first = spawn("a");
+        wait_for(&temp.0.join("a-before-publish"));
+        assert!(!temp.0.join("runtime").exists(), "A paused before publication");
+        let mut second = spawn("b");
+        wait_for(&temp.0.join("b-started"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(second.try_wait().expect("B state").is_none(), "B blocks on target lock");
+        assert!(!temp.0.join("runtime").exists(), "B cannot publish while A owns lock");
+        fs::write(temp.0.join("release-a"), b"yes").expect("release A");
+        assert!(first.wait().expect("A exit").success());
+        assert!(second.wait().expect("B exit").success());
+        assert_eq!(fs::read_to_string(temp.0.join("a-outcome")).expect("A outcome"), "Published");
+        assert_eq!(fs::read_to_string(temp.0.join("b-outcome")).expect("B outcome"), "Reused");
+        assert!(temp.0.join(activation_record_name("runtime")).is_file(), "activation record remains");
+        for role in ["a", "b"] {
+            assert_eq!(
+                fs::read_dir(temp.0.join(format!("cache-{role}"))).expect("cache remains").count(),
+                0,
+                "claimed cache leaves no residue",
+            );
+        }
+        assert_no_activation_residue(&temp.0);
     }
 
     #[cfg(any(target_os = "linux", windows))]
