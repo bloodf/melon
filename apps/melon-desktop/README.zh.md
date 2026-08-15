@@ -14,6 +14,10 @@ pnpm run melon:check
 
 `pnpm run melon:dev` 启动 Vite 设置页面和 Tauri 应用。生成的 Node sidecar 与暂存 Harness 资源均被忽略；打包脚本根据固定并验证的运行时输入创建它们。
 
+## DurinDoor 负载
+
+原生发布运行器使用已提交的 npm 锁构建 DurinDoor CLI 与运行时种子。`payload.json` 通过 SHA-256 绑定按可移植路径排序的 `metadata/runtime-seed-manifest.json`；该清单记录每个锁定种子文件在未来应用数据运行时根目录下的相对路径、大小、SHA-256 与可执行位，并固定 `better-sqlite3`、`sql.js` 的包和本机文件路径及版本。描述符不携带可执行脚本或参数，且在原生安装安全合并种子前继续标记 `managedLaunchReady: false`。
+
 ## 信任模型
 
 Tauri 首先启动标签为 `setup` 的一次性窗口。生成的应用权限仅向该标签授予 `status`、`probe`、`activate` 和 `shutdown`，能力文件不包含远程 URL 授权。激活将销毁设置窗口，并创建独立且无授权的 `main` Harness 窗口。返回“连接设置”时将反向执行原生生命周期，而不是在有权限的 webview 中导航。

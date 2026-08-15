@@ -14,6 +14,7 @@ import {
   publishExclusive,
   preflightNodeHeadersArchive,
   publishValidatedPayload,
+  runtimeSeedManifest,
   thirdPartyNotices,
   targetSpec,
   validateLockedManifests,
@@ -65,6 +66,8 @@ function fixture(target = 'x86_64-unknown-linux-gnu'): PayloadEntry[] {
     { path: 'app/node_modules/durindoor/cli.js', data: text('#!/usr/bin/env node\n'), mode: 0o644 },
     { path: 'app/node_modules/durindoor/package.json', data: text('{"name":"durindoor","version":"3.15.2","license":"MIT"}'), mode: 0o644 },
     { path: 'app/node_modules/durindoor/LICENSE', data: text('MIT'), mode: 0o644 },
+    { path: 'runtime-seed/package.json', data: text('{"name":"melon-durindoor-runtime-seed","version":"0.1.0"}'), mode: 0o644 },
+    { path: 'runtime-seed/package-lock.json', data: text('{"lockfileVersion":3}'), mode: 0o644 },
     { path: 'runtime-seed/node_modules/sql.js/package.json', data: text('{"name":"sql.js","version":"1.14.1","license":"MIT"}'), mode: 0o644 },
     { path: 'runtime-seed/node_modules/sql.js/LICENSE', data: text('MIT sql.js'), mode: 0o644 },
     { path: 'runtime-seed/node_modules/sql.js/dist/sql-wasm.wasm', data: wasm, mode: 0o644 },
@@ -78,9 +81,11 @@ function fixture(target = 'x86_64-unknown-linux-gnu'): PayloadEntry[] {
     ]),
     { path: 'licenses/node-LICENSE', data: text('Node license'), mode: 0o644 },
     { path: 'licenses/durindoor-LICENSE', data: text('MIT'), mode: 0o644 },
-    { path: 'payload.json', data: text(JSON.stringify({ schemaVersion: 1, target, durindoorVersion: '3.15.2', nodeVersion: '20.20.2', node: unix ? 'bin/node' : 'bin/node.exe', runtimeSeedPath: 'runtime-seed', managedLaunchReady: false })), mode: 0o644 },
   ]
   entries.push(thirdPartyNotices(entries))
+  const manifest = runtimeSeedManifest(entries, { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })
+  entries.push({ path: manifest.path, data: manifest.bytes, mode: 0o644 })
+  entries.push({ path: 'payload.json', data: text(JSON.stringify({ schemaVersion: 1, target, durindoorVersion: '3.15.2', nodeVersion: '20.20.2', node: unix ? 'bin/node' : 'bin/node.exe', runtimeSeedPath: 'runtime-seed', runtimeSeedManifest: manifest.descriptor, managedLaunchReady: false })), mode: 0o644 })
   return entries
 }
 
@@ -97,6 +102,61 @@ describe('canonical DurinDoor payload', () => {
     expect(inspected.find(entry => entry.path.includes('/traybin/'))?.mode).toBe(0o755)
     expect(inspected.some(entry => entry.path.includes('/.bin/'))).toBe(false)
   })
+  it('emits canonical runtime-seed authority independent of traversal order and mtime', () => {
+    const entries = fixture().filter(entry => !['payload.json', 'metadata/runtime-seed-manifest.json'].includes(entry.path))
+    const first = runtimeSeedManifest(entries, { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })
+    const second = runtimeSeedManifest([...entries].reverse(), { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })
+    const decoded = JSON.parse(first.bytes.toString()) as { files: Array<{ size: number }> }
+    expect(Buffer.compare(first.bytes, second.bytes)).toBe(0)
+    expect(first.descriptor).toEqual(second.descriptor)
+    expect(first.descriptor.destination).toBe('data-runtime-root')
+    expect(first.descriptor.probeVersion).toBe(1)
+    expect(first.descriptor.fileCount).toBe(decoded.files.length)
+    expect(first.descriptor.totalBytes).toBe(decoded.files.reduce((sum, file) => sum + file.size, 0))
+    expect(first.descriptor.sha256).toBe(createHash('sha256').update(first.bytes).digest('hex'))
+    expect(first.descriptor.modules).toEqual({
+      betterSqlite3: { packagePath: 'node_modules/better-sqlite3/package.json', binaryPath: 'node_modules/better-sqlite3/build/Release/better_sqlite3.node', version: '12.6.2' },
+      sqlJs: { packagePath: 'node_modules/sql.js/package.json', wasmPath: 'node_modules/sql.js/dist/sql-wasm.wasm', version: '1.14.1' },
+    })
+    expect(JSON.stringify(first.descriptor)).not.toMatch(/script|argv|command/i)
+  })
+
+  it('changes runtime-seed authority for one byte or executable-mode change', () => {
+    const entries = fixture().filter(entry => !['payload.json', 'metadata/runtime-seed-manifest.json'].includes(entry.path))
+    const original = runtimeSeedManifest(entries, { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })
+    const changedByte = entries.map(entry => entry.path.endsWith('sql-wasm.wasm') ? { ...entry, data: Uint8Array.from([...entry.data, 1]) } : entry)
+    const changedMode = entries.map(entry => entry.path.endsWith('sql-wasm.wasm') ? { ...entry, mode: 0o755 } : entry)
+    expect(runtimeSeedManifest(changedByte, { betterSqlite3: '12.6.2', sqlJs: '1.14.1' }).descriptor.sha256).not.toBe(original.descriptor.sha256)
+    expect(runtimeSeedManifest(changedMode, { betterSqlite3: '12.6.2', sqlJs: '1.14.1' }).descriptor.sha256).not.toBe(original.descriptor.sha256)
+  })
+
+  it.each(['../escape', '/absolute', 'node_modules\\alias', 'node_modules/sql.js:ads', 'node_modules/CON/file', 'node_modules/bad\nname', 'node_modules/café', 'node_modules/SQL.JS/package.json'])('rejects unsafe or colliding runtime-seed path %s', (path) => {
+    const entries = fixture().filter(entry => !['payload.json', 'metadata/runtime-seed-manifest.json'].includes(entry.path))
+    const candidate = path === 'node_modules/SQL.JS/package.json'
+      ? { path: `runtime-seed/${path}`, data: text('{}'), mode: 0o644 }
+      : path === 'node_modules/café'
+        ? { path: 'runtime-seed/node_modules/café', data: text('x'), mode: 0o644 }
+        : { ...entries.find(entry => entry.path.endsWith('sql-wasm.wasm'))!, path: `runtime-seed/${path}` }
+    const source = path === 'node_modules/café' ? [...entries, { path: 'runtime-seed/node_modules/café', data: text('y'), mode: 0o644 }] : entries
+    expect(() => runtimeSeedManifest([...source, candidate], { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })).toThrow(/path|collision|unsafe|reserved/i)
+  })
+  it('rejects links, special files, ambiguous modes, and wrong locked versions', () => {
+    const entries = fixture().filter(entry => !['payload.json', 'metadata/runtime-seed-manifest.json'].includes(entry.path))
+    const seedFile = entries.find(entry => entry.path.endsWith('sql-wasm.wasm'))!
+    for (const type of ['symlink', 'hardlink', 'special'] as const) {
+      expect(() => runtimeSeedManifest([...entries.filter(entry => entry !== seedFile), { ...seedFile, type }], { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })).toThrow(/link|special/i)
+    }
+    expect(() => runtimeSeedManifest(entries.map(entry => entry === seedFile ? { ...entry, mode: 0o600 } : entry), { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })).toThrow(/mode/i)
+    expect(() => runtimeSeedManifest(entries, { betterSqlite3: '12.6.1', sqlJs: '1.14.1' })).toThrow(/version/i)
+  })
+
+  it.each([
+    ['tampered sidecar', (entries: PayloadEntry[]) => entries.map(entry => entry.path === 'metadata/runtime-seed-manifest.json' ? { ...entry, data: text('{}') } : entry)],
+    ['missing seed file', (entries: PayloadEntry[]) => entries.filter(entry => !entry.path.endsWith('sql-wasm.wasm'))],
+    ['extra seed file', (entries: PayloadEntry[]) => [...entries, { path: 'runtime-seed/extra', data: text('x'), mode: 0o644 }]],
+  ])('rejects %s against structured runtime-seed authority', (_name, mutate) => {
+    expect(() => validatePayloadEntries(mutate(fixture()), 'x86_64-unknown-linux-gnu')).toThrow(/manifest|runtime seed|WASM/i)
+  })
 
   it.each([
     ['traversal', [{ path: '../escape', data: text('x'), mode: 0o644 }]],
@@ -107,6 +167,18 @@ describe('canonical DurinDoor payload', () => {
     ['user path', [{ path: 'home/user/.9router/data', data: text('x'), mode: 0o600 }]],
   ])('rejects %s entries', (_name, bad) => {
     expect(() => canonicalZip(bad)).toThrow()
+  })
+  it.each(['hardlink', 'special'] as const)('rejects a %s entry before emitting ZIP bytes', (type) => {
+    let bytes: Buffer | undefined
+    expect(() => { bytes = canonicalZip([{ path: 'unsafe', data: text('x'), mode: 0o644, type }]) }).toThrow(/entry|forbidden|unsupported/i)
+    expect(bytes).toBeUndefined()
+  })
+
+  it('rejects a payload descriptor that marks managed launch ready', () => {
+    const entries = fixture().map(entry => entry.path === 'payload.json'
+      ? { ...entry, data: text(JSON.stringify({ ...JSON.parse(Buffer.from(entry.data).toString()), managedLaunchReady: true })) }
+      : entry)
+    expect(() => validatePayloadEntries(entries, 'x86_64-unknown-linux-gnu')).toThrow(/managed launch/i)
   })
 
   it('rejects exact and nested .bin path segments', () => {

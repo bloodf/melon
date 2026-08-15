@@ -15,7 +15,7 @@ export interface PayloadEntry {
   path: string
   data: Uint8Array
   mode: number
-  type?: 'file' | 'symlink'
+  type?: 'file' | 'symlink' | 'hardlink' | 'special'
 }
 
 export interface InspectedEntry {
@@ -61,6 +61,11 @@ const MAX_ZIP_ENTRIES = 16_384
 const MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 const UINT32_MAX = 0xffff_ffff
 const FORBIDDEN_SEGMENTS = new Set(['.env', '.9router', '.durindoor'])
+const RUNTIME_SEED_PREFIX = 'runtime-seed/'
+const RUNTIME_SEED_MANIFEST_PATH = 'metadata/runtime-seed-manifest.json'
+const SEED_VERSIONS = { betterSqlite3: '12.6.2', sqlJs: '1.14.1' } as const
+const MAX_PORTABLE_COMPONENT_BYTES = 128
+const COPY_BUFFER_BYTES = 64 * 1024
 
 /** Resolves one supported Rust target and rejects an archive not named by the committed pins. */
 export function targetSpec(target: string, archive?: string): Target {
@@ -106,12 +111,11 @@ export function validateCanonicalMetadata(entries: ReadonlyArray<{ path: string;
   }
 }
 
-/** Creates a canonical ZIP containing regular files only, sorted by UTF-8 path. */
 export function canonicalZip(source: PayloadEntry[]): Buffer {
   validateCanonicalMetadata(source.map(entry => ({ path: entry.path, size: entry.data.byteLength })))
   const entries = source.map(entry => {
     const path = zipPath(entry.path)
-    if (entry.type === 'symlink') throw new Error(`symlink entry forbidden: ${path}`)
+    if (entry.type !== undefined && entry.type !== 'file') throw new Error(`unsupported ZIP entry: ${path}`)
     if (entry.mode !== 0o644 && entry.mode !== 0o755) throw new Error(`unsupported mode for ${path}`)
     return { ...entry, path, data: Buffer.from(entry.data) }
   }).sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)))
@@ -192,6 +196,120 @@ function hasArchitecture(entry: PayloadEntry | undefined, architecture: Target['
 }
 
 
+export interface RuntimeSeedManifestDescriptor {
+  path: string
+  sha256: string
+  fileCount: number
+  totalBytes: number
+  destination: 'data-runtime-root'
+  probeVersion: 1
+  modules: {
+    betterSqlite3: { packagePath: string; binaryPath: string; version: string }
+    sqlJs: { packagePath: string; wasmPath: string; version: string }
+  }
+}
+
+interface RuntimeSeedFile {
+  path: string
+  size: number
+  sha256: string
+  executable: boolean
+}
+
+function seedPathKey(path: string): string {
+  if (path.length === 0 || path.startsWith('/') || path.includes('\\') || path.includes(':') || /^[A-Za-z]:/.test(path) || /[\0-\x1f\x7f]/.test(path)) throw new Error(`unsafe runtime seed path: ${path}`)
+  const keys = path.split('/').map(component => {
+    if (component.length === 0 || component === '.' || component === '..' || Buffer.byteLength(component) > MAX_PORTABLE_COMPONENT_BYTES || component !== component.trimEnd() || component.endsWith('.')) throw new Error(`unsafe runtime seed path: ${path}`)
+    const key = component.normalize('NFC').toLowerCase()
+    const stem = key.split('.')[0]!
+    if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])$/.test(stem)) throw new Error(`reserved runtime seed path: ${path}`)
+    return key
+  })
+  return keys.join('/')
+}
+
+function packageVersion(entries: Map<string, PayloadEntry>, path: string, name: string, expected: string): void {
+  const entry = entries.get(`${RUNTIME_SEED_PREFIX}${path}`)
+  if (entry === undefined) throw new Error(`runtime seed module package missing: ${path}`)
+  const manifest = JSON.parse(Buffer.from(entry.data).toString('utf8')) as { name?: unknown; version?: unknown }
+  if (manifest.name !== name || manifest.version !== expected) throw new Error(`runtime seed ${name} version must match locked ${expected}`)
+}
+
+function lockedSeedVersions(root: string): { betterSqlite3: string; sqlJs: string } {
+  const lock = readJson(join(root, 'runtime-seed/package-lock.json'))
+  const packages = lock.packages as Record<string, { version?: string }> | undefined
+  const betterSqlite3 = packages?.['node_modules/better-sqlite3']?.version
+  const sqlJs = packages?.['node_modules/sql.js']?.version
+  if (betterSqlite3 !== SEED_VERSIONS.betterSqlite3 || sqlJs !== SEED_VERSIONS.sqlJs) throw new Error('runtime seed lock versions do not match payload contract')
+  return { betterSqlite3, sqlJs }
+}
+
+function sha256Bytes(data: Uint8Array): string {
+  const hash = createHash('sha256')
+  for (let offset = 0; offset < data.byteLength; offset += COPY_BUFFER_BYTES) hash.update(data.subarray(offset, offset + COPY_BUFFER_BYTES))
+  return hash.digest('hex')
+}
+
+/** Builds canonical per-file authority for non-destructive runtime seed installation. */
+export function runtimeSeedManifest(
+  entries: PayloadEntry[],
+  versions: { betterSqlite3: string; sqlJs: string } = SEED_VERSIONS,
+): { path: string; bytes: Buffer; descriptor: RuntimeSeedManifestDescriptor } {
+  if (versions.betterSqlite3 !== SEED_VERSIONS.betterSqlite3 || versions.sqlJs !== SEED_VERSIONS.sqlJs) throw new Error('runtime seed versions must match committed lock')
+  const source = entries.filter(entry => entry.path.startsWith(RUNTIME_SEED_PREFIX))
+  if (source.length === 0 || source.length > MAX_ZIP_ENTRIES) throw new Error('runtime seed file count exceeds supported limits')
+  const keys = new Map<string, string>()
+  let totalBytes = 0
+  const files: RuntimeSeedFile[] = source.map(entry => {
+    const path = entry.path.slice(RUNTIME_SEED_PREFIX.length)
+    const key = seedPathKey(path)
+    const prior = keys.get(key)
+    if (prior !== undefined) throw new Error(`runtime seed path collision: ${prior} and ${path}`)
+    keys.set(key, path)
+    if (entry.type !== undefined && entry.type !== 'file') throw new Error(`runtime seed link or special file forbidden: ${path}`)
+    if (entry.mode !== 0o644 && entry.mode !== 0o755) throw new Error(`ambiguous runtime seed mode: ${path}`)
+    if (entry.data.byteLength > UINT32_MAX) throw new Error(`runtime seed file exceeds supported size: ${path}`)
+    totalBytes += entry.data.byteLength
+    if (totalBytes > MAX_UNCOMPRESSED_BYTES) throw new Error('runtime seed exceeds supported total size')
+    return { path, size: entry.data.byteLength, sha256: sha256Bytes(entry.data), executable: entry.mode === 0o755 }
+  }).sort((left, right) => Buffer.from(seedPathKey(left.path)).compare(Buffer.from(seedPathKey(right.path))))
+  const byPath = new Map(source.map(entry => [entry.path, entry]))
+  const modules = {
+    betterSqlite3: { packagePath: 'node_modules/better-sqlite3/package.json', binaryPath: 'node_modules/better-sqlite3/build/Release/better_sqlite3.node', version: versions.betterSqlite3 },
+    sqlJs: { packagePath: 'node_modules/sql.js/package.json', wasmPath: 'node_modules/sql.js/dist/sql-wasm.wasm', version: versions.sqlJs },
+  }
+  const modulePaths = [modules.betterSqlite3.packagePath, modules.betterSqlite3.binaryPath, modules.sqlJs.packagePath, modules.sqlJs.wasmPath]
+  if (new Set(modulePaths.map(seedPathKey)).size !== modulePaths.length || modulePaths.some(path => !byPath.has(`${RUNTIME_SEED_PREFIX}${path}`))) throw new Error('runtime seed module paths are missing or duplicated')
+  packageVersion(byPath, modules.betterSqlite3.packagePath, 'better-sqlite3', versions.betterSqlite3)
+  packageVersion(byPath, modules.sqlJs.packagePath, 'sql.js', versions.sqlJs)
+  const bytes = Buffer.from(`${JSON.stringify({ schemaVersion: 1, files }, null, 2)}\n`)
+  return {
+    path: RUNTIME_SEED_MANIFEST_PATH,
+    bytes,
+    descriptor: {
+      path: RUNTIME_SEED_MANIFEST_PATH,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      fileCount: files.length,
+      totalBytes,
+      destination: 'data-runtime-root',
+      probeVersion: 1,
+      modules,
+    },
+  }
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function validateRuntimeSeedAuthority(entries: PayloadEntry[], descriptor: Record<string, unknown>): void {
+  if (descriptor.runtimeSeedPath !== 'runtime-seed') throw new Error('runtime seed source path mismatch')
+  const authority = runtimeSeedManifest(entries)
+  const manifest = entries.find(entry => entry.path === authority.path)
+  if (manifest === undefined || manifest.mode !== 0o644 || Buffer.compare(Buffer.from(manifest.data), authority.bytes) !== 0) throw new Error('runtime seed manifest content mismatch')
+  if (!sameJson(descriptor.runtimeSeedManifest, authority.descriptor)) throw new Error('runtime seed manifest descriptor mismatch')
+}
+
 interface PackageNotice {
   name: string
   version: string
@@ -244,6 +362,7 @@ export function validatePayloadEntries(entries: PayloadEntry[], target: string):
   if (descriptorEntry === undefined) throw new Error('payload descriptor missing')
   const descriptor = JSON.parse(Buffer.from(descriptorEntry.data).toString('utf8')) as unknown
   if (descriptor === null || typeof descriptor !== 'object' || !('node' in descriptor) || descriptor.node !== nodePath) throw new Error('payload descriptor Node path mismatch')
+  if (!('managedLaunchReady' in descriptor) || descriptor.managedLaunchReady !== false) throw new Error('payload descriptor must keep managed launch disabled')
   if (!byPath.has('app/node_modules/durindoor/cli.js')) throw new Error('payload is missing DurinDoor CLI')
   if (!byPath.has('licenses/durindoor-LICENSE')) throw new Error('payload is missing DurinDoor license')
   if (!byPath.has('licenses/node-LICENSE')) throw new Error('payload is missing Node license')
@@ -263,6 +382,7 @@ export function validatePayloadEntries(entries: PayloadEntry[], target: string):
     if (tray === undefined || tray.mode !== 0o755 || !hasMagic(tray, spec.magic) || !hasArchitecture(tray, spec.architecture)) throw new Error('payload has missing, non-executable, or wrong-architecture systray2 binary')
   }
   if (entries.some(entry => entry.path.includes('/systray/'))) throw new Error('legacy systray is forbidden')
+  validateRuntimeSeedAuthority(entries, descriptor as Record<string, unknown>)
 }
 
 function readJson(path: string): Record<string, unknown> {
@@ -324,7 +444,10 @@ function collectFiles(root: string, prefix: string, omit: (path: string) => bool
       const info = lstatSync(path)
       if (info.isSymbolicLink()) throw new Error(`symlink in staged closure: ${relativePath}`)
       if (info.isDirectory()) visit(path)
-      else if (info.isFile()) entries.push({ path: `${prefix}/${relativePath}`, data: readFileSync(path), mode: info.mode & 0o111 ? 0o755 : 0o644 })
+      else if (info.isFile()) {
+        if (info.nlink !== 1) throw new Error(`hardlink in staged closure: ${relativePath}`)
+        entries.push({ path: `${prefix}/${relativePath}`, data: readFileSync(path), mode: info.mode & 0o111 ? 0o755 : 0o644 })
+      }
       else throw new Error(`unsupported staged entry: ${relativePath}`)
     }
   }
@@ -749,7 +872,9 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
       node: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/node-LICENSE')!.data).digest('hex'),
       notices: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/THIRD_PARTY_NOTICES.json')!.data).digest('hex'),
     }
-    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: DURINDOOR_VERSION, nodeVersion: VERSION, nodeAbi, toolchain: toolchain.evidence, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
+    const seedManifest = runtimeSeedManifest(entries, lockedSeedVersions(manifests))
+    entries.push({ path: seedManifest.path, data: seedManifest.bytes, mode: 0o644 })
+    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: DURINDOOR_VERSION, nodeVersion: VERSION, nodeAbi, toolchain: toolchain.evidence, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', runtimeSeedManifest: seedManifest.descriptor, managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
     entries.push({ path: 'payload.json', data: Buffer.from(`${JSON.stringify(descriptor, null, 2)}\n`), mode: 0o644 })
     validatePayloadEntries(entries, options.target)
     const bytes = canonicalZip(entries)
