@@ -1793,6 +1793,55 @@ mod tests {
         writer.finish().expect("finish ZIP").into_inner()
     }
 
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BuilderFixture {
+        root: PathBuf,
+        cache: PathBuf,
+        archive: String,
+        target_id: String,
+        sha256: String,
+        final_dir: PathBuf,
+    }
+
+    #[test]
+    #[ignore = "requires MELON_PAYLOAD_FIXTURE"]
+    fn builder_payload_fixture_is_accepted() {
+        let descriptor = PathBuf::from(std::env::var_os("MELON_PAYLOAD_FIXTURE").expect("fixture descriptor"));
+        let fixture: BuilderFixture = serde_json::from_slice(&fs::read(&descriptor).expect("read fixture descriptor"))
+            .expect("parse fixture descriptor");
+        let root = fs::canonicalize(&fixture.root).expect("canonical fixture root");
+        let cache = fs::canonicalize(&fixture.cache).expect("canonical fixture cache");
+        let final_parent = fs::canonicalize(fixture.final_dir.parent().expect("fixture final parent"))
+            .expect("canonical fixture final parent");
+        assert!(cache.starts_with(&root) && final_parent.starts_with(&root), "fixture paths stay under builder-owned root");
+        assert!(Path::new(&fixture.archive).components().count() == 1, "archive is one cache component");
+        let outcome = activate_runtime(
+            &cache,
+            &fixture.archive,
+            &fixture.target_id,
+            &fixture.sha256,
+            &fixture.final_dir,
+            &[
+                "bin/node",
+                "app/node_modules/durindoor/cli.js",
+                "runtime-seed/node_modules/sql.js/dist/sql-wasm.wasm",
+                "runtime-seed/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+                "licenses/durindoor-LICENSE",
+                "payload.json",
+            ],
+        )
+        .expect("builder payload activates");
+        assert_eq!(outcome, ActivationOutcome::Published);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(fs::metadata(fixture.final_dir.join("bin/node")).expect("node metadata").permissions().mode() & 0o777, 0o755);
+            let tray = fixture.final_dir.join("runtime-seed/node_modules/systray2/traybin/tray_linux_release");
+            assert_eq!(fs::metadata(tray).expect("tray metadata").permissions().mode() & 0o777, 0o755);
+        }
+    }
+
     fn archive_with_unix_link_extra(id: u16, local: bool, central: bool) -> Vec<u8> {
         let mut bytes = archive(&[("link", b"")]);
         let data = if id == 0x756e {

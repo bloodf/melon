@@ -1,0 +1,13 @@
+{
+  "name": "melon-durindoor-runtime-seed",
+  "version": "0.1.0",
+  "private": true,
+  "allowScripts": {
+    "better-sqlite3@12.6.2": true
+  },
+  "dependencies": {
+    "better-sqlite3": "12.6.2",
+    "sql.js": "1.14.1",
+    "systray2": "2.1.4"
+  }
+}

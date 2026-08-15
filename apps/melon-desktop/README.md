@@ -14,6 +14,20 @@ pnpm run melon:check
 
 `pnpm run melon:dev` starts the Vite setup page and Tauri application. Generated Node sidecars and staged Harness resources are ignored; packaging scripts create them from pinned, verified runtime inputs.
 
+## DurinDoor payload
+
+Release runners build one target-native DurinDoor payload with committed CLI and runtime-seed npm locks. The builder verifies the official Node 20.20.2 archive checksum, installs the DurinDoor closure with scripts disabled, installs the native runtime seed with its reviewed `better-sqlite3` lifecycle enabled under an isolated `DATA_DIR`, excludes npm shims and all symlinks, validates the staged CLI offline, and writes a deterministic ZIP.
+
+```sh
+pnpm run build:durindoor-payload -- \
+  --target x86_64-unknown-linux-gnu \
+  --node-archive /path/to/node-v20.20.2-linux-x64.tar.gz \
+  --checksums /path/to/SHASUMS256.txt \
+  --output /path/to/melon-durindoor-x86_64-unknown-linux-gnu.zip
+```
+
+Run `pnpm run test:durindoor-payload` for canonical ZIP, target policy, locked-version, native/WASM, license-notice, and Rust activation fixture coverage. Native release evidence remains target-runner specific: Linux cannot prove the macOS or Windows `better-sqlite3` and tray binaries. Payload generation does not make managed launch ready: `payload.json` records `runtimeSeedPath` and `managedLaunchReady: false`; managed start must remain disabled until Rust installs missing locked seed files non-destructively and validates them with bundled Node.
+
 ## Trust model
 
 Tauri starts a disposable window labeled `setup`. Generated application permissions grant `status`, `probe`, `activate`, and `shutdown` only to that label, and capability files contain no remote URL grants. Activation will replace the setup window with a separately created, ungranted `main` Harness window. Returning to Connection Settings will reverse that native lifecycle rather than navigate the privileged webview.
