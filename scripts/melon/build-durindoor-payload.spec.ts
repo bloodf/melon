@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   canonicalZip,
@@ -36,6 +36,17 @@ function tarLink(type: '1' | '2', name: string, linkName: string): Buffer {
   let sum = 0; for (const byte of header.subarray(0, 512)) sum += byte
   header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'ascii')
   return header
+}
+function tarRegular(name: string, data: Buffer): Buffer {
+  const header = Buffer.alloc(512)
+  header.write(name, 0, 100, 'utf8')
+  header.write('0000644\x00', 100, 'ascii'); header.write('0000000\x00', 108, 'ascii'); header.write('0000000\x00', 116, 'ascii')
+  header.write(`${data.length.toString(8).padStart(11, '0')}\x00`, 124, 'ascii'); header[156] = 0x30
+  header.fill(0x20, 148, 156)
+  let sum = 0; for (const byte of header) sum += byte
+  header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'ascii')
+  const padding = Buffer.alloc((512 - (data.length % 512)) % 512)
+  return Buffer.concat([header, data, padding])
 }
 const pe = Uint8Array.from(Array(80).fill(0)); pe.set([0x4d, 0x5a]); pe[0x3c] = 64; pe.set([0x50, 0x45, 0, 0, 0x64, 0x86], 64)
 const wasm = Uint8Array.from([0, 0x61, 0x73, 0x6d, 1])
@@ -139,20 +150,11 @@ describe('canonical DurinDoor payload', () => {
     // Select only bin/node; bin/npm is a sibling, not selected
     expect(preflightNodeArchive(archive, [binNode])).toHaveLength(1)
   })
-  it('rejects duplicate selected required name with one regular and one hardlink entry', () => {
-    const work = root()
-    const archive = join(work, 'node duplicate.tar')
-    const license = join(work, 'node-v20.20.2-linux-x64', 'LICENSE')
-    mkdirSync(dirname(license), { recursive: true })
-    writeFileSync(license, 'ISC\n')
-    // tar -rf on the same file twice: second entry overwrites first in tar
-    spawnSync('tar', ['cvf', archive, '-C', work,
-      'node-v20.20.2-linux-x64/LICENSE'], { cwd: work })
-    spawnSync('tar', ['rf', archive, '-C', work,
-      'node-v20.20.2-linux-x64/LICENSE'], { cwd: work })
-    const r = spawnSync('tar', ['tvf', archive], { encoding: 'utf8' })
-    console.log('tar contents:', r.stdout)
+  it('rejects duplicate regular file entries sharing the same selected name', () => {
+    const archive = join(root(), 'node duplicate.tar')
     const selected = 'node-v20.20.2-linux-x64/LICENSE'
+    const record = tarRegular(selected, Buffer.from('ISC\n'))
+    writeFileSync(archive, Buffer.concat([record, record, Buffer.alloc(1024)]))
     expect(() => preflightNodeArchive(archive, [selected])).toThrow(/duplicate/)
   })
   it.each([
