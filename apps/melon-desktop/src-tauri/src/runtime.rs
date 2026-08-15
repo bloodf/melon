@@ -126,6 +126,7 @@ pub(crate) enum ActivationOutcome {
 pub(crate) fn activate_runtime(
     cache_dir: &Path,
     archive_name: &str,
+    target_id: &str,
     expected_sha256: &str,
     final_dir: &Path,
     required_entries: &[&str],
@@ -139,9 +140,14 @@ pub(crate) fn activate_runtime(
     let final_name = final_dir
         .file_name()
         .ok_or_else(|| RuntimeError::UnsafePath(final_dir.display().to_string()))?;
+    let target_key = validate_target_key(target_id, final_name)?;
     let parent = open_private_directory(parent_path)?;
-    let _target_lock = TargetLock::acquire(&parent, final_name)?;
-    let mut archive = OwnedCacheArtifact::claim(cache_dir, archive_name)?;
+    let existing_final = open_optional_private_child(parent_path, &parent, final_name)?;
+    let cache = open_private_directory(cache_dir)?;
+    validate_cache_disjointness(cache_dir, &cache, &parent, existing_final.as_ref())?;
+    validate_archive_control_name(archive_name, final_name, &target_key)?;
+    let _target_lock = TargetLock::acquire(&parent, &target_key)?;
+    let mut archive = OwnedCacheArtifact::claim(cache, archive_name)?;
     let digest = match parse_sha256(expected_sha256).and_then(|digest| {
         validate_required_paths(required_entries)?;
         Ok(digest)
@@ -157,6 +163,8 @@ pub(crate) fn activate_runtime(
         parent_path,
         &parent,
         final_name,
+        &target_key,
+        existing_final,
         required_entries,
     );
     let cleanup = archive.cleanup();
@@ -170,17 +178,19 @@ fn activate_claimed(
     parent_path: &Path,
     parent: &Dir,
     final_name: &OsStr,
+    target_key: &str,
+    existing_final: Option<Dir>,
     required_entries: &[&str],
 ) -> Result<ActivationOutcome, RuntimeError> {
-    if let Some(final_dir) = open_optional_private_child(parent_path, parent, final_name)? {
-        if reusable_runtime(parent_path, parent, final_name, &final_dir, digest, required_entries)? {
+    if let Some(final_dir) = existing_final {
+        if reusable_runtime(parent_path, parent, target_key, &final_dir, digest, required_entries)? {
             return Ok(ActivationOutcome::Reused);
         }
         return Err(RuntimeError::Activation(
             "existing runtime differs; replacement is disabled until recovery-safe swapping is available".into(),
         ));
     }
-    remove_stale_activation_record(parent, final_name)?;
+    remove_stale_activation_record(parent, target_key)?;
     let mut staging = ActivationDirectory::create(parent_path, parent, ".melon-activate-staging")?;
     let result = (|| {
         archive.seek(io::SeekFrom::Start(0))?;
@@ -193,8 +203,8 @@ fn activate_claimed(
         staging.reopen()?;
         validate_required_entries(staging.dir(), required_entries)?;
         let tree_digest = hash_runtime_tree(staging.dir())?;
-        let record_name = activation_record_name(final_name);
-        write_activation_record(parent_path, parent, final_name, digest, &tree_digest)?;
+        let record_name = activation_record_name(target_key);
+        write_activation_record(parent, target_key, digest, &tree_digest)?;
         let staging_name = staging
             .path()
             .file_name()
@@ -235,12 +245,13 @@ fn validate_required_paths(required_entries: &[&str]) -> Result<(), RuntimeError
     }
     let mut seen = HashMap::with_capacity(required_entries.len());
     for path in required_entries {
-        let (validated, _) = validate_path(path)?;
+        let (validated, components) = validate_path(path)?;
+        let collision_key = components.join("/");
         if validated
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with(ACTIVATION_RECORD_PREFIX))
-            || seen.insert(validated, ()).is_some()
+            .is_some_and(is_reserved_activation_name)
+            || seen.insert(collision_key, ()).is_some()
         {
             return Err(RuntimeError::UnsafePath((*path).into()));
         }
@@ -248,6 +259,39 @@ fn validate_required_paths(required_entries: &[&str]) -> Result<(), RuntimeError
     Ok(())
 }
 
+fn validate_target_key(target_id: &str, final_name: &OsStr) -> Result<String, RuntimeError> {
+    let (_, components) = validate_path(target_id)?;
+    if components.len() != 1 || target_id != components[0] || final_name != OsStr::new(target_id) {
+        return Err(RuntimeError::UnsafePath(target_id.into()));
+    }
+    Ok(components.into_iter().next().expect("one target component"))
+}
+
+fn is_reserved_activation_name(name: &str) -> bool {
+    name.starts_with(".melon-activate-")
+        || name.starts_with(".melon-activation-lock-")
+        || name.starts_with(ACTIVATION_RECORD_PREFIX)
+}
+
+fn validate_archive_control_name(
+    archive_name: &str,
+    final_name: &OsStr,
+    target_key: &str,
+) -> Result<(), RuntimeError> {
+    let (archive, components) = validate_path(archive_name)?;
+    let archive = archive
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| RuntimeError::UnsafePath(archive_name.into()))?;
+    if components.len() != 1
+        || archive == target_key
+        || OsStr::new(archive) == final_name
+        || is_reserved_activation_name(archive)
+    {
+        return Err(RuntimeError::UnsafePath(archive_name.into()));
+    }
+    Ok(())
+}
 fn validate_required_entries(dir: &Dir, required_entries: &[&str]) -> Result<(), RuntimeError> {
     for path in required_entries {
         let path = Path::new(path);
@@ -275,27 +319,25 @@ fn validate_required_entries(dir: &Dir, required_entries: &[&str]) -> Result<(),
     Ok(())
 }
 
-fn activation_record_name(final_name: &OsStr) -> String {
-    let digest = Sha256::digest(final_name.as_encoded_bytes());
+fn activation_record_name(target_key: &str) -> String {
+    let digest = Sha256::digest(target_key.as_bytes());
     format!("{ACTIVATION_RECORD_PREFIX}{digest:x}")
 }
 
 fn write_activation_record(
-    _parent_path: &Path,
     parent: &Dir,
-    final_name: &OsStr,
+    target_key: &str,
     archive_digest: &[u8; 32],
     tree_digest: &[u8; 32],
 ) -> Result<(), RuntimeError> {
-    let name = activation_record_name(final_name);
+    let name = activation_record_name(target_key);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).follow(FollowSymlinks::No);
     let mut file = parent.open_with(&name, &options)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(_parent_path.join(&name), fs::Permissions::from_mode(0o600))?;
-    }
+    file.set_permissions(cap_std::fs::Permissions::from_std(
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    ))?;
     for digest in [archive_digest, tree_digest] {
         for byte in digest {
             write!(file, "{byte:02x}")?;
@@ -308,12 +350,12 @@ fn write_activation_record(
 fn reusable_runtime(
     parent_path: &Path,
     parent: &Dir,
-    final_name: &OsStr,
+    target_key: &str,
     dir: &Dir,
     digest: &[u8; 32],
     required_entries: &[&str],
 ) -> Result<bool, RuntimeError> {
-    let (recorded_archive, recorded_tree) = read_activation_record(parent_path, parent, final_name)?;
+    let (recorded_archive, recorded_tree) = read_activation_record(parent_path, parent, target_key)?;
     if recorded_archive != *digest {
         return Ok(false);
     }
@@ -324,9 +366,9 @@ fn reusable_runtime(
 fn read_activation_record(
     _parent_path: &Path,
     parent: &Dir,
-    final_name: &OsStr,
+    target_key: &str,
 ) -> Result<([u8; 32], [u8; 32]), RuntimeError> {
-    let name = activation_record_name(final_name);
+    let name = activation_record_name(target_key);
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let mut file = parent.open_with(&name, &options)?;
@@ -346,8 +388,8 @@ fn read_activation_record(
     Ok((parse_sha256(&value[..64])?, parse_sha256(&value[64..])?))
 }
 
-fn remove_stale_activation_record(parent: &Dir, final_name: &OsStr) -> Result<(), RuntimeError> {
-    match parent.remove_file(activation_record_name(final_name)) {
+fn remove_stale_activation_record(parent: &Dir, target_key: &str) -> Result<(), RuntimeError> {
+    match parent.remove_file(activation_record_name(target_key)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -355,21 +397,37 @@ fn remove_stale_activation_record(parent: &Dir, final_name: &OsStr) -> Result<()
 }
 
 fn hash_runtime_tree(dir: &Dir) -> Result<[u8; 32], RuntimeError> {
-    fn walk(dir: &Dir, prefix: &Path, hasher: &mut Sha256) -> Result<(), RuntimeError> {
-        let mut names = dir
-            .entries()?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<Result<Vec<_>, _>>()?;
-        names.sort();
-        for name in names {
-            let path = prefix.join(&name);
+    fn frame(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    fn walk(dir: &Dir, components: &[OsString], hasher: &mut Sha256) -> Result<(), RuntimeError> {
+        let mut entries = dir.entries()?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| windows_component_key(&entry.file_name().to_string_lossy()).unwrap_or_default());
+        for entry in entries {
+            let name = entry.file_name();
+            let collision_key = windows_component_key(&name.to_string_lossy())?;
+            let mut path_components = components.to_vec();
+            path_components.push(name.clone());
+            hasher.update((path_components.len() as u64).to_le_bytes());
+            for component in &path_components {
+                frame(hasher, component.as_encoded_bytes());
+            }
+            frame(hasher, collision_key.as_bytes());
             let metadata = dir.symlink_metadata(&name)?;
-            hasher.update(path.as_os_str().as_encoded_bytes());
             if metadata.is_dir() && !metadata.is_symlink() {
                 hasher.update(b"d");
-                walk(&open_child_directory(dir, &name)?, &path, hasher)?;
+                hasher.update(0_u32.to_le_bytes());
+                walk(&open_child_directory(dir, &name)?, &path_components, hasher)?;
             } else if metadata.is_file() && !metadata.is_symlink() {
                 hasher.update(b"f");
+                #[cfg(unix)]
+                let mode = metadata.permissions().mode() & 0o111;
+                #[cfg(not(unix))]
+                let mode = 0_u32;
+                hasher.update(mode.to_le_bytes());
+                hasher.update(metadata.len().to_le_bytes());
                 let mut options = OpenOptions::new();
                 options.read(true).follow(FollowSymlinks::No);
                 let mut file = dir.open_with(&name, &options)?;
@@ -382,16 +440,51 @@ fn hash_runtime_tree(dir: &Dir) -> Result<[u8; 32], RuntimeError> {
                     hasher.update(&buffer[..read]);
                 }
             } else {
-                return Err(RuntimeError::UnsafePath(path.display().to_string()));
+                return Err(RuntimeError::UnsafePath(PathBuf::from_iter(path_components).display().to_string()));
             }
         }
         Ok(())
     }
 
     let mut hasher = Sha256::new();
-    walk(dir, Path::new(""), &mut hasher)?;
+    hasher.update(b"melon-runtime-tree\0v1");
+    walk(dir, &[], &mut hasher)?;
     Ok(hasher.finalize().into())
 }
+
+fn directory_identity(dir: &Dir) -> Result<(u64, u64), RuntimeError> {
+    let metadata = dir.dir_metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn validate_cache_disjointness(
+    cache_path: &Path,
+    cache: &Dir,
+    final_parent: &Dir,
+    final_dir: Option<&Dir>,
+) -> Result<(), RuntimeError> {
+    let cache_identity = directory_identity(cache)?;
+    if cache_identity == directory_identity(final_parent)?
+        || final_dir.is_some_and(|final_dir| directory_identity(final_dir).ok() == Some(cache_identity))
+    {
+        return Err(RuntimeError::Activation("cache directory overlaps runtime namespace".into()));
+    }
+    if let Some(final_dir) = final_dir {
+        let final_identity = directory_identity(final_dir)?;
+        let mut ancestor = Some(cache_path);
+        while let Some(path) = ancestor {
+            if open_runtime_directory(path)
+                .and_then(|dir| directory_identity(&dir))
+                .is_ok_and(|identity| identity == final_identity)
+            {
+                return Err(RuntimeError::Activation("cache directory is nested inside final runtime".into()));
+            }
+            ancestor = path.parent();
+        }
+    }
+    Ok(())
+}
+
 
 fn open_private_directory(path: &Path) -> Result<Dir, RuntimeError> {
     validate_private_directory_path(path)?;
@@ -447,12 +540,11 @@ struct OwnedCacheArtifact {
 }
 
 impl OwnedCacheArtifact {
-    fn claim(cache_dir: &Path, archive_name: &str) -> Result<Self, RuntimeError> {
+    fn claim(cache: Dir, archive_name: &str) -> Result<Self, RuntimeError> {
         let (name, components) = validate_path(archive_name)?;
         if components.len() != 1 {
             return Err(RuntimeError::UnsafePath(archive_name.into()));
         }
-        let cache = open_private_directory(cache_dir)?;
         let owned = random_name(".melon-activate-archive")?;
         cache.rename(name.as_os_str(), &cache, &owned)?;
         let mut options = OpenOptions::new();
@@ -494,8 +586,8 @@ impl Drop for OwnedCacheArtifact {
 struct TargetLock(fs::File);
 
 impl TargetLock {
-    fn acquire(parent: &Dir, final_name: &OsStr) -> Result<Self, RuntimeError> {
-        let digest = Sha256::digest(final_name.as_encoded_bytes());
+    fn acquire(parent: &Dir, target_key: &str) -> Result<Self, RuntimeError> {
+        let digest = Sha256::digest(target_key.as_bytes());
         let name = format!(".melon-activation-lock-{digest:x}");
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).follow(FollowSymlinks::No);
@@ -2170,15 +2262,29 @@ mod tests {
         final_dir: &Path,
         required: &[&str],
     ) -> Result<ActivationOutcome, RuntimeError> {
+        let cache = archive.parent().expect("archive parent").join("cache");
+        match fs::create_dir(&cache) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create cache directory: {error}"),
+        }
+        #[cfg(unix)]
+        fs::set_permissions(
+            &cache,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .expect("private cache");
+        let name = archive.file_name().expect("archive name");
+        fs::rename(archive, cache.join(name)).expect("stage archive in cache");
         activate_runtime(
-            archive.parent().expect("cache parent"),
-            archive.file_name().expect("archive name").to_str().expect("UTF-8 archive name"),
+            &cache,
+            name.to_str().expect("UTF-8 archive name"),
+            "runtime",
             digest,
             final_dir,
             required,
         )
     }
-
 
     const REQUIRED_RUNTIME_ENTRIES: &[&str] = &["bin/node", "durindoor/cli.js"];
 
@@ -2349,7 +2455,14 @@ mod tests {
         let final_dir = temp.0.join("runtime");
         let bytes = runtime_archive(b"node", b"cli");
         let digest = format!("{:x}", Sha256::digest(&bytes));
-        for (index, required) in [&[][..], &["bin/node", "bin/node"][..]].into_iter().enumerate() {
+        for (index, required) in [
+            &[][..],
+            &["bin/node", "bin/node"][..],
+            &["bin/node", "BIN/NODE"][..],
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let archive = write_archive_candidate(&temp, &format!("invalid-required-{index}.zip"), &bytes);
             activate_test(&archive, &digest, &final_dir, required)
                 .expect_err("invalid required list must fail");
@@ -2375,10 +2488,93 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tree_hash_separates_structural_boundaries() {
+        let left = TempDir::new();
+        let right = TempDir::new();
+        fs::write(left.0.join("a"), b"bfX").expect("left file");
+        fs::write(right.0.join("afb"), b"X").expect("right file");
+        let left_dir = open_private_directory(&left.0).expect("left dir");
+        let right_dir = open_private_directory(&right.0).expect("right dir");
+
+        assert_ne!(hash_runtime_tree(&left_dir).expect("left hash"), hash_runtime_tree(&right_dir).expect("right hash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_rejects_executable_mode_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        let bytes = archive_with_mode("bin/node", b"node", 0o100755);
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "runtime.zip", &bytes);
+        activate_test(&archive, &digest, &final_dir, &["bin/node"]).expect("initial activation");
+        fs::set_permissions(final_dir.join("bin/node"), fs::Permissions::from_mode(0o644)).expect("drop executable bit");
+        let repeat = write_archive_candidate(&temp, "repeat.zip", &bytes);
+
+        let outcome = activate_test(&repeat, &digest, &final_dir, &["bin/node"]);
+
+        assert!(!matches!(outcome, Ok(ActivationOutcome::Reused)));
+    }
+
+    #[test]
+    fn activation_rejects_cache_control_and_final_names() {
+        let temp = TempDir::new();
+        for name in [
+            "runtime",
+            ".melon-activate-archive-deadbeef",
+            ".melon-activation-lock-deadbeef",
+            ".melon-activation-record-deadbeef",
+        ] {
+            let path = temp.0.join(name);
+            fs::write(&path, b"sentinel").expect("control sentinel");
+            activate_runtime(&temp.0, name, "runtime", "00", &temp.0.join("runtime"), REQUIRED_RUNTIME_ENTRIES)
+                .expect_err("control namespace must reject");
+            assert_eq!(fs::read(path).expect("control sentinel remains"), b"sentinel");
+        }
+    }
+
+    #[test]
+    fn activation_rejects_cache_identity_overlap_with_parent_or_final() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        fs::create_dir(&final_dir).expect("final runtime");
+        #[cfg(unix)]
+        fs::set_permissions(&final_dir, <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+            .expect("private final");
+        fs::write(temp.0.join("archive.zip"), b"archive").expect("parent archive");
+        fs::write(final_dir.join("archive.zip"), b"archive").expect("final archive");
+
+        activate_runtime(&temp.0, "archive.zip", "runtime", "00", &final_dir, REQUIRED_RUNTIME_ENTRIES)
+            .expect_err("cache equal to final parent must reject");
+        activate_runtime(&final_dir, "archive.zip", "runtime", "00", &final_dir, REQUIRED_RUNTIME_ENTRIES)
+            .expect_err("cache equal to final must reject");
+
+        assert!(temp.0.join("archive.zip").exists());
+        assert!(final_dir.join("archive.zip").exists());
+    }
+
+    #[test]
+    fn activation_rejects_noncanonical_target_aliases() {
+        let temp = TempDir::new();
+        for (target_id, child) in [
+            ("runtime", "RUNTIME"),
+            ("runtime", "runtime."),
+            ("runtime", "runtime "),
+            ("con", "con"),
+        ] {
+            activate_runtime(&temp.0, "missing.zip", target_id, "00", &temp.0.join(child), REQUIRED_RUNTIME_ENTRIES)
+                .expect_err("target alias must reject before cache claim");
+        }
+    }
+
+    #[test]
     fn owned_cache_cleanup_never_unlinks_replacement_name() {
         let temp = TempDir::new();
         let archive = write_archive_candidate(&temp, "runtime.zip", b"archive");
-        let mut owned = OwnedCacheArtifact::claim(&temp.0, "runtime.zip").expect("claim cache artifact");
+        let mut owned = OwnedCacheArtifact::claim(open_private_directory(&temp.0).expect("cache"), "runtime.zip")
+            .expect("claim cache artifact");
         fs::write(&archive, b"replacement").expect("replace original cache name");
 
         owned.cleanup().expect("clean owned artifact");
@@ -2390,7 +2586,8 @@ mod tests {
     fn owned_cache_cleanup_failure_is_reported() {
         let temp = TempDir::new();
         write_archive_candidate(&temp, "runtime.zip", b"archive");
-        let mut owned = OwnedCacheArtifact::claim(&temp.0, "runtime.zip").expect("claim cache artifact");
+        let mut owned = OwnedCacheArtifact::claim(open_private_directory(&temp.0).expect("cache"), "runtime.zip")
+            .expect("claim cache artifact");
         owned.file.take();
         owned.parent.remove_file(&owned.name).expect("remove owned artifact");
         owned.parent.create_dir(&owned.name).expect("replace owned name with directory");
@@ -2405,14 +2602,17 @@ mod tests {
     #[test]
     fn activation_rejects_peer_writable_final_parent_before_cache_claim() {
         use std::os::unix::fs::PermissionsExt;
-
         let temp = TempDir::new();
         let parent = temp.0.join("unsafe-parent");
         fs::create_dir(&parent).expect("unsafe parent");
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).expect("unsafe mode");
-        let archive = write_archive_candidate(&temp, "runtime.zip", b"archive");
+        let cache = temp.0.join("cache");
+        fs::create_dir(&cache).expect("cache");
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).expect("private cache");
+        let archive = cache.join("runtime.zip");
+        fs::write(&archive, b"archive").expect("cache artifact");
 
-        activate_test(&archive, "00", &parent.join("runtime"), REQUIRED_RUNTIME_ENTRIES)
+        activate_runtime(&cache, "runtime.zip", "runtime", "00", &parent.join("runtime"), REQUIRED_RUNTIME_ENTRIES)
             .expect_err("unsafe parent must fail before claim");
 
         assert!(archive.exists(), "cache artifact remains unclaimed");
@@ -2425,14 +2625,14 @@ mod tests {
         if let Ok(parent) = std::env::var("MELON_LOCK_TEST_PARENT") {
             let parent = PathBuf::from(parent);
             let parent_dir = open_private_directory(&parent).expect("child parent");
-            let _lock = TargetLock::acquire(&parent_dir, OsStr::new("runtime")).expect("child lock");
+            let _lock = TargetLock::acquire(&parent_dir, "runtime").expect("child lock");
             fs::write(parent.join("child-acquired"), b"yes").expect("child signal");
             return;
         }
 
         let temp = TempDir::new();
         let parent = open_private_directory(&temp.0).expect("parent");
-        let lock = TargetLock::acquire(&parent, OsStr::new("runtime")).expect("parent lock");
+        let lock = TargetLock::acquire(&parent, "runtime").expect("parent lock");
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .arg("runtime::tests::subprocess_same_target_lock_blocks_until_released")
             .arg("--exact")
