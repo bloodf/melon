@@ -22,13 +22,12 @@ use std::ptr;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 #[cfg(windows)]
 use windows_sys::Wdk::Storage::FileSystem::{
-    NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+    NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    RtlNtStatusToDosError, SetLastError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, STATUS_SUCCESS,
-    UNICODE_STRING,
+    RtlNtStatusToDosError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -168,7 +167,9 @@ pub(crate) fn verify_and_extract_zip(
     extract_zip(reader, staging)
 }
 
-/// Validates every ZIP entry, extracts into an owned sibling candidate, then replaces only the empty staging directory.
+/// Extracts into a newly-created empty Tauri app-cache staging directory owned by the current user.
+///
+/// On Unix, staging and its parent must prevent mutation by other users throughout publication.
 pub(crate) fn extract_zip(reader: &mut (impl Read + Seek), staging: &Path) -> Result<(), RuntimeError> {
     extract_zip_with_limits(reader, staging, DEFAULT_EXTRACTION_LIMITS)
 }
@@ -189,6 +190,7 @@ fn extract_zip_with_limits(
     }
     let plans = validate_entries(&mut archive, limits)?;
     let mut candidate = CandidateDir::create(staging, &staging_dir)?;
+    drop(staging_dir);
     let extraction = extract_entries(&mut archive, &plans, candidate.dir(), limits);
     if let Err(error) = extraction {
         candidate.cleanup()?;
@@ -212,15 +214,17 @@ fn extract_zip_with_hook(
     }
     let plans = validate_entries(&mut archive, limits)?;
     let mut candidate = CandidateDir::create(staging, &staging_dir)?;
+    drop(staging_dir);
     hook(candidate.path());
     extract_entries(&mut archive, &plans, candidate.dir(), limits)?;
     candidate.publish(staging)
 }
 #[cfg(test)]
-fn extract_zip_with_publish_hook(
+fn extract_zip_with_publish_hooks(
     reader: &mut (impl Read + Seek),
     staging: &Path,
-    hook: impl FnOnce(&Path),
+    after_check: impl FnOnce(&Path),
+    after_final_rename: impl FnOnce(&Path),
 ) -> Result<(), RuntimeError> {
     let preflight = preflight_archive(reader)?;
     let staging_dir = open_empty_staging(staging)?;
@@ -228,13 +232,14 @@ fn extract_zip_with_publish_hook(
     let plans = validate_entries(&mut archive, DEFAULT_EXTRACTION_LIMITS)?;
     assert_eq!(preflight.declared_entries, archive.len());
     let mut candidate = CandidateDir::create(staging, &staging_dir)?;
+    drop(staging_dir);
     extract_entries(
         &mut archive,
         &plans,
         candidate.dir(),
         DEFAULT_EXTRACTION_LIMITS,
     )?;
-    candidate.publish_with_hook(staging, hook)
+    candidate.publish_with_hooks(staging, after_check, after_final_rename)
 }
 
 
@@ -276,11 +281,42 @@ impl<R: Seek> Seek for MaskedReader<'_, R> {
 }
 
 fn open_empty_staging(staging: &Path) -> Result<Dir, RuntimeError> {
+    validate_private_staging(staging)?;
     let staging = open_runtime_directory(staging)?;
     if staging.entries()?.next().is_some() {
         return Err(RuntimeError::StagingNotEmpty);
     }
     Ok(staging)
+}
+
+#[cfg(unix)]
+fn validate_private_staging(staging: &Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::symlink_metadata(staging)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(RuntimeError::StagingNotEmpty);
+    }
+    let parent = fs::symlink_metadata(
+        staging.parent().ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?,
+    )?;
+    if !parent.is_dir()
+        || parent.file_type().is_symlink()
+        || parent.uid() != unsafe { libc::geteuid() }
+        || parent.permissions().mode() & 0o077 != 0
+    {
+        return Err(RuntimeError::StagingNotEmpty);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_staging(_staging: &Path) -> Result<(), RuntimeError> {
+    // Caller supplies a Tauri app-cache directory protected by the current user's ACL.
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -402,6 +438,7 @@ fn find_eocd(reader: &mut (impl Read + Seek)) -> Result<Eocd, RuntimeError> {
             && directory_disk == 0
             && disk_entries == total_entries
             && u64::from(central_offset) + u64::from(directory_size) == absolute_eocd
+            && (total_entries != 0 || absolute_eocd == 0)
             && (total_entries == 0 || central_signature(reader, central_offset)?)
         {
             return Ok(Eocd {
@@ -637,9 +674,23 @@ fn open_child_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeE
 
 #[cfg(windows)]
 fn open_child_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeError> {
+    nt_create_directory(parent, component, FILE_OPEN)
+}
+
+#[cfg(windows)]
+fn create_candidate_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeError> {
+    nt_create_directory(parent, component, FILE_CREATE)
+}
+
+#[cfg(windows)]
+fn nt_create_directory(parent: &Dir, component: &OsStr, disposition: u32) -> Result<Dir, RuntimeError> {
     let name = component.encode_wide().collect::<Vec<_>>();
-    let byte_length = u16::try_from(name.len().checked_mul(2).ok_or(RuntimeError::UnsafePath(component.to_string_lossy().into_owned()))?)
-        .map_err(|_| RuntimeError::UnsafePath(component.to_string_lossy().into_owned()))?;
+    let byte_length = u16::try_from(
+        name.len()
+            .checked_mul(2)
+            .ok_or_else(|| RuntimeError::UnsafePath(component.to_string_lossy().into_owned()))?,
+    )
+    .map_err(|_| RuntimeError::UnsafePath(component.to_string_lossy().into_owned()))?;
     let mut unicode = UNICODE_STRING {
         Length: byte_length,
         MaximumLength: byte_length,
@@ -664,15 +715,17 @@ fn open_child_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeE
             ptr::null(),
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
-            FILE_OPEN,
+            disposition,
             FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             ptr::null(),
             0,
         )
     };
-    if status != STATUS_SUCCESS {
-        unsafe { SetLastError(RtlNtStatusToDosError(status)) };
-        return Err(io::Error::last_os_error().into());
+    if status < 0 {
+        return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32).into());
+    }
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::other("NtCreateFile returned an invalid directory handle").into());
     }
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     Ok(Dir::from_std_file(file))
@@ -697,14 +750,32 @@ struct CandidateDir {
     armed: bool,
 }
 
+#[cfg(not(windows))]
+fn create_candidate_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeError> {
+    parent.create_dir(component)?;
+    match open_child_directory(parent, component) {
+        Ok(dir) => Ok(dir),
+        Err(error) => {
+            let _ = parent.remove_dir(component);
+            Err(error)
+        }
+    }
+}
 impl CandidateDir {
     fn create(staging: &Path, staging_dir: &Dir) -> Result<Self, RuntimeError> {
         loop {
             let id = NEXT_CANDIDATE.fetch_add(1, Ordering::Relaxed);
-            let name = OsString::from(format!(".melon-candidate-{}-{id}", std::process::id()));
-            match staging_dir.create_dir(&name) {
-                Ok(()) => {
-                    let dir = open_child_directory(staging_dir, &name)?;
+            let mut nonce = [0; 16];
+            getrandom::fill(&mut nonce).map_err(|error| {
+                io::Error::other(format!("OS randomness failed while naming runtime staging: {error}"))
+            })?;
+            let name = OsString::from(format!(
+                ".melon-candidate-{}-{id}-{}",
+                std::process::id(),
+                nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            ));
+            match create_candidate_directory(staging_dir, &name) {
+                Ok(dir) => {
                     let metadata = dir.dir_metadata()?;
                     return Ok(Self {
                         path: staging.join(&name),
@@ -713,8 +784,8 @@ impl CandidateDir {
                         armed: true,
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
+                Err(RuntimeError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
             }
         }
     }
@@ -728,7 +799,7 @@ impl CandidateDir {
     }
 
     fn publish(&mut self, staging: &Path) -> Result<(), RuntimeError> {
-        self.publish_impl(staging, |_| {})
+        self.publish_impl(staging, |_| {}, |_| {})
     }
 
     fn cleanup(&mut self) -> Result<(), RuntimeError> {
@@ -740,22 +811,24 @@ impl CandidateDir {
     }
 
     #[cfg(test)]
-    fn publish_with_hook(
+    fn publish_with_hooks(
         &mut self,
         staging: &Path,
-        hook: impl FnOnce(&Path),
+        after_check: impl FnOnce(&Path),
+        after_final_rename: impl FnOnce(&Path),
     ) -> Result<(), RuntimeError> {
-        self.publish_impl(staging, hook)
+        self.publish_impl(staging, after_check, after_final_rename)
     }
 
     #[cfg(not(windows))]
     fn publish_impl(
         &mut self,
         staging: &Path,
-        hook: impl FnOnce(&Path),
+        after_check: impl FnOnce(&Path),
+        after_final_rename: impl FnOnce(&Path),
     ) -> Result<(), RuntimeError> {
         require_owned_candidate(staging, &self.path, self.identity)?;
-        hook(&self.path);
+        after_check(&self.path);
         let parent = staging.parent().ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
         let name = self.path.file_name().ok_or_else(|| RuntimeError::UnsafePath(self.path.display().to_string()))?;
         let lifted = parent.join(name);
@@ -769,8 +842,18 @@ impl CandidateDir {
         fs::remove_dir(staging)?;
         if let Err(error) = fs::rename(&self.path, staging) {
             fs::create_dir(staging)?;
+            fs::set_permissions(
+                staging,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )?;
             self.cleanup()?;
             return Err(error.into());
+        }
+        self.path = staging.to_path_buf();
+        after_final_rename(staging);
+        if candidate_identity(staging)? != self.identity {
+            self.cleanup()?;
+            return Err(RuntimeError::StagingNotEmpty);
         }
         self.armed = false;
         Ok(())
@@ -780,11 +863,16 @@ impl CandidateDir {
     fn publish_impl(
         &mut self,
         staging: &Path,
-        hook: impl FnOnce(&Path),
+        after_check: impl FnOnce(&Path),
+        _after_final_rename: impl FnOnce(&Path),
     ) -> Result<(), RuntimeError> {
         require_owned_candidate(staging, &self.path, self.identity)?;
-        hook(&self.path);
-        windows_publish_candidate(self.dir.as_ref().expect("candidate handle remains live"), staging)?;
+        after_check(&self.path);
+        windows_publish_candidate(
+            self.dir.as_ref().expect("candidate handle remains live"),
+            &self.path,
+            staging,
+        )?;
         self.path = staging.to_path_buf();
         self.armed = false;
         Ok(())
@@ -808,11 +896,37 @@ fn cleanup_candidate(dir: Dir) -> Result<(), RuntimeError> {
     windows_delete_candidate(dir)
 }
 #[cfg(windows)]
-fn windows_publish_candidate(candidate: &Dir, staging: &Path) -> Result<(), RuntimeError> {
+fn windows_publish_candidate(
+    candidate: &Dir,
+    candidate_path: &Path,
+    staging: &Path,
+) -> Result<(), RuntimeError> {
+    let parent = staging
+        .parent()
+        .ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
+    let verified_sibling = parent.join(
+        candidate_path
+            .file_name()
+            .ok_or_else(|| RuntimeError::UnsafePath(candidate_path.display().to_string()))?,
+    );
+    windows_rename_handle(candidate.as_raw_handle() as HANDLE, &verified_sibling)?;
+    if candidate_identity(&verified_sibling)? != candidate_identity_from_dir(candidate)? {
+        return Err(RuntimeError::StagingNotEmpty);
+    }
     let staging_handle = open_runtime_directory(staging)?;
     windows_mark_delete(staging_handle.as_raw_handle() as HANDLE)?;
     drop(staging_handle);
-    windows_rename_handle(candidate.as_raw_handle() as HANDLE, staging)
+    if let Err(error) = windows_rename_handle(candidate.as_raw_handle() as HANDLE, staging) {
+        fs::create_dir(staging)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn candidate_identity_from_dir(dir: &Dir) -> Result<(u64, u64), RuntimeError> {
+    let metadata = dir.dir_metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(windows)]
@@ -936,7 +1050,6 @@ mod tests {
     use std::fs;
     use std::io::{Cursor, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -952,12 +1065,21 @@ mod tests {
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).expect("create test directory");
+            #[cfg(unix)]
+            fs::set_permissions(
+                &path,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .expect("secure test cache directory");
             Self(path)
         }
 
         fn staging(&self) -> PathBuf {
             let path = self.0.join("staging");
             fs::create_dir(&path).expect("create staging directory");
+            #[cfg(unix)]
+            fs::set_permissions(&path, <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+                .expect("secure staging permissions");
             path
         }
     }
@@ -968,12 +1090,14 @@ mod tests {
         }
     }
     fn archive_with_mode(name: &str, contents: &[u8], mode: u32) -> Vec<u8> {
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        writer
-            .start_file(name, SimpleFileOptions::default().unix_permissions(mode))
-            .expect("start mode ZIP entry");
-        writer.write_all(contents).expect("write mode ZIP entry");
-        writer.finish().expect("finish mode ZIP").into_inner()
+        let mut bytes = archive(&[(name, contents)]);
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("central directory");
+        bytes[central + 5] = 3;
+        bytes[central + 38..central + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+        bytes
     }
 
     fn matching_false_eocd_comment() -> Vec<u8> {
@@ -986,6 +1110,18 @@ mod tests {
         comment[12..16].copy_from_slice(&1_u32.to_le_bytes());
         comment[16..20].copy_from_slice(&1_u32.to_le_bytes());
         comment[20..22].copy_from_slice(&18_u16.to_le_bytes());
+        commented_archive(&comment)
+    }
+    fn matching_zero_entry_false_eocd_comment() -> Vec<u8> {
+        let mut comment = vec![0; 40];
+        comment[..4].copy_from_slice(b"PK\x05\x06");
+        comment[20..22].copy_from_slice(&18_u16.to_le_bytes());
+        let provisional = commented_archive(&comment);
+        let real_eocd = provisional
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("real ZIP footer");
+        comment[16..20].copy_from_slice(&((real_eocd + 22) as u32).to_le_bytes());
         commented_archive(&comment)
     }
 
@@ -1197,11 +1333,13 @@ mod tests {
     }
     #[test]
     fn accepts_matching_length_false_eocd_inside_comment() {
-        let temp = TempDir::new();
-        let staging = temp.staging();
-        extract_zip(&mut Cursor::new(matching_false_eocd_comment()), &staging)
-            .expect("structurally false footer in comment");
-        assert_eq!(fs::read(staging.join("node")).expect("node"), b"node");
+        for bytes in [matching_false_eocd_comment(), matching_zero_entry_false_eocd_comment()] {
+            let temp = TempDir::new();
+            let staging = temp.staging();
+            extract_zip(&mut Cursor::new(bytes), &staging)
+                .expect("structurally false footer in comment");
+            assert_eq!(fs::read(staging.join("node")).expect("node"), b"node");
+        }
     }
 
     #[test]
@@ -1236,19 +1374,43 @@ mod tests {
         let moved = temp.0.join("owned-moved");
         fs::create_dir(&attacker).expect("attacker directory");
         fs::write(attacker.join("marker"), b"attacker").expect("attacker marker");
-        let error = extract_zip_with_publish_hook(
+        let error = extract_zip_with_publish_hooks(
             &mut Cursor::new(archive(&[("node", b"owned")])),
             &staging,
             |candidate| {
                 fs::rename(candidate, &moved).expect("move verified candidate");
                 symlink(&attacker, candidate).expect("replace verified candidate");
             },
+            |_| {},
         )
         .expect_err("post-identity replacement must fail closed");
         assert!(!staging.join("marker").exists(), "attacker directory must not publish");
         assert!(!moved.exists(), "owned original must be cleaned by handle");
         assert_eq!(fs::read(attacker.join("marker")).expect("attacker untouched"), b"attacker");
         drop(error);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn final_transition_replacement_never_disarms_owned_candidate() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let attacker = temp.0.join("attacker");
+        let moved = temp.0.join("owned-after-final-rename");
+        fs::create_dir(&attacker).expect("attacker directory");
+        fs::write(attacker.join("marker"), b"attacker").expect("attacker marker");
+        let error = extract_zip_with_publish_hooks(
+            &mut Cursor::new(archive(&[("node", b"owned")])),
+            &staging,
+            |_| {},
+            |published| {
+                fs::rename(published, &moved).expect("move published owned candidate");
+                fs::rename(&attacker, published).expect("replace final path");
+            },
+        )
+        .expect_err("final transition replacement must fail closed");
+        assert!(matches!(error, RuntimeError::StagingNotEmpty), "{error:?}");
+        assert!(!moved.exists(), "owned original must be cleaned by handle");
+        assert_eq!(fs::read(staging.join("marker")).expect("attacker replacement remains"), b"attacker");
     }
 
     #[test]
@@ -1450,6 +1612,28 @@ mod tests {
         assert_empty(&staging);
         assert_eq!(fs::read(outside).expect("outside untouched"), b"sentinel");
     }
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nonprivate_staging_and_unsafe_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).expect("loosen staging");
+        let error = extract_zip(&mut Cursor::new(archive(&[("node", b"node")])), &staging)
+            .expect_err("nonprivate staging must fail");
+        assert!(matches!(error, RuntimeError::StagingNotEmpty), "{error:?}");
+
+        let unsafe_parent = temp.0.join("unsafe-parent");
+        fs::create_dir(&unsafe_parent).expect("unsafe parent");
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).expect("loosen parent");
+        let unsafe_staging = unsafe_parent.join("staging");
+        fs::create_dir(&unsafe_staging).expect("unsafe staging");
+        fs::set_permissions(&unsafe_staging, fs::Permissions::from_mode(0o700)).expect("private child");
+        let error = extract_zip(&mut Cursor::new(archive(&[("node", b"node")])), &unsafe_staging)
+            .expect_err("peer-writable parent without sticky bit must fail");
+        assert!(matches!(error, RuntimeError::StagingNotEmpty), "{error:?}");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1475,6 +1659,17 @@ mod tests {
         extract_zip(&mut Cursor::new(archive(&[("node", b"node")])), &staging)
             .expect("publish through Windows directory handle");
         assert_eq!(fs::read(staging.join("node")).expect("published node"), b"node");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_nt_create_file_failure_never_adopts_invalid_handle() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let staging_dir = open_empty_staging(&staging).expect("staging handle");
+        let error = nt_create_directory(&staging_dir, OsStr::new("missing"), FILE_OPEN)
+            .expect_err("opening a missing directory must fail");
+        assert!(matches!(error, RuntimeError::Io(_)), "{error:?}");
     }
 
     #[cfg(windows)]
