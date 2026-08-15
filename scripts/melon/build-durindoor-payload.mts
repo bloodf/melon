@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto'
-import { deflateRawSync } from 'node:zlib'
+import { deflateRawSync, gunzipSync } from 'node:zlib'
 import {
-  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  renameSync, rmSync, writeFileSync,
+  chmodSync, closeSync, cpSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, mkdtempSync,
+  openSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -41,6 +41,9 @@ const TARGETS: Record<string, Target> = {
   'aarch64-apple-darwin': { archive: `node-v${VERSION}-darwin-arm64.tar.gz`, archiveRoot: `node-v${VERSION}-darwin-arm64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0xcf, 0xfa, 0xed, 0xfe], architecture: 'darwin-arm64', tray: 'tray_darwin_release' },
   'x86_64-pc-windows-msvc': { archive: `node-v${VERSION}-win-x64.zip`, archiveRoot: `node-v${VERSION}-win-x64`, nodePath: 'node.exe', npmCli: 'node_modules/npm/bin/npm-cli.js', magic: [0x4d, 0x5a], architecture: 'windows-x64' },
 }
+const MAX_ZIP_ENTRIES = 16_384
+const MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+const UINT32_MAX = 0xffff_ffff
 const FORBIDDEN_SEGMENTS = new Set(['.env', '.9router', '.durindoor'])
 
 /** Resolves one supported Rust target and rejects a mismatched official Node archive name. */
@@ -64,12 +67,31 @@ function zipPath(path: string): string {
   const normalized = path.replaceAll('\\', '/')
   const parts = normalized.split('/')
   if (normalized.length === 0 || normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized) || parts.some(part => part === '' || part === '.' || part === '..')) throw new Error(`unsafe ZIP path: ${path}`)
-  if (parts.some(part => FORBIDDEN_SEGMENTS.has(part)) || normalized.includes('node_modules/.bin/')) throw new Error(`forbidden payload path: ${path}`)
+  if (parts.some(part => FORBIDDEN_SEGMENTS.has(part) || part === '.bin')) throw new Error(`forbidden payload path: ${path}`)
   return normalized
+}
+
+/** Validates Rust extractor and classic ZIP numeric limits without allocating entry data. */
+export function validateCanonicalMetadata(entries: ReadonlyArray<{ path: string; size: number }>): void {
+  if (entries.length > MAX_ZIP_ENTRIES) throw new Error(`payload exceeds ${MAX_ZIP_ENTRIES} ZIP entries`)
+  let total = 0
+  let maximumOffset = 0
+  let centralSize = 0
+  for (const entry of entries) {
+    const path = zipPath(entry.path)
+    const nameBytes = Buffer.byteLength(path)
+    if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > UINT32_MAX) throw new Error(`ZIP entry size exceeds UInt32: ${path}`)
+    total += entry.size
+    if (total > MAX_UNCOMPRESSED_BYTES) throw new Error('payload exceeds 4 GiB uncompressed limit')
+    maximumOffset += 30 + nameBytes + entry.size
+    centralSize += 46 + nameBytes
+    if (maximumOffset > UINT32_MAX || centralSize > UINT32_MAX || maximumOffset + centralSize > UINT32_MAX) throw new Error('ZIP offset exceeds UInt32')
+  }
 }
 
 /** Creates a canonical ZIP containing regular files only, sorted by UTF-8 path. */
 export function canonicalZip(source: PayloadEntry[]): Buffer {
+  validateCanonicalMetadata(source.map(entry => ({ path: entry.path, size: entry.data.byteLength })))
   const entries = source.map(entry => {
     const path = zipPath(entry.path)
     if (entry.type === 'symlink') throw new Error(`symlink entry forbidden: ${path}`)
@@ -101,6 +123,7 @@ export function canonicalZip(source: PayloadEntry[]): Buffer {
     central.push(Buffer.concat([directory, name])); offset += record.length
   }
   const centralBytes = Buffer.concat(central)
+  if (centralBytes.length > UINT32_MAX || offset > UINT32_MAX) throw new Error('ZIP directory exceeds UInt32')
   const end = Buffer.alloc(22)
   end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10)
   end.writeUInt32LE(centralBytes.length, 12); end.writeUInt32LE(offset, 16)
@@ -266,7 +289,7 @@ function collectFiles(root: string, prefix: string, omit: (path: string) => bool
     for (const name of readdirSync(directory).sort()) {
       const path = join(directory, name)
       const relativePath = relative(root, path).split(sep).join('/')
-      if (omit(relativePath)) continue
+      if (relativePath.split('/').includes('.bin')) continue
       const info = lstatSync(path)
       if (info.isSymbolicLink()) throw new Error(`symlink in staged closure: ${relativePath}`)
       if (info.isDirectory()) visit(path)
@@ -285,35 +308,94 @@ export function verifyChecksum(archive: string, checksums: string, expectedName:
   if (actual !== expected) throw new Error(`Node archive checksum mismatch for ${expectedName}`)
 }
 
-function safeArchiveNames(archive: string): string[] {
-  const args = archive.endsWith('.zip') ? ['-tf', archive] : ['-tzf', archive]
-  const names = run('tar', args, dirname(archive), join(dirname(archive), '.data')).split(/\r?\n/).filter(Boolean)
-  for (const name of names) {
-    const normalized = name.replaceAll('\\', '/')
-    if (isAbsolute(normalized) || normalized.split('/').some(part => part === '..')) throw new Error(`unsafe Node archive entry: ${name}`)
-  }
-  return names
+interface ArchiveEntry { name: string; type: 'file' | 'directory'; linkName?: string }
+
+function safeArchiveEntryName(name: string): string {
+  const normalized = name.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '')
+  if (normalized.length === 0 || isAbsolute(normalized) || /^[A-Za-z]:/.test(normalized) || normalized.split('/').some(part => part === '..')) throw new Error(`unsafe Node archive entry: ${name}`)
+  return normalized
 }
 
-function extractNodeRuntime(archive: string, destination: string, spec: Target, dataDir: string): string {
-  const names = safeArchiveNames(archive)
-  const required = [`${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli}`, `${spec.archiveRoot}/LICENSE`]
-  if (required.some(name => !names.includes(name))) throw new Error('Node archive lacks runtime, npm, or license')
-  const listingArgs = archive.endsWith('.zip') ? ['-tvf', archive] : ['-tvzf', archive]
-  const listing = run('tar', listingArgs, dirname(archive), join(dirname(archive), '.data')).split(/\r?\n/).filter(Boolean)
-  const selected = [`${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli.split('/bin/')[0]}`, `${spec.archiveRoot}/LICENSE`]
-  const selectedNames = new Set<string>()
-  for (const line of listing) {
-    const name = line.trim().split(/\s+/).at(-1)!
-    if (!selected.some(root => name === root || name.startsWith(`${root}/`))) continue
-    if (!['-', 'd'].includes(line[0]!)) throw new Error(`unsafe selected Node archive entry type: ${name}`)
-    if (selectedNames.has(name)) throw new Error(`duplicate selected Node archive entry: ${name}`)
-    selectedNames.add(name)
+function tarEntries(bytes: Buffer): ArchiveEntry[] {
+  const tar = bytes[0] === 0x1f && bytes[1] === 0x8b ? gunzipSync(bytes) : bytes
+  const entries: ArchiveEntry[] = []
+  for (let offset = 0; offset + 512 <= tar.length;) {
+    const header = tar.subarray(offset, offset + 512)
+    if (header.every(byte => byte === 0)) break
+    const field = (start: number, length: number) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/, '')
+    const name = safeArchiveEntryName([field(345, 155), field(0, 100)].filter(Boolean).join('/'))
+    const linkName = field(157, 100)
+    const type = header[156]
+    const sizeText = field(124, 12).trim()
+    const size = sizeText.length === 0 ? 0 : Number.parseInt(sizeText, 8)
+    if (!Number.isSafeInteger(size) || size < 0) throw new Error(`invalid tar entry size: ${name}`)
+    const regular = type === 0 || type === 0x30
+    entries.push({ name, type: type === 0x35 ? 'directory' : 'file', ...(!regular && type !== 0x35 ? { linkName: linkName || `type:${String.fromCharCode(type)}` } : {}) })
+    offset += 512 + Math.ceil(size / 512) * 512
   }
+  return entries
+}
+
+function zipEntries(bytes: Buffer): ArchiveEntry[] {
+  const end = bytes.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]))
+  if (end < 0) throw new Error('invalid Node ZIP')
+  const count = bytes.readUInt16LE(end + 10)
+  let cursor = bytes.readUInt32LE(end + 16)
+  const entries: ArchiveEntry[] = []
+  for (let index = 0; index < count; index += 1) {
+    if (bytes.readUInt32LE(cursor) !== 0x02014b50) throw new Error('invalid Node ZIP directory')
+    const nameLength = bytes.readUInt16LE(cursor + 28)
+    const extraLength = bytes.readUInt16LE(cursor + 30)
+    const commentLength = bytes.readUInt16LE(cursor + 32)
+    const rawName = bytes.subarray(cursor + 46, cursor + 46 + nameLength).toString('utf8')
+    const name = safeArchiveEntryName(rawName)
+    const unixType = (bytes.readUInt32LE(cursor + 38) >>> 16) & 0o170000
+    if (unixType !== 0 && unixType !== 0o100000 && unixType !== 0o040000) throw new Error(`unsafe Node ZIP entry type: ${name}`)
+    entries.push({ name, type: rawName.endsWith('/') || unixType === 0o040000 ? 'directory' : 'file' })
+    cursor += 46 + nameLength + extraLength + commentLength
+  }
+  return entries
+}
+
+/** Parses archive metadata structurally and rejects links, special files, duplicates, and unsafe names.
+ *  Returns only the selected subset; validation (duplicate, type) applies only to selected entries. */
+export function preflightNodeArchive(archive: string, selectedRoots?: readonly string[]): ArchiveEntry[] {
+  const bytes = readFileSync(archive)
+  const entries = archive.endsWith('.zip') ? zipEntries(bytes) : tarEntries(bytes)
+  const selectedEntries: ArchiveEntry[] = []
+  const selectedNames = new Set<string>()
+  for (const entry of entries) {
+    const selected = selectedRoots === undefined || selectedRoots.some(root => entry.name === root || entry.name.startsWith(`${root}/`))
+    if (selected) {
+      if (entry.linkName !== undefined) throw new Error(`Node archive link or special entry forbidden: ${entry.name}`)
+      if (selectedNames.has(entry.name)) throw new Error(`duplicate Node archive entry: ${entry.name}`)
+      selectedNames.add(entry.name)
+      selectedEntries.push(entry)
+    }
+  }
+  return selectedEntries
+}
+
+
+function extractNodeRuntime(archive: string, destination: string, spec: Target, dataDir: string): string {
+  const selected = [`${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli.split('/bin/')[0]}`, `${spec.archiveRoot}/LICENSE`]
+  const entries = preflightNodeArchive(archive, selected)
+  const names = new Set(entries.map(entry => entry.name))
+  const required = [`${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli}`, `${spec.archiveRoot}/LICENSE`]
+  if (required.some(name => !names.has(name))) throw new Error('Node archive lacks runtime, npm, or license')
   mkdirSync(destination, { recursive: true })
   if (archive.endsWith('.zip')) run('tar', ['-xf', archive, '-C', destination, `${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/node_modules/npm`, `${spec.archiveRoot}/LICENSE`], dirname(archive), dataDir)
   else run('tar', ['-xzf', archive, '-C', destination, `${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli.split('/bin/')[0]}`, `${spec.archiveRoot}/LICENSE`], dirname(archive), dataDir)
-  return join(destination, spec.archiveRoot)
+  const root = join(destination, spec.archiveRoot)
+  for (const requiredPath of [spec.nodePath, spec.npmCli, 'LICENSE']) {
+    let current = root
+    for (const component of requiredPath.split('/')) {
+      current = join(current, component)
+      const info = lstatSync(current)
+      if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) throw new Error(`unsafe materialized Node component: ${requiredPath}`)
+    }
+  }
+  return root
 }
 function runNpm(nodeRoot: string, spec: Target, args: string[], cwd: string, dataDir: string): void {
   const node = join(nodeRoot, spec.nodePath)
@@ -328,6 +410,19 @@ function copyRuntimeSeed(seed: string, dataDir: string): void {
   cpSync(join(seed, 'package.json'), join(runtime, 'package.json'))
 }
 
+/** Writes preload guards for network and process APIs used by validated Node scripts. */
+export function writeOfflineGuard(path: string): void {
+  writeFileSync(path, [
+    "const deny=()=>{throw new Error('offline capability blocked')}",
+    "globalThis.fetch=deny",
+    "const http=require('http');http.request=deny;http.get=deny;const https=require('https');https.request=deny;https.get=deny",
+    "const net=require('net');net.connect=deny;net.createConnection=deny;net.Socket.prototype.connect=deny;const tls=require('tls');tls.connect=deny",
+    "const dns=require('dns');for(const key of ['lookup','resolve','resolve4','resolve6','resolveAny','resolveCaa','resolveCname','resolveMx','resolveNaptr','resolveNs','resolvePtr','resolveSoa','resolveSrv','resolveTxt','reverse'])dns[key]=deny;for(const key of Object.keys(dns.promises))if(typeof dns.promises[key]==='function')dns.promises[key]=deny",
+    "const dgram=require('dgram');dgram.createSocket=deny",
+    "const child=require('child_process');for(const key of ['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'])child[key]=deny",
+  ].join(';'))
+}
+
 function validateOffline(staging: string, dataDir: string, target: string): void {
   copyRuntimeSeed(join(staging, 'runtime-seed'), dataDir)
   const node = join(staging, 'bin', target.includes('windows') ? 'node.exe' : 'node')
@@ -336,11 +431,7 @@ function validateOffline(staging: string, dataDir: string, target: string): void
   const runtimeModules = join(dataDir, 'runtime/node_modules')
   mkdirSync(emptyPath)
   const guard = join(dataDir, 'offline-guard.cjs')
-  writeFileSync(guard, [
-    "globalThis.fetch=()=>Promise.reject(new Error('offline network blocked'))",
-    "for(const name of ['net','tls','dgram','dns','http','https','http2']){const mod=require(name);for(const key of Object.keys(mod)){if(typeof mod[key]==='function'&&/connect|request|resolve|lookup|createConnection|createSocket/.test(key))mod[key]=()=>{throw new Error('offline network blocked')}}}",
-    "const child=require('child_process');for(const key of ['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'])child[key]=()=>{throw new Error('offline child process blocked')}",
-  ].join(';'))
+  writeOfflineGuard(guard)
   const offlineEnv = { NODE_PATH: runtimeModules, NODE_OPTIONS: `--require=${guard}` }
   if (!run(node, [cli, '--version'], staging, dataDir, emptyPath, offlineEnv).includes('3.15.2')) throw new Error('offline CLI version failed')
   if (!run(node, [cli, '--help'], staging, dataDir, emptyPath, offlineEnv).includes('--skip-update')) throw new Error('offline CLI help failed')
@@ -376,6 +467,23 @@ function assertNativeLoadGateRejectsCorruption(staging: string, dataDir: string,
   throw new Error('offline native load gate accepted a truncated wrong-ABI module')
 }
 
+/** Writes validated bytes completely before atomically claiming an absent final path with a hard link. */
+export function publishExclusive(output: string, bytes: Uint8Array, beforeClaim?: (output: string) => void, link = linkSync): void {
+  const temporary = `${output}.part-${process.pid}-${createHash('sha256').update(bytes).digest('hex').slice(0, 12)}`
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600)
+    writeSync(descriptor, bytes)
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = undefined
+    beforeClaim?.(output)
+    link(temporary, output)
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+    rmSync(temporary, { force: true })
+  }
+}
 interface BuildOptions { target: string; nodeArchive: string; checksums: string; output: string }
 
 /** Builds one locked, verified, deterministic DurinDoor payload on its native target runner. */
@@ -404,6 +512,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
       chmodSync(tray, 0o755)
     }
     const entries: PayloadEntry[] = [
+
       { path: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, data: readFileSync(join(nodeRoot, spec.nodePath)), mode: options.target.includes('windows') ? 0o644 : 0o755 },
       ...collectFiles(join(cliProject, 'node_modules'), 'app/node_modules', path => path === '.bin' || path.startsWith('.bin/')),
       ...collectFiles(join(seedProject, 'node_modules'), 'runtime-seed/node_modules', path => path === '.bin' || path.startsWith('.bin/')),
@@ -433,14 +542,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
     cpSync(staging, corruptStaging, { recursive: true })
     assertNativeLoadGateRejectsCorruption(corruptStaging, join(work, 'offline-corrupt-data'), options.target)
     mkdirSync(dirname(options.output), { recursive: true })
-    if (existsSync(options.output)) throw new Error(`refusing to replace existing payload: ${options.output}`)
-    const temporaryOutput = `${options.output}.part-${process.pid}`
-    try {
-      writeFileSync(temporaryOutput, bytes, { flag: 'wx' })
-      renameSync(temporaryOutput, options.output)
-    } finally {
-      rmSync(temporaryOutput, { force: true })
-    }
+    publishExclusive(options.output, bytes)
     return { archive: options.output, sha256: createHash('sha256').update(bytes).digest('hex') }
   } finally {
     rmSync(work, { recursive: true, force: true })

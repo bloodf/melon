@@ -1815,6 +1815,12 @@ mod tests {
         let final_parent = fs::canonicalize(fixture.final_dir.parent().expect("fixture final parent"))
             .expect("canonical fixture final parent");
         assert!(cache.starts_with(&root) && final_parent.starts_with(&root), "fixture paths stay under builder-owned root");
+        let archive_path = cache.join(&fixture.archive);
+        let archive_file = fs::File::open(&archive_path).expect("open builder archive");
+        let mut archive = ZipArchive::new(archive_file).expect("parse builder archive");
+        assert!(archive.len() <= DEFAULT_EXTRACTION_LIMITS.max_entries);
+        let total_size: u64 = (0..archive.len()).map(|index| archive.by_index(index).expect("archive entry").size()).sum();
+        assert!(total_size <= DEFAULT_EXTRACTION_LIMITS.max_uncompressed_bytes);
         assert!(Path::new(&fixture.archive).components().count() == 1, "archive is one cache component");
         let outcome = activate_runtime(
             &cache,
