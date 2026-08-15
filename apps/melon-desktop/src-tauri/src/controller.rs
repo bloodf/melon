@@ -67,6 +67,7 @@ impl std::fmt::Debug for OwnedProcesses {
 struct ControllerState {
     mutating: bool,
     shutting_down: bool,
+    retirement_active: bool,
     shutdown_active: bool,
     teardown_harness: bool,
     teardown_managed: bool,
@@ -121,7 +122,10 @@ impl ConnectionController {
     fn status_snapshot(&self) -> ControllerStatus {
         let mut state = self.lock();
         let mut query_error = None;
-        let mut running = state.teardown_harness || state.teardown_managed || state.teardown_retiring;
+        let mut running = state.teardown_harness
+            || state.teardown_managed
+            || state.teardown_retiring
+            || state.retirement_active;
         query_owned_processes(&mut state.owned, &mut running, &mut query_error);
         for owned in &mut state.retiring {
             query_owned_processes(owned, &mut running, &mut query_error);
@@ -136,15 +140,32 @@ impl ConnectionController {
             recoverable_error: state.recoverable_error.clone(),
         }
     }
-
     pub fn shutdown(&self) -> Result<(), ControllerError> {
-        let mut owned_sets = {
+        let retirement_deadline = std::time::Instant::now()
+            + self.stop_grace.saturating_mul(4)
+            + Duration::from_secs(1);
+        let mut owns_shutdown = false;
+        let mut owned_sets = loop {
             let mut state = self.lock();
             state.shutting_down = true;
-            if state.shutdown_active {
-                return Err(ControllerError::Busy);
+            if !owns_shutdown {
+                if state.shutdown_active {
+                    return Err(ControllerError::Busy);
+                }
+                state.shutdown_active = true;
+                owns_shutdown = true;
             }
-            state.shutdown_active = true;
+            if state.retirement_active {
+                drop(state);
+                if std::time::Instant::now() >= retirement_deadline {
+                    let mut state = self.lock();
+                    state.shutdown_active = false;
+                    state.recoverable_error = Some("Replacement teardown did not finish before shutdown deadline".into());
+                    return Err(ControllerError::ShutdownFailed);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             let current = std::mem::take(&mut state.owned);
             let mut owned_sets = std::mem::take(&mut state.retiring);
             if !current.is_empty() {
@@ -153,7 +174,7 @@ impl ConnectionController {
             state.teardown_harness = owned_sets.iter().any(|owned| owned.harness.is_some());
             state.teardown_managed = owned_sets.iter().any(|owned| owned.managed_durindoor.is_some());
             state.teardown_retiring = !owned_sets.is_empty();
-            owned_sets
+            break owned_sets;
         };
 
         let mut first_error = None;
@@ -254,16 +275,29 @@ impl Operation<'_> {
                 let _ = stop_owned_processes(&mut attempted, self.controller.stop_grace);
                 return Err(ControllerError::ShuttingDown);
             }
-            std::mem::replace(&mut state.owned, attempted)
+            let replaced = std::mem::replace(&mut state.owned, attempted);
+            state.retirement_active = !replaced.is_empty();
+            replaced
         };
         let error = stop_and_prune(&mut replaced, self.controller.stop_grace);
         let mut state = self.controller.lock();
+        if state.shutting_down {
+            state.retirement_active = false;
+            state.mutating = false;
+            self.active = false;
+            drop(state);
+            if !replaced.is_empty() {
+                let _ = stop_and_prune(&mut replaced, self.controller.stop_grace);
+            }
+            return Err(ControllerError::ShuttingDown);
+        }
         if let Some(error) = error {
             state.recoverable_error = Some(error.to_string());
         }
         if !replaced.is_empty() {
             state.retiring.push(replaced);
         }
+        state.retirement_active = false;
         state.mutating = false;
         self.active = false;
         Ok(())
@@ -1068,6 +1102,7 @@ mod ownership_tests {
             Err(io::Error::other("old managed replacement failure")),
             Ok(()),
         ]);
+
         controller
             .begin_operation().expect("old operation")
             .adopt(processes(Some(old_harness), Some(old_managed)), true).expect("adopt old trees");
@@ -1092,6 +1127,77 @@ mod ownership_tests {
         assert!(!controller.status_snapshot().running);
     }
 
+    struct BlockingFailureTree {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    impl OwnedTree for BlockingFailureTree {
+        fn is_running(&mut self) -> io::Result<bool> {
+            Ok(self.state.lock().expect("blocking failure state").running)
+        }
+
+        fn stop(&mut self, _grace: Duration) -> io::Result<()> {
+            let mut state = self.state.lock().expect("blocking failure state");
+            state.stops += 1;
+            let stop = state.stops;
+            drop(state);
+            if stop == 1 {
+                self.entered.wait();
+                self.release.wait();
+                return Err(io::Error::other("blocked replacement failure"));
+            }
+            self.state.lock().expect("blocking failure state").running = false;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shutdown_drains_replacement_teardown_that_started_before_shutdown() {
+        let controller = Arc::new(ConnectionController::for_test(false, Duration::from_millis(100)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let old_state = Arc::new(Mutex::new(FakeState { running: true, ..Default::default() }));
+        controller
+            .begin_operation().expect("old operation")
+            .adopt(
+                processes(Some(Box::new(BlockingFailureTree {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    state: Arc::clone(&old_state),
+                })), None),
+                true,
+            )
+            .expect("adopt old tree");
+
+        let (new_tree, new_state) = FakeTree::running();
+        let adopting_controller = Arc::clone(&controller);
+        let adoption = thread::spawn(move || {
+            adopting_controller
+                .begin_operation().expect("replacement operation")
+                .adopt(processes(Some(new_tree), None), true)
+        });
+        entered.wait();
+
+        let shutdown_controller = Arc::clone(&controller);
+        let shutdown = thread::spawn(move || shutdown_controller.shutdown());
+        thread::sleep(Duration::from_millis(20));
+        assert!(!shutdown.is_finished(), "shutdown escaped active replacement teardown");
+        release.wait();
+
+        assert_eq!(adoption.join().expect("adoption thread"), Err(ControllerError::ShuttingDown));
+        assert_eq!(shutdown.join().expect("shutdown thread"), Ok(()));
+        assert_eq!(old_state.lock().expect("old state").stops, 2);
+        assert!(!old_state.lock().expect("old state").running);
+        assert_eq!(new_state.lock().expect("new state").stops, 1);
+        assert!(!new_state.lock().expect("new state").running);
+        assert!(!controller.status_snapshot().running);
+        let state = controller.lock();
+        assert!(state.owned.is_empty());
+        assert!(state.retiring.is_empty());
+        assert!(!state.teardown_harness && !state.teardown_managed && !state.teardown_retiring);
+    }
 
     struct BlockingTree {
         entered: Arc<Barrier>,
