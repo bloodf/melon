@@ -155,12 +155,12 @@ impl ConnectionController {
                 state.shutdown_active = true;
                 owns_shutdown = true;
             }
-            if state.retirement_active {
+            if state.retirement_active || state.mutating {
                 drop(state);
                 if std::time::Instant::now() >= retirement_deadline {
                     let mut state = self.lock();
                     state.shutdown_active = false;
-                    state.recoverable_error = Some("Replacement teardown did not finish before shutdown deadline".into());
+                    state.recoverable_error = Some("Connection operation did not finish before shutdown deadline".into());
                     return Err(ControllerError::ShutdownFailed);
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -247,13 +247,18 @@ fn stop_and_prune(owned: &mut OwnedProcesses, grace: Duration) -> Option<io::Err
     first_error
 }
 
-fn stop_owned_processes(
-    owned: &mut OwnedProcesses,
-    grace: Duration,
-) -> (Option<io::Error>, bool, bool) {
-    let error = stop_and_prune(owned, grace);
-    (error, owned.harness.is_none(), owned.managed_durindoor.is_none())
+fn retain_cleanup_survivors(
+    controller: &ConnectionController,
+    attempted: &mut OwnedProcesses,
+) -> Option<io::Error> {
+    let error = stop_and_prune(attempted, controller.stop_grace);
+    if !attempted.is_empty() {
+        let survivor = std::mem::take(attempted);
+        controller.lock().retiring.push(survivor);
+    }
+    error
 }
+
 
 
 #[derive(Debug)]
@@ -265,14 +270,14 @@ struct Operation<'a> {
 impl Operation<'_> {
     fn adopt(mut self, mut attempted: OwnedProcesses, succeeded: bool) -> Result<(), ControllerError> {
         if !succeeded {
-            let _ = stop_owned_processes(&mut attempted, self.controller.stop_grace);
+            let _ = retain_cleanup_survivors(self.controller, &mut attempted);
             return Err(ControllerError::ActivationFailed);
         }
         let mut replaced = {
             let mut state = self.controller.lock();
             if state.shutting_down {
                 drop(state);
-                let _ = stop_owned_processes(&mut attempted, self.controller.stop_grace);
+                let _ = retain_cleanup_survivors(self.controller, &mut attempted);
                 return Err(ControllerError::ShuttingDown);
             }
             let replaced = std::mem::replace(&mut state.owned, attempted);
@@ -282,13 +287,15 @@ impl Operation<'_> {
         let error = stop_and_prune(&mut replaced, self.controller.stop_grace);
         let mut state = self.controller.lock();
         if state.shutting_down {
-            state.retirement_active = false;
             state.mutating = false;
             self.active = false;
-            drop(state);
-            if !replaced.is_empty() {
-                let _ = stop_and_prune(&mut replaced, self.controller.stop_grace);
+            if let Some(error) = error {
+                state.recoverable_error = Some(error.to_string());
             }
+            if !replaced.is_empty() {
+                state.retiring.push(replaced);
+            }
+            state.retirement_active = false;
             return Err(ControllerError::ShuttingDown);
         }
         if let Some(error) = error {
@@ -1044,7 +1051,7 @@ mod ownership_tests {
     fn shutdown_blocks_new_operations_and_late_adoption_rolls_back_attempt() {
         let controller = ConnectionController::for_test(false, Duration::from_millis(50));
         let operation = controller.begin_operation().expect("operation");
-        assert_eq!(controller.shutdown(), Ok(()));
+        assert_eq!(controller.shutdown(), Err(ControllerError::ShutdownFailed));
         let (attempt, attempt_state) = FakeTree::running();
         assert_eq!(
             operation.adopt(processes(Some(attempt), None), true),
@@ -1091,6 +1098,29 @@ mod ownership_tests {
         assert_eq!(prior_state.lock().expect("prior").stops, 0);
         assert!(controller.status_snapshot().running);
     }
+    #[test]
+    fn failed_attempted_adoption_tracks_survivor_until_later_shutdown_succeeds() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(50));
+        let (attempt, state) = FakeTree::with_results(vec![
+            Err(io::Error::other("rollback failure one")),
+            Err(io::Error::other("rollback failure two")),
+            Ok(()),
+        ]);
+
+        assert_eq!(
+            controller.begin_operation().expect("operation").adopt(processes(Some(attempt), None), false),
+            Err(ControllerError::ActivationFailed),
+        );
+        assert_eq!(state.lock().expect("attempt").stops, 1);
+        assert!(controller.status_snapshot().running);
+        assert_eq!(controller.shutdown(), Err(ControllerError::ShutdownFailed));
+        assert_eq!(state.lock().expect("attempt").stops, 2);
+        assert!(controller.status_snapshot().running);
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert_eq!(state.lock().expect("attempt").stops, 3);
+        assert!(!controller.status_snapshot().running);
+    }
+
     #[test]
     fn successful_replacement_retains_and_retries_every_failed_prior_tree() {
         let controller = ConnectionController::for_test(false, Duration::from_millis(50));
@@ -1141,15 +1171,17 @@ mod ownership_tests {
         fn stop(&mut self, _grace: Duration) -> io::Result<()> {
             let mut state = self.state.lock().expect("blocking failure state");
             state.stops += 1;
+            let result = state.stop_results.pop_front().unwrap_or(Ok(()));
             let stop = state.stops;
+            if result.is_ok() {
+                state.running = false;
+            }
             drop(state);
             if stop == 1 {
                 self.entered.wait();
                 self.release.wait();
-                return Err(io::Error::other("blocked replacement failure"));
             }
-            self.state.lock().expect("blocking failure state").running = false;
-            Ok(())
+            result
         }
     }
 
@@ -1158,7 +1190,15 @@ mod ownership_tests {
         let controller = Arc::new(ConnectionController::for_test(false, Duration::from_millis(100)));
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
-        let old_state = Arc::new(Mutex::new(FakeState { running: true, ..Default::default() }));
+        let old_state = Arc::new(Mutex::new(FakeState {
+            running: true,
+            stop_results: vec![
+                Err(io::Error::other("blocked replacement failure")),
+                Err(io::Error::other("shutdown retry failure")),
+                Ok(()),
+            ].into(),
+            ..Default::default()
+        }));
         controller
             .begin_operation().expect("old operation")
             .adopt(
@@ -1179,7 +1219,6 @@ mod ownership_tests {
                 .adopt(processes(Some(new_tree), None), true)
         });
         entered.wait();
-
         let shutdown_controller = Arc::clone(&controller);
         let shutdown = thread::spawn(move || shutdown_controller.shutdown());
         thread::sleep(Duration::from_millis(20));
@@ -1187,11 +1226,15 @@ mod ownership_tests {
         release.wait();
 
         assert_eq!(adoption.join().expect("adoption thread"), Err(ControllerError::ShuttingDown));
-        assert_eq!(shutdown.join().expect("shutdown thread"), Ok(()));
+        assert_eq!(shutdown.join().expect("shutdown thread"), Err(ControllerError::ShutdownFailed));
         assert_eq!(old_state.lock().expect("old state").stops, 2);
-        assert!(!old_state.lock().expect("old state").running);
+        assert!(old_state.lock().expect("old state").running);
         assert_eq!(new_state.lock().expect("new state").stops, 1);
         assert!(!new_state.lock().expect("new state").running);
+        assert!(controller.status_snapshot().running);
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert_eq!(old_state.lock().expect("old state").stops, 3);
+        assert!(!old_state.lock().expect("old state").running);
         assert!(!controller.status_snapshot().running);
         let state = controller.lock();
         assert!(state.owned.is_empty());
