@@ -1,7 +1,7 @@
 //! Current-session ownership of one spawned child process tree.
 
 use std::io;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -196,8 +196,17 @@ impl ProcessTree {
         Ok(Self { child, platform: PlatformTree { job }, stopped: false })
     }
 
-    /// Reports whether any member remains in the owned process tree.
+    /// Observes only the directly spawned child's exit status.
     ///
+    /// Descendants may remain live after this returns `Some`; use [`Self::is_running`] for whole-tree liveness.
+    ///
+    /// # Errors
+    /// Returns an OS error when the direct child's status cannot be queried.
+    pub(crate) fn try_wait_direct(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Reports whether any member remains in the owned process tree.
     /// # Errors
     /// Returns an OS query error other than an already-absent tree.
     pub(crate) fn is_running(&mut self) -> io::Result<bool> {
@@ -634,6 +643,47 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    fn wait_direct(tree: &mut ProcessTree) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = tree.try_wait_direct().expect("direct child status") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "direct child did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn observes_zero_and_nonzero_direct_status_without_timeout() {
+        for code in [0, 37] {
+            let mut command = helper_command("exit");
+            command.env("MELON_PROCESS_TREE_HELPER_EXIT", code.to_string());
+            let mut tree = ProcessTree::spawn(&mut command).expect("spawn exiting child");
+            let started = Instant::now();
+            let status = wait_direct(&mut tree);
+            assert_eq!(status.code(), Some(code));
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(tree.try_wait_direct().expect("repeated status"), Some(status));
+            tree.stop(Duration::from_millis(50)).expect("stop observed child");
+            tree.stop(Duration::from_millis(50)).expect("repeat stop observed child");
+        }
+    }
+
+    #[test]
+    fn direct_exit_does_not_hide_live_grandchild_tree() {
+        let ready = unique_path("direct-exit-grandchild");
+        let mut command = helper_command("parent-exit");
+        command.env(HELPER_READY, &ready);
+        let mut tree = ProcessTree::spawn(&mut command).expect("spawn parent-exit tree");
+        let (_parent, grandchild) = wait_for_ready(&ready);
+        assert_eq!(wait_direct(&mut tree).code(), Some(0));
+        assert!(tree.is_running().expect("grandchild keeps tree running"));
+        tree.stop(Duration::from_millis(100)).expect("stop remaining grandchild");
+        wait_gone(grandchild);
+        fs::remove_file(ready).expect("remove readiness file");
+    }
+
 
     #[test]
     fn stops_parent_and_grandchild_without_touching_unrelated_process() {
@@ -856,6 +906,18 @@ mod tests {
                 loop {
                     thread::park_timeout(Duration::from_secs(60));
                 }
+            }
+            Ok("exit") => {
+                let code = std::env::var("MELON_PROCESS_TREE_HELPER_EXIT")
+                    .expect("exit code")
+                    .parse::<i32>()
+                    .expect("numeric exit code");
+                std::process::exit(code);
+            }
+            Ok("parent-exit") => {
+                let grandchild = helper_command("leaf").spawn().expect("spawn grandchild");
+                let ready = std::env::var_os(HELPER_READY).expect("readiness path");
+                fs::write(ready, format!("{},{}", std::process::id(), grandchild.id())).expect("publish readiness");
             }
             Ok("leaf") => {
                 #[cfg(unix)]
