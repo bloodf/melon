@@ -1,0 +1,8 @@
+{
+  "name": "melon-durindoor-runtime-seed-build",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "node-gyp": "10.1.0"
+  }
+}

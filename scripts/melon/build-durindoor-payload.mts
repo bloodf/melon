@@ -39,13 +39,17 @@ interface PinnedArchive {
 
 interface RuntimePins {
   durindoor: {
+    version: string
+    packageIntegrity: string
     nodeVersion: string
+    nodeHeaders: PinnedArchive
     nodeArchives: Record<string, PinnedArchive>
   }
 }
 const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const RUNTIME_PINS = readJson(join(SCRIPT_ROOT, 'apps/melon-desktop/runtime/runtime-pins.json')) as unknown as RuntimePins
 const VERSION = RUNTIME_PINS.durindoor.nodeVersion
+const DURINDOOR_VERSION = RUNTIME_PINS.durindoor.version
 const FIXED_DOS_DATE = 0x0021
 const TARGETS: Record<string, Target> = {
   'x86_64-unknown-linux-gnu': { archiveRoot: `node-v${VERSION}-linux-x64`, nodePath: 'bin/node', npmCli: 'lib/node_modules/npm/bin/npm-cli.js', magic: [0x7f, 0x45, 0x4c, 0x46], architecture: 'linux-x64', tray: 'tray_linux_release' },
@@ -265,18 +269,25 @@ function readJson(path: string): Record<string, unknown> {
   return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
 }
 
-/** Verifies committed npm locks pin exact CLI and runtime seed roots. */
+/** Verifies committed npm locks match exact runtime pins and seed roots. */
 export function validateLockedManifests(root: string): void {
   const cli = readJson(join(root, 'package-lock.json'))
   const seed = readJson(join(root, 'runtime-seed/package-lock.json'))
-  const cliPackages = cli.packages as Record<string, { version?: string }> | undefined
+  const build = readJson(join(root, 'runtime-seed-build/package-lock.json'))
+  const cliPackages = cli.packages as Record<string, { version?: string; integrity?: string }> | undefined
   const seedPackages = seed.packages as Record<string, { version?: string }> | undefined
-  if (cliPackages?.['node_modules/durindoor']?.version !== '3.15.2') throw new Error('DurinDoor lock must pin 3.15.2')
+  const buildPackages = build.packages as Record<string, { version?: string; integrity?: string; hasInstallScript?: boolean }> | undefined
+  const durindoor = cliPackages?.['node_modules/durindoor']
+  if (durindoor?.version !== DURINDOOR_VERSION) throw new Error(`DurinDoor lock must pin ${DURINDOOR_VERSION}`)
+  if (durindoor.integrity !== RUNTIME_PINS.durindoor.packageIntegrity) throw new Error('DurinDoor lock integrity must match runtime pins')
   for (const [name, version] of [['better-sqlite3', '12.6.2'], ['sql.js', '1.14.1'], ['systray2', '2.1.4']]) {
     if (seedPackages?.[`node_modules/${name}`]?.version !== version) throw new Error(`runtime seed lock must pin ${name}@${version}`)
   }
+  const nodeGyp = buildPackages?.['node_modules/node-gyp']
+  if (nodeGyp?.version !== '10.1.0' || nodeGyp.integrity !== 'sha512-B4J5M1cABxPc5PwfjhbV5hoy2DP9p8lFXASnEN6hugXOa61416tnTZ29x9sSwAd0o99XNIcpvDDy1swAExsVKA==') throw new Error('runtime seed build lock must pin authenticated node-gyp@10.1.0')
   const lifecyclePackages = Object.entries(seedPackages ?? {}).filter(([, value]) => (value as { hasInstallScript?: boolean }).hasInstallScript).map(([path]) => path)
   if (JSON.stringify(lifecyclePackages) !== JSON.stringify(['node_modules/better-sqlite3'])) throw new Error('runtime seed lifecycle set must contain only better-sqlite3')
+  if (Object.values(buildPackages ?? {}).some(value => value.hasInstallScript === true)) throw new Error('runtime seed build tool lock must contain no lifecycle scripts')
 }
 function run(command: string, args: string[], cwd: string, dataDir: string, path = process.env.PATH ?? '', extraEnv: Record<string, string> = {}): string {
   const home = join(dataDir, 'home')
@@ -292,7 +303,14 @@ function run(command: string, args: string[], cwd: string, dataDir: string, path
   }
   for (const name of ['SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'TMPDIR']) if (process.env[name] !== undefined) env[name] = process.env[name]!
   const result = spawnSync(command, args, { cwd, env, encoding: 'utf8' })
-  if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}\n${result.stderr}`)
+  const output = `${result.stdout}${result.stderr}`
+  if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${output}`)
+  return output
+}
+
+function runStdout(command: string, args: string[], cwd: string, dataDir: string): string {
+  const result = spawnSync(command, args, { cwd, env: { DATA_DIR: dataDir, HOME: join(dataDir, 'home'), USERPROFILE: join(dataDir, 'home'), PATH: process.env.PATH ?? '' }, encoding: 'utf8' })
+  if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed\n${result.stdout}${result.stderr}`)
   return result.stdout
 }
 
@@ -429,7 +447,6 @@ export function preflightNodeArchive(archive: string, selectedRoots?: readonly s
   return selectedEntries
 }
 
-
 function extractNodeRuntime(archive: string, destination: string, spec: Target, dataDir: string): string {
   const selected = [`${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli.split('/bin/')[0]}`, `${spec.archiveRoot}/LICENSE`]
   const entries = preflightNodeArchive(archive, selected)
@@ -437,8 +454,7 @@ function extractNodeRuntime(archive: string, destination: string, spec: Target, 
   const required = [`${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli}`, `${spec.archiveRoot}/LICENSE`]
   if (required.some(name => !names.has(name))) throw new Error('Node archive lacks runtime, npm, or license')
   mkdirSync(destination, { recursive: true })
-  if (archive.endsWith('.zip')) run('tar', ['-xf', archive, '-C', destination, `${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/node_modules/npm`, `${spec.archiveRoot}/LICENSE`], dirname(archive), dataDir)
-  else run('tar', ['-xzf', archive, '-C', destination, `${spec.archiveRoot}/${spec.nodePath}`, `${spec.archiveRoot}/${spec.npmCli.split('/bin/')[0]}`, `${spec.archiveRoot}/LICENSE`], dirname(archive), dataDir)
+  run('tar', [archive.endsWith('.zip') ? '-xf' : '-xzf', archive, '-C', destination, ...selected], dirname(archive), dataDir)
   const root = join(destination, spec.archiveRoot)
   for (const requiredPath of [spec.nodePath, spec.npmCli, 'LICENSE']) {
     let current = root
@@ -450,12 +466,58 @@ function extractNodeRuntime(archive: string, destination: string, spec: Target, 
   }
   return root
 }
+
+/** Structurally validates required regular files in the shared official Node headers archive. */
+export function preflightNodeHeadersArchive(archive: string): ArchiveEntry[] {
+  const root = `node-v${VERSION}/include/node`
+  const entries = preflightNodeArchive(archive, [root])
+  const names = new Set(entries.map(entry => entry.name))
+  for (const required of [`${root}/node.h`, `${root}/common.gypi`, `${root}/config.gypi`]) {
+    if (!names.has(required)) throw new Error(`Node headers archive lacks ${basename(required)}`)
+  }
+  return entries
+}
+
+function extractNodeHeaders(archive: string, destination: string, dataDir: string): string {
+  preflightNodeHeadersArchive(archive)
+  const archiveRoot = `node-v${VERSION}`
+  mkdirSync(destination, { recursive: true })
+  run('tar', ['-xzf', archive, '-C', destination, `${archiveRoot}/include/node`], dirname(archive), dataDir)
+  const root = join(destination, archiveRoot)
+  for (const required of ['include/node/node.h', 'include/node/common.gypi', 'include/node/config.gypi']) {
+    if (!lstatSync(join(root, required), { throwIfNoEntry: false })?.isFile()) throw new Error(`materialized Node headers missing ${required}`)
+  }
+  return root
+}
 function runNpm(nodeRoot: string, spec: Target, args: string[], cwd: string, dataDir: string): void {
   const node = join(nodeRoot, spec.nodePath)
   const npmCli = join(nodeRoot, spec.npmCli)
   run(node, [npmCli, ...args], cwd, dataDir, `${dirname(node)}${delimiter}${process.env.PATH ?? ''}`)
 }
 
+type NativeBuildRunner = (command: string, args: string[], cwd: string, dataDir: string, path: string, env: Record<string, string>) => string
+
+/** Rejects evidence that native build selected a downloaded or prebuilt artifact.
+ * @param log - Complete npm rebuild output.
+ */
+export function validateNativeBuildLog(log: string): void {
+  if (/prebuild-install|\bdownload(?:ing|ed)?\b|https?:\/\/github\.com|\bprebuilt\b/i.test(log)) throw new Error('native seed must build from locked source')
+}
+
+/** Builds better-sqlite3 from locked source under the positively-probed sandbox. */
+export function buildNativeSeed(nodeRoot: string, headersRoot: string, buildTools: string, spec: Target, seedProject: string, dataDir: string, sandboxPrefix: string[], runner: NativeBuildRunner = run): void {
+  if (sandboxPrefix.length === 0) throw new Error('native seed build requires sandbox prefix')
+  for (const header of ['include/node/node.h', 'include/node/common.gypi', 'include/node/config.gypi']) {
+    if (!lstatSync(join(headersRoot, header), { throwIfNoEntry: false })?.isFile()) throw new Error(`verified Node headers missing ${header}`)
+  }
+  const node = join(nodeRoot, spec.nodePath)
+  const nodeGyp = join(buildTools, 'node_modules/node-gyp/bin/node-gyp.js')
+  if (!lstatSync(nodeGyp, { throwIfNoEntry: false })?.isFile()) throw new Error('locked node-gyp build tool missing')
+  const nativeProject = join(seedProject, 'node_modules/better-sqlite3')
+  const env = { npm_config_build_from_source: 'true', npm_config_nodedir: headersRoot, npm_config_tarball: '' }
+  const log = runner(sandboxPrefix[0]!, [...sandboxPrefix.slice(1), node, nodeGyp, 'rebuild', '--release', `--nodedir=${headersRoot}`], nativeProject, dataDir, '', env)
+  validateNativeBuildLog(log)
+}
 function copyRuntimeSeed(seed: string, dataDir: string): void {
   const runtime = join(dataDir, 'runtime')
   mkdirSync(runtime, { recursive: true })
@@ -491,7 +553,7 @@ function validateOffline(staging: string, dataDir: string, target: string, sandb
   writeOfflineGuard(guard)
   const offlineEnv = { NODE_PATH: runtimeModules, NODE_OPTIONS: `--require=${guard}` }
   const validate = (args: string[]) => runSandboxed(sandboxPrefix, node, args, staging, dataDir, emptyPath, offlineEnv)
-  if (!validate([cli, '--version']).includes('3.15.2')) throw new Error('offline CLI version failed')
+  if (!validate([cli, '--version']).includes(DURINDOOR_VERSION)) throw new Error('offline CLI version failed')
   if (!validate([cli, '--help']).includes('--skip-update')) throw new Error('offline CLI help failed')
   const smoke = [
     "const Database=require('better-sqlite3')",
@@ -553,8 +615,49 @@ export function publishExclusive(
     rmSync(temporary, { force: true })
   }
 }
+
+type RustGateRunner = (descriptor: string) => void
+
+/** Passes actual payload bytes through the production Rust extractor before publication. */
+/** Requires positive cargo output naming the ignored production fixture. */
+export function validateRustGateOutput(output: string): void {
+  if (!/test runtime::tests::builder_payload_fixture_is_accepted \.\.\. ok/.test(output)) throw new Error('Rust payload gate did not execute builder_payload_fixture_is_accepted')
+}
+
+export function runRustPayloadGate(bytes: Uint8Array, target: string, work: string, runner: RustGateRunner = descriptor => {
+  const result = spawnSync('cargo', ['test', '--manifest-path', 'apps/melon-desktop/src-tauri/Cargo.toml', 'builder_payload_fixture_is_accepted', '--', '--ignored', '--nocapture'], {
+    cwd: SCRIPT_ROOT,
+    env: { ...process.env, MELON_PAYLOAD_FIXTURE: descriptor },
+    encoding: 'utf8',
+  })
+  const output = `${result.stdout}${result.stderr}`
+  if (result.status !== 0) throw new Error(`Rust payload gate failed\n${output}`)
+  validateRustGateOutput(output)
+}): void {
+  const gate = join(work, 'rust-gate')
+  const cache = join(gate, 'cache')
+  const finalParent = join(gate, 'final')
+  try {
+    mkdirSync(cache, { recursive: true, mode: 0o700 })
+    mkdirSync(finalParent, { recursive: true, mode: 0o700 })
+    const archive = 'payload.zip'
+    writeFileSync(join(cache, archive), bytes, { mode: 0o600 })
+    const descriptor = join(gate, 'fixture.json')
+    writeFileSync(descriptor, JSON.stringify({ root: gate, cache, archive, targetId: target, sha256: createHash('sha256').update(bytes).digest('hex'), finalDir: join(finalParent, target) }), { mode: 0o600 })
+    runner(descriptor)
+  } finally {
+    rmSync(gate, { recursive: true, force: true })
+  }
+}
 /** Inputs for one target-native authenticated payload build. */
-export interface BuildOptions { target: string; nodeArchive: string; checksums: string; output: string; sandboxRunner?: string; sandboxProbe?: SandboxProbe; parentNetworkNamespace?: string }
+export interface BuildOptions { target: string; nodeArchive: string; headersArchive: string; checksums: string; output: string; sandboxRunner?: string; sandboxProbe?: SandboxProbe; parentNetworkNamespace?: string; nativeBuildRunner?: NativeBuildRunner; rustGateRunner?: RustGateRunner }
+
+/** Requires Rust activation acceptance before creating the final payload path. */
+export function publishValidatedPayload(bytes: Uint8Array, target: string, work: string, output: string, runner?: RustGateRunner): void {
+  runRustPayloadGate(bytes, target, work, runner)
+  mkdirSync(dirname(output), { recursive: true })
+  publishExclusive(output, bytes)
+}
 
 /** Builds one locked, verified, deterministic DurinDoor payload on its native target runner. */
 export function buildPayload(options: BuildOptions): { archive: string; sha256: string } {
@@ -563,19 +666,26 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
   const spec = targetSpec(options.target, options.nodeArchive)
   const pin = RUNTIME_PINS.durindoor.nodeArchives[options.target]!
   verifyChecksum(options.nodeArchive, options.checksums, pin.filename, pin.sha256)
+  const headersPin = RUNTIME_PINS.durindoor.nodeHeaders
+  if (basename(options.headersArchive) !== headersPin.filename) throw new Error('Node headers archive does not match runtime pins')
+  verifyChecksum(options.headersArchive, options.checksums, headersPin.filename, headersPin.sha256)
   const sandboxPrefix = nativeSandboxPrefix(options.target, options.sandboxRunner, undefined, options.sandboxProbe, options.parentNetworkNamespace)
   const work = mkdtempSync(join(tmpdir(), 'melon-durindoor-build-'))
   const dataDir = join(work, 'data')
   try {
     const cliProject = join(work, 'cli')
     const seedProject = join(work, 'seed')
+    const buildProject = join(work, 'seed-build')
     const nodeRoot = extractNodeRuntime(options.nodeArchive, join(work, 'node'), spec, dataDir)
-    mkdirSync(cliProject); mkdirSync(seedProject); mkdirSync(dataDir, { recursive: true })
+    const headersRoot = extractNodeHeaders(options.headersArchive, join(work, 'headers'), dataDir)
+    mkdirSync(cliProject); mkdirSync(seedProject); mkdirSync(buildProject); mkdirSync(dataDir, { recursive: true })
     for (const name of ['package.json', 'package-lock.json']) cpSync(join(manifests, name), join(cliProject, name))
     for (const name of ['package.json', 'package-lock.json']) cpSync(join(manifests, 'runtime-seed', name), join(seedProject, name))
+    for (const name of ['package.json', 'package-lock.json']) cpSync(join(manifests, 'runtime-seed-build', name), join(buildProject, name))
     runNpm(nodeRoot, spec, ['ci', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund'], cliProject, dataDir)
     runNpm(nodeRoot, spec, ['ci', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund'], seedProject, dataDir)
-    runNpm(nodeRoot, spec, ['rebuild', 'better-sqlite3', '--foreground-scripts', '--no-audit', '--no-fund'], seedProject, dataDir)
+    runNpm(nodeRoot, spec, ['ci', '--ignore-scripts', '--omit=dev', '--no-audit', '--no-fund'], buildProject, dataDir)
+    buildNativeSeed(nodeRoot, headersRoot, buildProject, spec, seedProject, dataDir, sandboxPrefix, options.nativeBuildRunner)
     if (spec.tray === undefined) rmSync(join(seedProject, 'node_modules/systray2'), { recursive: true, force: true })
     else {
       const tray = join(seedProject, 'node_modules/systray2/traybin', spec.tray)
@@ -594,14 +704,14 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
     ]
     for (const entry of entries.filter(entry => /(^|\/)LICENSE(?:\.|$)/i.test(entry.path) && !entry.path.startsWith('licenses/'))) entries.push({ ...entry, path: `licenses/${entry.path.replaceAll('/', '__')}` })
     entries.push(thirdPartyNotices(entries))
-    const nodeAbi = run(join(nodeRoot, spec.nodePath), ['-p', 'process.versions.modules'], work, dataDir).trim()
+    const nodeAbi = runStdout(join(nodeRoot, spec.nodePath), ['-p', 'process.versions.modules'], work, dataDir).trim()
     if (!/^\d+$/.test(nodeAbi)) throw new Error('verified Node did not report a native module ABI')
     const licenseHashes = {
       durindoor: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/durindoor-LICENSE')!.data).digest('hex'),
       node: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/node-LICENSE')!.data).digest('hex'),
       notices: createHash('sha256').update(entries.find(entry => entry.path === 'licenses/THIRD_PARTY_NOTICES.json')!.data).digest('hex'),
     }
-    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: '3.15.2', nodeVersion: VERSION, nodeAbi, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
+    const descriptor = { schemaVersion: 1, target: options.target, durindoorVersion: DURINDOOR_VERSION, nodeVersion: VERSION, nodeAbi, cli: 'app/node_modules/durindoor/cli.js', node: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, runtimeSeedPath: 'runtime-seed', managedLaunchReady: false, licenses: { durindoor: 'licenses/durindoor-LICENSE', node: 'licenses/node-LICENSE', notices: 'licenses/THIRD_PARTY_NOTICES.json', sha256: licenseHashes } }
     entries.push({ path: 'payload.json', data: Buffer.from(`${JSON.stringify(descriptor, null, 2)}\n`), mode: 0o644 })
     validatePayloadEntries(entries, options.target)
     const bytes = canonicalZip(entries)
@@ -612,8 +722,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
     const corruptStaging = join(work, 'offline-corrupt')
     cpSync(staging, corruptStaging, { recursive: true })
     assertNativeLoadGateRejectsCorruption(corruptStaging, join(work, 'offline-corrupt-data'), options.target, sandboxPrefix)
-    mkdirSync(dirname(options.output), { recursive: true })
-    publishExclusive(options.output, bytes)
+    publishValidatedPayload(bytes, options.target, work, options.output, options.rustGateRunner)
     return { archive: options.output, sha256: createHash('sha256').update(bytes).digest('hex') }
   } finally {
     rmSync(work, { recursive: true, force: true })
@@ -623,7 +732,7 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
 function main(): void {
   const args = process.argv.slice(2)
   const value = (flag: string) => { const index = args.indexOf(flag); if (index < 0 || args[index + 1] === undefined) throw new Error(`missing ${flag}`); return args[index + 1] }
-  const result = buildPayload({ target: value('--target'), nodeArchive: resolve(value('--node-archive')), checksums: resolve(value('--checksums')), output: resolve(value('--output')), sandboxRunner: resolve(value('--sandbox-runner')) })
+  const result = buildPayload({ target: value('--target'), nodeArchive: resolve(value('--node-archive')), headersArchive: resolve(value('--headers-archive')), checksums: resolve(value('--checksums')), output: resolve(value('--output')), sandboxRunner: resolve(value('--sandbox-runner')) })
   process.stdout.write(`${JSON.stringify(result)}\n`)
 }
 

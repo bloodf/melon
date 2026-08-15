@@ -16,18 +16,19 @@ pnpm run melon:check
 
 ## DurinDoor payload
 
-Release runners build one target-native DurinDoor payload with committed CLI and runtime-seed npm locks. `runtime-pins.json` owns each exact Node 20.20.2 archive filename and SHA-256; the builder requires both the supplied official `SHASUMS256.txt` value and actual archive digest to equal that pin. It installs the DurinDoor closure with scripts disabled, installs the native runtime seed with its reviewed `better-sqlite3` lifecycle enabled under an isolated `DATA_DIR`, excludes npm shims and all symlinks, validates the staged CLI inside a positively probed OS network sandbox, and writes a deterministic ZIP with durable Unix directory publication.
+Release runners build one target-native DurinDoor payload with committed CLI, shipped runtime-seed, and build-only npm locks. `runtime-pins.json` owns the DurinDoor version/package integrity, each exact Node 20.20.2 runtime archive, and the shared official headers archive with SHA-256. The builder requires supplied official checksum metadata and actual archive bytes to match those pins. It installs runtime closures with scripts disabled, installs exact build-only `node-gyp@10.1.0` separately, then invokes it directly under verified Node 20 inside the positively probed OS network sandbox with empty `PATH` and authenticated headers. Build tools never enter the payload, and logs reject prebuild/download evidence. After bundled-Node native/WASM validation, actual payload bytes must positively report the production Rust activation test passing before durable publication.
 
 ```sh
 pnpm run build:durindoor-payload -- \
   --target x86_64-unknown-linux-gnu \
   --node-archive /path/to/node-v20.20.2-linux-x64.tar.gz \
+  --headers-archive /path/to/node-v20.20.2-headers.tar.gz \
   --checksums /path/to/SHASUMS256.txt \
   --sandbox-runner /usr/bin/unshare \
   --output /path/to/melon-durindoor-x86_64-unknown-linux-gnu.zip
 ```
 
-Run `pnpm run test:durindoor-payload` for authenticated input, sandbox behavior, canonical ZIP, target policy, locked-version, native/WASM, license-notice, durable publication, and Rust activation fixture coverage. Linux builds require `unshare` with working user and network namespaces; the builder probes namespace isolation before any payload work and fails closed otherwise. macOS and Windows builders remain blocked until native runners provide and prove equivalent positive network sandboxes, so Linux evidence cannot be represented as macOS or Windows offline proof. Payload generation does not make managed launch ready: `payload.json` records `runtimeSeedPath` and `managedLaunchReady: false`; managed start must remain disabled until Rust installs missing locked seed files non-destructively and validates them with bundled Node.
+Run `pnpm run test:durindoor-payload` for authenticated runtime/header inputs, sandboxed source-build behavior, canonical ZIP, target policy, locked-version/integrity, native/WASM, license-notice, Rust activation, and durable publication coverage. Linux builds require `unshare` with working user and network namespaces; the builder probes namespace isolation before any payload work and fails closed otherwise. macOS and Windows builders remain blocked until native runners provide and prove equivalent positive network sandboxes. All targets use the pinned shared official headers archive; missing, linked, special, duplicate, or unsafe header entries fail closed rather than using ambient headers. Linux evidence cannot be represented as macOS or Windows offline proof. Payload generation does not make managed launch ready: `payload.json` records `runtimeSeedPath` and `managedLaunchReady: false`; managed start remains disabled until Rust installs missing locked seed files non-destructively and validates them with bundled Node.
 
 ## Trust model
 

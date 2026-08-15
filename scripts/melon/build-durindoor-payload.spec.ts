@@ -1,18 +1,23 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  buildNativeSeed,
+  buildPayload,
   canonicalZip,
   inspectZip,
   nativeSandboxPrefix,
   preflightNodeArchive,
   publishExclusive,
+  preflightNodeHeadersArchive,
+  publishValidatedPayload,
   thirdPartyNotices,
   targetSpec,
   validateLockedManifests,
+  validateRustGateOutput,
+  validateNativeBuildLog,
   validatePayloadEntries,
   verifyChecksum,
   validateCanonicalMetadata,
@@ -79,7 +84,7 @@ function fixture(target = 'x86_64-unknown-linux-gnu'): PayloadEntry[] {
 }
 
 describe('canonical DurinDoor payload', () => {
-  it('emits byte-identical sorted regular-file entries with fixed timestamps and modes', () => {
+  it('keeps the canonical serializer byte-stable for synthetic entries', () => {
     const entries = fixture()
     const first = canonicalZip(entries)
     const second = canonicalZip([...entries].reverse())
@@ -232,6 +237,90 @@ describe('canonical DurinDoor payload', () => {
     })
   })
 
+  it('commits the exact official shared Node headers archive and digest', () => {
+    const pins = JSON.parse(readFileSync(join(process.cwd(), 'apps/melon-desktop/runtime/runtime-pins.json'), 'utf8')) as { durindoor: { nodeHeaders: { filename: string; sha256: string } } }
+    expect(pins.durindoor.nodeHeaders).toEqual({
+      filename: 'node-v20.20.2-headers.tar.gz',
+      sha256: '6de0e836efa9f32512e61db3dfd08b3d97a015b7e828d1a5efdf281a56a692d9',
+    })
+  })
+
+  it('rejects missing, linked, and traversing Node headers entries', () => {
+    const work = root()
+    const required = 'node-v20.20.2/include/node/node.h'
+    const common = 'node-v20.20.2/include/node/common.gypi'
+    const config = 'node-v20.20.2/include/node/config.gypi'
+    const missing = join(work, 'missing.tar')
+    writeFileSync(missing, Buffer.concat([tarRegular(required, Buffer.from('node')), tarRegular(common, Buffer.from('common'))]))
+    expect(() => preflightNodeHeadersArchive(missing)).toThrow(/config\.gypi/i)
+    const linked = join(work, 'linked.tar')
+    writeFileSync(linked, Buffer.concat([tarRegular(required, Buffer.from('node')), tarRegular(common, Buffer.from('common')), tarLink('2', config, '../config')]))
+    expect(() => preflightNodeHeadersArchive(linked)).toThrow(/link|special/i)
+    const traversal = join(work, 'traversal.tar')
+    writeFileSync(traversal, tarRegular('../node-v20.20.2/include/node/node.h', Buffer.from('node')))
+    expect(() => preflightNodeHeadersArchive(traversal)).toThrow(/unsafe/i)
+  })
+
+  it('rejects forged Node headers even when their forged checksum file agrees', () => {
+    const work = root()
+    const archive = join(work, 'node-v20.20.2-headers.tar.gz')
+    const checksums = join(work, 'SHASUMS256.txt')
+    const forged = Buffer.from('forged headers')
+    writeFileSync(archive, forged)
+    writeFileSync(checksums, `${createHash('sha256').update(forged).digest('hex')}  node-v20.20.2-headers.tar.gz\n`)
+    expect(() => verifyChecksum(archive, checksums, 'node-v20.20.2-headers.tar.gz', '6de0e836efa9f32512e61db3dfd08b3d97a015b7e828d1a5efdf281a56a692d9')).toThrow(/pinned checksum mismatch/i)
+  })
+
+  it('runs native rebuild under the probed sandbox with verified source headers', () => {
+    const work = root()
+    const nodeRoot = join(work, 'node')
+    const seed = join(work, 'seed')
+    for (const path of ['include/node/node.h', 'include/node/common.gypi', 'include/node/config.gypi', 'bin/node', 'lib/node_modules/npm/bin/npm-cli.js']) {
+      mkdirSync(join(nodeRoot, path, '..'), { recursive: true })
+      writeFileSync(join(nodeRoot, path), path)
+    }
+    mkdirSync(join(seed, 'node_modules/better-sqlite3'), { recursive: true })
+    writeFileSync(join(seed, 'node_modules/better-sqlite3/package.json'), JSON.stringify({ scripts: { install: 'prebuild-install || node-gyp rebuild --release' } }))
+    const buildTools = join(work, 'build-tools')
+    mkdirSync(join(buildTools, 'node_modules/node-gyp/bin'), { recursive: true })
+    writeFileSync(join(buildTools, 'node_modules/node-gyp/bin/node-gyp.js'), 'node-gyp')
+    const calls: Array<{ command: string; args: string[]; env: Record<string, string> }> = []
+    buildNativeSeed(nodeRoot, nodeRoot, buildTools, targetSpec('x86_64-unknown-linux-gnu'), seed, work, ['/usr/bin/unshare', '--net', '--'], (command, args, _cwd, _dataDir, path, env) => {
+      expect(path).toBe('')
+      calls.push({ command, args, env }); return 'gyp info ok\n'
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.command).toBe('/usr/bin/unshare')
+    expect(calls[0]?.args.slice(0, 3)).toEqual(['--net', '--', join(nodeRoot, 'bin/node')])
+    expect(calls[0]?.args).toContain(join(buildTools, 'node_modules/node-gyp/bin/node-gyp.js'))
+    expect(calls[0]?.args).toContain(`--nodedir=${nodeRoot}`)
+    expect(calls[0]?.env.npm_config_build_from_source).toBe('true')
+    expect(calls[0]?.env.npm_config_nodedir).toBe(nodeRoot)
+    expect(() => buildNativeSeed(nodeRoot, nodeRoot, buildTools, targetSpec('x86_64-unknown-linux-gnu'), seed, work, [], () => '')).toThrow(/sandbox/i)
+  })
+
+  it('rejects missing verified headers and prebuilt/download build logs', () => {
+    const work = root()
+    expect(() => buildNativeSeed(work, work, work, targetSpec('x86_64-unknown-linux-gnu'), work, work, ['/usr/bin/unshare', '--net', '--'], () => '')).toThrow(/headers/i)
+    for (const log of ['prebuild-install info begin', 'download https://github.com/example/prebuilt.tar.gz', 'using prebuilt binary']) {
+      expect(() => validateNativeBuildLog(log)).toThrow(/locked source/i)
+    }
+  })
+
+  it('requires the Rust gate before publication and leaves no final or gate cache on failure', () => {
+    const work = root()
+    const output = join(work, 'out', 'payload.zip')
+    const bytes = canonicalZip(fixture())
+    expect(() => publishValidatedPayload(bytes, 'x86_64-unknown-linux-gnu', work, output, () => { throw new Error('Rust rejected payload') })).toThrow(/Rust rejected payload/)
+    expect(existsSync(output)).toBe(false)
+    expect(existsSync(join(work, 'rust-gate'))).toBe(false)
+  })
+
+  it('rejects a vacuous Rust test filter success', () => {
+    expect(() => validateRustGateOutput('test result: ok. 0 passed; 0 failed; 1 filtered out')).toThrow(/did not execute/i)
+    expect(() => validateRustGateOutput('test runtime::tests::builder_payload_fixture_is_accepted ... ok')).not.toThrow()
+  })
+
 
   it.each([
     ['Node license', (entries: PayloadEntry[]) => entries.filter(entry => entry.path !== 'licenses/node-LICENSE')],
@@ -245,6 +334,16 @@ describe('canonical DurinDoor payload', () => {
     expect(() => validateLockedManifests(join(process.cwd(), 'apps/melon-desktop/runtime/durindoor'))).not.toThrow()
   })
 
+  it('rejects a CLI lock whose DurinDoor integrity differs from runtime pins', () => {
+    const work = root()
+    cpSync(join(process.cwd(), 'apps/melon-desktop/runtime/durindoor'), work, { recursive: true })
+    const lockPath = join(work, 'package-lock.json')
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8')) as { packages: Record<string, { integrity?: string }> }
+    lock.packages['node_modules/durindoor']!.integrity = 'sha512-forged'
+    writeFileSync(lockPath, JSON.stringify(lock))
+    expect(() => validateLockedManifests(work)).toThrow(/integrity/i)
+  })
+
   it('marks payload as unusable for managed launch until Rust installs the runtime seed', () => {
     const descriptor = JSON.parse(Buffer.from(fixture().find(entry => entry.path === 'payload.json')!.data).toString()) as Record<string, unknown>
     expect(descriptor.managedLaunchReady).not.toBe(true)
@@ -252,24 +351,18 @@ describe('canonical DurinDoor payload', () => {
     expect(controller).not.toContain('runtimeSeedPath')
   })
 
-  it('passes emitted fixture through Rust activation and preserves executable modes', { timeout: 20_000 }, () => {
-    if (process.platform === 'win32') return
-    const work = root()
-    const cache = join(work, 'cache')
-    const final = join(work, 'final', 'x86_64-unknown-linux-gnu')
-    mkdirSync(join(work, 'final'), { recursive: true, mode: 0o700 })
-    mkdirSync(cache, { recursive: true, mode: 0o700 })
-    const archive = join(cache, 'fixture.zip')
-    const bytes = canonicalZip(fixture())
-    writeFileSync(archive, bytes)
-    const sha256 = createHash('sha256').update(bytes).digest('hex')
-    const descriptor = join(work, 'fixture.json')
-    writeFileSync(descriptor, JSON.stringify({ root: work, cache, archive: 'fixture.zip', targetId: 'x86_64-unknown-linux-gnu', sha256, finalDir: final }))
-    const result = spawnSync('cargo', ['test', '--manifest-path', 'apps/melon-desktop/src-tauri/Cargo.toml', 'builder_payload_fixture_is_accepted', '--', '--ignored', '--nocapture'], {
-      cwd: process.cwd(), env: { ...process.env, MELON_PAYLOAD_FIXTURE: descriptor }, encoding: 'utf8',
-    })
-    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0)
-    expect(result.stdout + result.stderr).toContain('builder_payload_fixture_is_accepted')
-    expect(readFileSync(join(final, 'bin/node')).subarray(0, 4)).toEqual(Buffer.from(elf.subarray(0, 4)))
+  it('runs actual build output through the real Rust gate before publication on a native runner', { timeout: 600_000 }, ({ skip }) => {
+    const nodeArchive = process.env.MELON_NODE_ARCHIVE
+    const headersArchive = process.env.MELON_NODE_HEADERS_ARCHIVE
+    const checksums = process.env.MELON_NODE_CHECKSUMS
+    const sandboxRunner = process.env.MELON_SANDBOX_RUNNER
+    if (nodeArchive === undefined || headersArchive === undefined || checksums === undefined || sandboxRunner === undefined) {
+      skip('requires authenticated Node runtime/headers archives, checksums, and working native sandbox')
+      return
+    }
+    const output = join(root(), 'actual-payload.zip')
+    const result = buildPayload({ target: 'x86_64-unknown-linux-gnu', nodeArchive, headersArchive, checksums, sandboxRunner, output })
+    expect(result.archive).toBe(output)
+    expect(existsSync(output)).toBe(true)
   })
 })

@@ -1807,10 +1807,14 @@ mod tests {
     #[test]
     #[ignore = "requires MELON_PAYLOAD_FIXTURE"]
     fn builder_payload_fixture_is_accepted() {
-        let descriptor = PathBuf::from(std::env::var_os("MELON_PAYLOAD_FIXTURE").expect("fixture descriptor"));
+        let descriptor = fs::canonicalize(PathBuf::from(
+            std::env::var_os("MELON_PAYLOAD_FIXTURE").expect("fixture descriptor"),
+        ))
+        .expect("canonical fixture descriptor");
         let fixture: BuilderFixture = serde_json::from_slice(&fs::read(&descriptor).expect("read fixture descriptor"))
             .expect("parse fixture descriptor");
         let root = fs::canonicalize(&fixture.root).expect("canonical fixture root");
+        assert!(descriptor.starts_with(&root), "fixture descriptor stays under builder-owned root");
         let cache = fs::canonicalize(&fixture.cache).expect("canonical fixture cache");
         let final_parent = fs::canonicalize(fixture.final_dir.parent().expect("fixture final parent"))
             .expect("canonical fixture final parent");
@@ -1822,29 +1826,42 @@ mod tests {
         let total_size: u64 = (0..archive.len()).map(|index| archive.by_index(index).expect("archive entry").size()).sum();
         assert!(total_size <= DEFAULT_EXTRACTION_LIMITS.max_uncompressed_bytes);
         assert!(Path::new(&fixture.archive).components().count() == 1, "archive is one cache component");
+        let (node, tray) = match fixture.target_id.as_str() {
+            "x86_64-unknown-linux-gnu" => ("bin/node", Some("runtime-seed/node_modules/systray2/traybin/tray_linux_release")),
+            "x86_64-apple-darwin" | "aarch64-apple-darwin" => {
+                ("bin/node", Some("runtime-seed/node_modules/systray2/traybin/tray_darwin_release"))
+            }
+            "x86_64-pc-windows-msvc" => ("bin/node.exe", None),
+            target => panic!("unsupported builder fixture target {target}"),
+        };
+        let mut required = vec![
+            node,
+            "app/node_modules/durindoor/cli.js",
+            "runtime-seed/node_modules/sql.js/dist/sql-wasm.wasm",
+            "runtime-seed/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+            "licenses/durindoor-LICENSE",
+            "payload.json",
+        ];
+        if let Some(tray) = tray {
+            required.push(tray);
+        }
         let outcome = activate_runtime(
             &cache,
             &fixture.archive,
             &fixture.target_id,
             &fixture.sha256,
             &fixture.final_dir,
-            &[
-                "bin/node",
-                "app/node_modules/durindoor/cli.js",
-                "runtime-seed/node_modules/sql.js/dist/sql-wasm.wasm",
-                "runtime-seed/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
-                "licenses/durindoor-LICENSE",
-                "payload.json",
-            ],
+            &required,
         )
         .expect("builder payload activates");
         assert_eq!(outcome, ActivationOutcome::Published);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(fs::metadata(fixture.final_dir.join("bin/node")).expect("node metadata").permissions().mode() & 0o777, 0o755);
-            let tray = fixture.final_dir.join("runtime-seed/node_modules/systray2/traybin/tray_linux_release");
-            assert_eq!(fs::metadata(tray).expect("tray metadata").permissions().mode() & 0o777, 0o755);
+            assert_eq!(fs::metadata(fixture.final_dir.join(node)).expect("node metadata").permissions().mode() & 0o777, 0o755);
+            if let Some(tray) = tray {
+                assert_eq!(fs::metadata(fixture.final_dir.join(tray)).expect("tray metadata").permissions().mode() & 0o777, 0o755);
+            }
         }
     }
 

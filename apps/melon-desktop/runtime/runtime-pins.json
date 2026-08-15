@@ -17,6 +17,10 @@
     "nodeVersion": "20.20.2",
     "nodeDownloads": "https://nodejs.org/download/release/v20.20.2/",
     "nodeChecksums": "https://nodejs.org/download/release/v20.20.2/SHASUMS256.txt",
+    "nodeHeaders": {
+      "filename": "node-v20.20.2-headers.tar.gz",
+      "sha256": "6de0e836efa9f32512e61db3dfd08b3d97a015b7e828d1a5efdf281a56a692d9"
+    },
     "nodeArchives": {
       "x86_64-unknown-linux-gnu": {
         "filename": "node-v20.20.2-linux-x64.tar.gz",
