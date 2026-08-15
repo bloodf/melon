@@ -144,7 +144,7 @@ pub(crate) fn activate_runtime(
     let parent = open_private_directory(parent_path)?;
     let existing_final = open_optional_private_child(parent_path, &parent, final_name)?;
     let cache = open_private_directory(cache_dir)?;
-    validate_cache_disjointness(cache_dir, &cache, &parent, existing_final.as_ref())?;
+    validate_cache_disjointness(cache_dir, &cache, parent_path, &parent, existing_final.as_ref())?;
     validate_archive_control_name(archive_name, final_name, &target_key)?;
     let _target_lock = TargetLock::acquire(&parent, &target_key)?;
     let mut archive = OwnedCacheArtifact::claim(cache, archive_name)?;
@@ -460,29 +460,38 @@ fn directory_identity(dir: &Dir) -> Result<(u64, u64), RuntimeError> {
 fn validate_cache_disjointness(
     cache_path: &Path,
     cache: &Dir,
+    final_parent_path: &Path,
     final_parent: &Dir,
     final_dir: Option<&Dir>,
 ) -> Result<(), RuntimeError> {
     let cache_identity = directory_identity(cache)?;
-    if cache_identity == directory_identity(final_parent)?
+    let parent_identity = directory_identity(final_parent)?;
+    if cache_identity == parent_identity
         || final_dir.is_some_and(|final_dir| directory_identity(final_dir).ok() == Some(cache_identity))
+        || ancestor_has_identity(final_parent_path, cache_identity)?
     {
         return Err(RuntimeError::Activation("cache directory overlaps runtime namespace".into()));
     }
-    if let Some(final_dir) = final_dir {
-        let final_identity = directory_identity(final_dir)?;
-        let mut ancestor = Some(cache_path);
-        while let Some(path) = ancestor {
-            if open_runtime_directory(path)
-                .and_then(|dir| directory_identity(&dir))
-                .is_ok_and(|identity| identity == final_identity)
-            {
-                return Err(RuntimeError::Activation("cache directory is nested inside final runtime".into()));
-            }
-            ancestor = path.parent();
-        }
+    if let Some(final_dir) = final_dir
+        && ancestor_has_identity(cache_path, directory_identity(final_dir)?)?
+    {
+        return Err(RuntimeError::Activation("cache directory is nested inside final runtime".into()));
     }
     Ok(())
+}
+
+fn ancestor_has_identity(start: &Path, wanted: (u64, u64)) -> Result<bool, RuntimeError> {
+    for ancestor in start.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if metadata.file_type().is_symlink() {
+            return Err(RuntimeError::StagingNotEmpty);
+        }
+        let dir = open_runtime_directory(ancestor)?;
+        if directory_identity(&dir)? == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 
@@ -2533,6 +2542,41 @@ mod tests {
                 .expect_err("control namespace must reject");
             assert_eq!(fs::read(path).expect("control sentinel remains"), b"sentinel");
         }
+    }
+
+    #[test]
+    fn activation_rejects_final_namespace_nested_inside_cache() {
+        let temp = TempDir::new();
+        let cache = temp.0.join("cache");
+        let runtimes = cache.join("runtimes");
+        let final_dir = runtimes.join("runtime");
+        fs::create_dir_all(&final_dir).expect("nested final");
+        #[cfg(unix)]
+        for path in [&cache, &runtimes, &final_dir] {
+            fs::set_permissions(
+                path,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .expect("private nested path");
+        }
+        fs::write(final_dir.join("sentinel"), b"keep").expect("final sentinel");
+
+        activate_runtime(
+            &cache,
+            "runtimes",
+            "runtime",
+            "00",
+            &final_dir,
+            REQUIRED_RUNTIME_ENTRIES,
+        )
+        .expect_err("cache ancestor of final namespace must reject");
+
+        assert_eq!(fs::read(final_dir.join("sentinel")).expect("sentinel remains"), b"keep");
+        assert!(runtimes.exists(), "final parent remains unmoved");
+        assert!(!fs::read_dir(&cache)
+            .expect("cache entries")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".melon-activate-archive")));
     }
 
     #[test]
