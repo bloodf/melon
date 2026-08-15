@@ -219,8 +219,9 @@ interface RuntimeSeedFile {
 function seedPathKey(path: string): string {
   if (path.length === 0 || path.startsWith('/') || path.includes('\\') || path.includes(':') || /^[A-Za-z]:/.test(path) || /[\0-\x1f\x7f]/.test(path)) throw new Error(`unsafe runtime seed path: ${path}`)
   const keys = path.split('/').map(component => {
-    if (component.length === 0 || component === '.' || component === '..' || Buffer.byteLength(component) > MAX_PORTABLE_COMPONENT_BYTES || component !== component.trimEnd() || component.endsWith('.')) throw new Error(`unsafe runtime seed path: ${path}`)
-    const key = component.normalize('NFC').toLowerCase()
+    const normalized = component.normalize('NFC')
+    if (component.length === 0 || component === '.' || component === '..' || Buffer.byteLength(component) > MAX_PORTABLE_COMPONENT_BYTES || component !== component.trimEnd() || component.endsWith('.') || normalized !== component) throw new Error(`unsafe runtime seed path: ${path}`)
+    const key = normalized.toLowerCase()
     const stem = key.split('.')[0]!
     if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])$/.test(stem)) throw new Error(`reserved runtime seed path: ${path}`)
     return key

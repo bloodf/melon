@@ -130,15 +130,33 @@ describe('canonical DurinDoor payload', () => {
     expect(runtimeSeedManifest(changedMode, { betterSqlite3: '12.6.2', sqlJs: '1.14.1' }).descriptor.sha256).not.toBe(original.descriptor.sha256)
   })
 
-  it.each(['../escape', '/absolute', 'node_modules\\alias', 'node_modules/sql.js:ads', 'node_modules/CON/file', 'node_modules/bad\nname', 'node_modules/café', 'node_modules/SQL.JS/package.json'])('rejects unsafe or colliding runtime-seed path %s', (path) => {
+  it.each([
+    ['traversal', '../escape', false],
+    ['absolute', '/absolute', false],
+    ['backslash alias', 'node_modules\\alias', false],
+    ['ADS alias', 'node_modules/sql.js:ads', false],
+    ['NFD equivalent', 'node_modules/café', false],
+    ['reserved device', 'node_modules/CON/file', false],
+    ['control character', 'node_modules/bad\nname', false],
+    ['128-byte NFC component', `node_modules/${'é'.repeat(64)}`, true],
+    ['129-byte NFC component', `node_modules/${'é'.repeat(64)}a`, false],
+  ] as const)('%s follows portable runtime-seed path policy', (_name, path, accepted) => {
     const entries = fixture().filter(entry => !['payload.json', 'metadata/runtime-seed-manifest.json'].includes(entry.path))
-    const candidate = path === 'node_modules/SQL.JS/package.json'
-      ? { path: `runtime-seed/${path}`, data: text('{}'), mode: 0o644 }
-      : path === 'node_modules/café'
-        ? { path: 'runtime-seed/node_modules/café', data: text('x'), mode: 0o644 }
-        : { ...entries.find(entry => entry.path.endsWith('sql-wasm.wasm'))!, path: `runtime-seed/${path}` }
-    const source = path === 'node_modules/café' ? [...entries, { path: 'runtime-seed/node_modules/café', data: text('y'), mode: 0o644 }] : entries
-    expect(() => runtimeSeedManifest([...source, candidate], { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })).toThrow(/path|collision|unsafe|reserved/i)
+    const candidate = { path: `runtime-seed/${path}`, data: text('x'), mode: 0o644 }
+    const build = () => runtimeSeedManifest([...entries, candidate], { betterSqlite3: '12.6.2', sqlJs: '1.14.1' })
+    if (accepted) expect(build).not.toThrow()
+    else expect(build).toThrow(/path|unsafe|reserved/i)
+  })
+
+  it('uses NFC lowercase keys for collisions and deterministic ordering without full case folding', () => {
+    const entries = fixture().filter(entry => !['payload.json', 'metadata/runtime-seed-manifest.json'].includes(entry.path))
+    const add = (path: string) => ({ path: `runtime-seed/${path}`, data: text(path), mode: 0o644 })
+    expect(() => runtimeSeedManifest([...entries, add('Case'), add('case')])).toThrow(/collision/i)
+    const result = runtimeSeedManifest([...entries, add('SS'), add('ß'), add('café')])
+    const decoded: unknown = JSON.parse(result.bytes.toString())
+    if (decoded === null || typeof decoded !== 'object' || !('files' in decoded) || !Array.isArray(decoded.files)) throw new Error('manifest files missing')
+    const files = decoded.files.flatMap(file => file !== null && typeof file === 'object' && 'path' in file && typeof file.path === 'string' ? [file.path] : [])
+    expect(files.filter(path => ['SS', 'ß', 'café'].includes(path))).toEqual(['café', 'SS', 'ß'])
   })
   it('rejects links, special files, ambiguous modes, and wrong locked versions', () => {
     const entries = fixture().filter(entry => !['payload.json', 'metadata/runtime-seed-manifest.json'].includes(entry.path))
