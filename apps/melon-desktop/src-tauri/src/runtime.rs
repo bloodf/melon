@@ -1,7 +1,11 @@
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,18 +144,18 @@ fn extract_zip_with_limits(
     staging: &Path,
     limits: ExtractionLimits,
 ) -> Result<(), RuntimeError> {
-    let declared_entries = declared_entry_count(reader)?;
+    let declared_entries = preflight_archive(reader)?;
     if declared_entries > limits.max_entries {
         return Err(RuntimeError::TooManyEntries);
     }
-    require_empty_staging(staging)?;
+    let staging_dir = open_empty_staging(staging)?;
     let mut archive = ZipArchive::new(reader)?;
     if declared_entries != archive.len() {
         return Err(RuntimeError::PathCollision("duplicate central-directory name".into()));
     }
     let plans = validate_entries(&mut archive, limits)?;
-    let mut candidate = CandidateDir::create(staging)?;
-    let extraction = extract_entries(&mut archive, &plans, candidate.path(), limits);
+    let mut candidate = CandidateDir::create(staging, &staging_dir)?;
+    let extraction = extract_entries(&mut archive, &plans, candidate.dir(), limits);
     if let Err(error) = extraction {
         candidate.cleanup()?;
         return Err(error);
@@ -159,33 +163,108 @@ fn extract_zip_with_limits(
     candidate.publish(staging)?;
     Ok(())
 }
-
-fn require_empty_staging(staging: &Path) -> Result<(), RuntimeError> {
-    let metadata = fs::symlink_metadata(staging).map_err(RuntimeError::Io)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || fs::read_dir(staging)?.next().is_some() {
-        return Err(RuntimeError::StagingNotEmpty);
+#[cfg(test)]
+fn extract_zip_with_hook(
+    reader: &mut (impl Read + Seek),
+    staging: &Path,
+    limits: ExtractionLimits,
+    hook: impl FnOnce(&Path),
+) -> Result<(), RuntimeError> {
+    let declared_entries = preflight_archive(reader)?;
+    let staging_dir = open_empty_staging(staging)?;
+    let mut archive = ZipArchive::new(reader)?;
+    if declared_entries != archive.len() {
+        return Err(RuntimeError::PathCollision("duplicate central-directory name".into()));
     }
-    Ok(())
+    let plans = validate_entries(&mut archive, limits)?;
+    let mut candidate = CandidateDir::create(staging, &staging_dir)?;
+    hook(candidate.path());
+    extract_entries(&mut archive, &plans, candidate.dir(), limits)?;
+    candidate.publish(staging)
 }
 
-fn declared_entry_count(reader: &mut (impl Read + Seek)) -> Result<usize, RuntimeError> {
-    const EOCD_BYTES: u64 = 22;
-    const MAX_COMMENT_BYTES: u64 = u16::MAX as u64;
+
+fn open_empty_staging(staging: &Path) -> Result<Dir, RuntimeError> {
+    let parent = staging
+        .parent()
+        .ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
+    let name = staging
+        .file_name()
+        .ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
+    let parent = Dir::open_ambient_dir(parent, ambient_authority())?;
+    let staging = parent
+        .open_dir_nofollow(name)
+        .map_err(|_| RuntimeError::StagingNotEmpty)?;
+    if staging.entries()?.next().is_some() {
+        return Err(RuntimeError::StagingNotEmpty);
+    }
+    Ok(staging)
+}
+
+fn preflight_archive(reader: &mut (impl Read + Seek)) -> Result<usize, RuntimeError> {
+    let footer = find_eocd(reader)?;
+    if footer.total_entries == u16::MAX {
+        return Err(RuntimeError::InvalidArchive("ZIP64 entry tables are unsupported"));
+    }
+    reader.seek(io::SeekFrom::Start(footer.central_offset.into()))?;
+    let mut local_headers = Vec::with_capacity(footer.total_entries as usize);
+    for _ in 0..footer.total_entries {
+        let fixed = read_exact_array::<46>(reader)?;
+        if &fixed[..4] != b"PK\x01\x02" {
+            return Err(RuntimeError::InvalidArchive("invalid central-directory entry"));
+        }
+        let name_length = u16::from_le_bytes([fixed[28], fixed[29]]) as usize;
+        let extra_length = u16::from_le_bytes([fixed[30], fixed[31]]) as usize;
+        let comment_length = u16::from_le_bytes([fixed[32], fixed[33]]) as usize;
+        let local_offset = u32::from_le_bytes(fixed[42..46].try_into().expect("fixed field"));
+        reader.seek(io::SeekFrom::Current(name_length as i64))?;
+        let mut extra = vec![0; extra_length];
+        reader.read_exact(&mut extra)?;
+        reject_link_extra(&extra)?;
+        reader.seek(io::SeekFrom::Current(comment_length as i64))?;
+        local_headers.push(local_offset);
+    }
+    for local_offset in local_headers {
+        reader.seek(io::SeekFrom::Start(local_offset.into()))?;
+        let fixed = read_exact_array::<30>(reader)?;
+        if &fixed[..4] != b"PK\x03\x04" {
+            return Err(RuntimeError::InvalidArchive("invalid local file header"));
+        }
+        let name_length = u16::from_le_bytes([fixed[26], fixed[27]]) as i64;
+        let extra_length = u16::from_le_bytes([fixed[28], fixed[29]]) as usize;
+        reader.seek(io::SeekFrom::Current(name_length))?;
+        let mut extra = vec![0; extra_length];
+        reader.read_exact(&mut extra)?;
+        reject_link_extra(&extra)?;
+    }
+    Ok(footer.total_entries as usize)
+}
+
+struct Eocd {
+    total_entries: u16,
+    central_offset: u32,
+}
+
+fn find_eocd(reader: &mut (impl Read + Seek)) -> Result<Eocd, RuntimeError> {
+    const EOCD_BYTES: usize = 22;
+    const MAX_COMMENT_BYTES: usize = u16::MAX as usize;
     let length = reader.seek(io::SeekFrom::End(0))?;
-    if length < EOCD_BYTES {
+    if length < EOCD_BYTES as u64 {
         return Err(RuntimeError::InvalidArchive("missing end-of-central-directory record"));
     }
-    let tail_length = length.min(EOCD_BYTES + MAX_COMMENT_BYTES) as usize;
+    let tail_length = usize::try_from(length.min((EOCD_BYTES + MAX_COMMENT_BYTES) as u64))
+        .map_err(|_| RuntimeError::InvalidArchive("oversized ZIP footer"))?;
     reader.seek(io::SeekFrom::End(-(tail_length as i64)))?;
     let mut tail = vec![0; tail_length];
     reader.read_exact(&mut tail)?;
     let offset = tail
         .windows(4)
-        .rposition(|window| window == b"PK\x05\x06")
+        .enumerate()
+        .rev()
+        .find_map(|(offset, window)| {
+            (window == b"PK\x05\x06" && valid_eocd_candidate(&tail, offset)).then_some(offset)
+        })
         .ok_or(RuntimeError::InvalidArchive("missing end-of-central-directory record"))?;
-    if tail.len() - offset < EOCD_BYTES as usize {
-        return Err(RuntimeError::InvalidArchive("truncated end-of-central-directory record"));
-    }
     let disk = u16::from_le_bytes([tail[offset + 4], tail[offset + 5]]);
     let directory_disk = u16::from_le_bytes([tail[offset + 6], tail[offset + 7]]);
     let disk_entries = u16::from_le_bytes([tail[offset + 8], tail[offset + 9]]);
@@ -193,10 +272,42 @@ fn declared_entry_count(reader: &mut (impl Read + Seek)) -> Result<usize, Runtim
     if disk != 0 || directory_disk != 0 || disk_entries != total_entries {
         return Err(RuntimeError::InvalidArchive("multi-disk ZIPs are unsupported"));
     }
-    if total_entries == u16::MAX {
-        return Err(RuntimeError::InvalidArchive("ZIP64 entry tables are unsupported"));
+    Ok(Eocd {
+        total_entries,
+        central_offset: u32::from_le_bytes(tail[offset + 16..offset + 20].try_into().expect("fixed field")),
+    })
+}
+
+fn read_exact_array<const N: usize>(reader: &mut impl Read) -> Result<[u8; N], RuntimeError> {
+    let mut bytes = [0; N];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn reject_link_extra(mut extra: &[u8]) -> Result<(), RuntimeError> {
+    while !extra.is_empty() {
+        if extra.len() < 4 {
+            return Err(RuntimeError::InvalidArchive("malformed ZIP extra field"));
+        }
+        let id = u16::from_le_bytes([extra[0], extra[1]]);
+        let length = u16::from_le_bytes([extra[2], extra[3]]) as usize;
+        if extra.len() < 4 + length {
+            return Err(RuntimeError::InvalidArchive("malformed ZIP extra field"));
+        }
+        if matches!(id, 0x000d | 0x756e) {
+            return Err(RuntimeError::UnsupportedEntry("UNIX link metadata".into()));
+        }
+        extra = &extra[4 + length..];
     }
-    Ok(total_entries as usize)
+    Ok(())
+}
+
+fn valid_eocd_candidate(tail: &[u8], offset: usize) -> bool {
+    if tail.len().saturating_sub(offset) < 22 {
+        return false;
+    }
+    let comment_length = u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize;
+    offset + 22 + comment_length == tail.len()
 }
 
 fn validate_entries<R: Read + Seek>(
@@ -243,12 +354,29 @@ fn validate_path(name: &str) -> Result<(PathBuf, Vec<String>), RuntimeError> {
             return Err(RuntimeError::UnsafePath(name.into()));
         }
         path.push(component);
-        keys.push(component.to_ascii_lowercase());
+        keys.push(windows_component_key(component)?);
     }
     if path.components().any(|component| !matches!(component, Component::Normal(_))) {
         return Err(RuntimeError::UnsafePath(name.into()));
     }
     Ok((path, keys))
+}
+fn windows_component_key(component: &str) -> Result<String, RuntimeError> {
+    let normalized = component.trim_end_matches([' ', '.']);
+    if normalized.len() != component.len() || normalized.is_empty() {
+        return Err(RuntimeError::UnsafePath(component.into()));
+    }
+    let key = normalized.to_ascii_lowercase();
+    let stem = key.split('.').next().unwrap_or_default();
+    let reserved = matches!(stem, "con" | "prn" | "aux" | "nul")
+        || stem
+            .strip_prefix("com")
+            .or_else(|| stem.strip_prefix("lpt"))
+            .is_some_and(|number| matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"));
+    if reserved {
+        return Err(RuntimeError::UnsafePath(component.into()));
+    }
+    Ok(key)
 }
 
 fn validate_kind<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Result<EntryKind, RuntimeError> {
@@ -264,26 +392,8 @@ fn validate_kind<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Result<EntryKind
     {
         return Err(RuntimeError::UnsupportedEntry(entry.name().into()));
     }
-    if contains_hard_link_metadata(entry.extra_data().unwrap_or_default()) {
-        return Err(RuntimeError::UnsupportedEntry(entry.name().into()));
-    }
     Ok(kind)
 }
-fn contains_hard_link_metadata(mut extra: &[u8]) -> bool {
-    while extra.len() >= 4 {
-        let id = u16::from_le_bytes([extra[0], extra[1]]);
-        let length = u16::from_le_bytes([extra[2], extra[3]]) as usize;
-        if extra.len() < 4 + length {
-            return true;
-        }
-        if id == 0x756e && length > 14 {
-            return true;
-        }
-        extra = &extra[4 + length..];
-    }
-    !extra.is_empty()
-}
-
 
 fn register_path(
     paths: &mut HashMap<String, EntryKind>,
@@ -311,71 +421,88 @@ fn register_path(
     }
     Ok(())
 }
-
 fn extract_entries<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     plans: &[EntryPlan],
-    candidate: &Path,
+    candidate: &Dir,
     limits: ExtractionLimits,
 ) -> Result<(), RuntimeError> {
     let mut extracted_bytes = 0_u64;
     let mut buffer = [0; COPY_BUFFER_BYTES];
     for (index, plan) in plans.iter().enumerate() {
-        let output = candidate.join(&plan.path);
-        if plan.kind == EntryKind::Directory {
-            create_directory_chain(candidate, &plan.path)?;
-            continue;
-        }
-        if let Some(parent) = plan.path.parent() {
-            create_directory_chain(candidate, parent)?;
-        }
-        let mut entry = archive.by_index(index)?;
-        let mut output = OpenOptions::new().write(true).create_new(true).open(output)?;
-        loop {
-            let read = entry.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let components = plan.path.components().map(|component| match component {
+            Component::Normal(component) => Ok(component),
+            _ => Err(RuntimeError::UnsafePath(plan.path.display().to_string())),
+        });
+        let mut directory = candidate.try_clone()?;
+        let mut components = components.peekable();
+        while let Some(component) = components.next() {
+            let component = component?;
+            let last = components.peek().is_none();
+            if last && plan.kind == EntryKind::File {
+                let mut options = OpenOptions::new();
+                options
+                    .write(true)
+                    .create_new(true)
+                    .follow(FollowSymlinks::No);
+                let mut output = directory.open_with(component, &options)?;
+                let mut entry = archive.by_index(index)?;
+                loop {
+                    let read = entry.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    extracted_bytes = extracted_bytes
+                        .checked_add(read as u64)
+                        .ok_or(RuntimeError::TooManyBytes)?;
+                    if extracted_bytes > limits.max_uncompressed_bytes {
+                        return Err(RuntimeError::TooManyBytes);
+                    }
+                    output.write_all(&buffer[..read])?;
+                }
+                output.sync_all()?;
+            } else {
+                directory = open_or_create_directory(&directory, component)?;
             }
-            extracted_bytes = extracted_bytes.checked_add(read as u64).ok_or(RuntimeError::TooManyBytes)?;
-            if extracted_bytes > limits.max_uncompressed_bytes {
-                return Err(RuntimeError::TooManyBytes);
-            }
-            output.write_all(&buffer[..read])?;
         }
-        output.sync_all()?;
     }
     Ok(())
 }
 
-fn create_directory_chain(root: &Path, relative: &Path) -> Result<(), RuntimeError> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(component) = component else {
-            return Err(RuntimeError::UnsafePath(relative.display().to_string()));
-        };
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => return Err(RuntimeError::PathCollision(relative.display().to_string())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
-            Err(error) => return Err(error.into()),
-        }
+fn open_or_create_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeError> {
+    match parent.create_dir(component) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
     }
-    Ok(())
+    parent
+        .open_dir_nofollow(component)
+        .map_err(|_| RuntimeError::PathCollision(component.to_string_lossy().into_owned()))
 }
 
 struct CandidateDir {
     path: PathBuf,
+    dir: Option<Dir>,
+    identity: (u64, u64),
     armed: bool,
 }
 
 impl CandidateDir {
-    fn create(staging: &Path) -> Result<Self, RuntimeError> {
+    fn create(staging: &Path, staging_dir: &Dir) -> Result<Self, RuntimeError> {
         loop {
             let id = NEXT_CANDIDATE.fetch_add(1, Ordering::Relaxed);
-            let path = staging.join(format!(".melon-candidate-{}-{id}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path, armed: true }),
+            let name = OsString::from(format!(".melon-candidate-{}-{id}", std::process::id()));
+            match staging_dir.create_dir(&name) {
+                Ok(()) => {
+                    let dir = staging_dir.open_dir_nofollow(&name)?;
+                    let metadata = dir.dir_metadata()?;
+                    return Ok(Self {
+                        path: staging.join(&name),
+                        dir: Some(dir),
+                        identity: (metadata.dev(), metadata.ino()),
+                        armed: true,
+                    });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             }
@@ -386,14 +513,18 @@ impl CandidateDir {
         &self.path
     }
 
+    fn dir(&self) -> &Dir {
+        self.dir.as_ref().expect("candidate handle remains live")
+    }
+
     fn publish(&mut self, staging: &Path) -> Result<(), RuntimeError> {
-        require_owned_candidate(staging, &self.path)?;
+        require_owned_candidate(staging, &self.path, self.identity)?;
         let parent = staging.parent().ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
         let name = self.path.file_name().ok_or_else(|| RuntimeError::UnsafePath(self.path.display().to_string()))?;
         let lifted = parent.join(name);
         fs::rename(&self.path, &lifted)?;
         self.path = lifted;
-        require_empty_staging(staging)?;
+        drop(open_empty_staging(staging)?);
         fs::remove_dir(staging)?;
         if let Err(error) = fs::rename(&self.path, staging) {
             fs::create_dir(staging)?;
@@ -406,7 +537,9 @@ impl CandidateDir {
 
     fn cleanup(&mut self) -> Result<(), RuntimeError> {
         if self.armed {
-            fs::remove_dir_all(&self.path)?;
+            if let Some(dir) = self.dir.take() {
+                dir.remove_open_dir_all()?;
+            }
             self.armed = false;
         }
         Ok(())
@@ -414,14 +547,19 @@ impl CandidateDir {
 }
 
 
-fn require_owned_candidate(staging: &Path, candidate: &Path) -> Result<(), RuntimeError> {
+fn require_owned_candidate(
+    staging: &Path,
+    candidate: &Path,
+    identity: (u64, u64),
+) -> Result<(), RuntimeError> {
     let mut entries = fs::read_dir(staging)?;
     let only = entries.next().transpose()?.ok_or(RuntimeError::StagingNotEmpty)?.path();
     if only != candidate || entries.next().is_some() {
         return Err(RuntimeError::StagingNotEmpty);
     }
-    let metadata = fs::symlink_metadata(candidate)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    let candidate_dir = Dir::open_ambient_dir(candidate, ambient_authority())?;
+    let metadata = candidate_dir.dir_metadata()?;
+    if (metadata.dev(), metadata.ino()) != identity {
         return Err(RuntimeError::StagingNotEmpty);
     }
     Ok(())
@@ -429,8 +567,10 @@ fn require_owned_candidate(staging: &Path, candidate: &Path) -> Result<(), Runti
 
 impl Drop for CandidateDir {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_dir_all(&self.path);
+        if self.armed
+            && let Some(dir) = self.dir.take()
+        {
+            let _ = dir.remove_open_dir_all();
         }
     }
 }
@@ -481,6 +621,67 @@ mod tests {
             writer.write_all(contents).expect("write ZIP entry");
         }
         writer.finish().expect("finish ZIP").into_inner()
+    }
+    fn commented_archive(comment: &[u8]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.set_raw_comment(comment.into()).expect("set ZIP comment");
+        writer
+            .start_file("node", SimpleFileOptions::default())
+            .expect("start ZIP entry");
+        writer.write_all(b"node").expect("write ZIP entry");
+        writer.finish().expect("finish ZIP").into_inner()
+    }
+
+    fn archive_with_unix_link_extra(id: u16, local: bool, central: bool) -> Vec<u8> {
+        let mut bytes = archive(&[("link", b"")]);
+        let data = if id == 0x756e {
+            vec![0; 15]
+        } else {
+            vec![0; 13]
+        };
+        let mut field = Vec::with_capacity(data.len() + 4);
+        field.extend_from_slice(&id.to_le_bytes());
+        field.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        field.extend_from_slice(&data);
+        let delta = field.len() as u32;
+        if local {
+            let name_length = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+            let extra_length = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+            let insert = 30 + name_length + extra_length;
+            bytes.splice(insert..insert, field.iter().copied());
+            bytes[28..30].copy_from_slice(&((extra_length + field.len()) as u16).to_le_bytes());
+        }
+        let central_offset_in_bytes = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("central directory");
+        if central {
+            let name_length = u16::from_le_bytes([
+                bytes[central_offset_in_bytes + 28],
+                bytes[central_offset_in_bytes + 29],
+            ]) as usize;
+            let extra_length = u16::from_le_bytes([
+                bytes[central_offset_in_bytes + 30],
+                bytes[central_offset_in_bytes + 31],
+            ]) as usize;
+            let insert = central_offset_in_bytes + 46 + name_length + extra_length;
+            bytes.splice(insert..insert, field.iter().copied());
+            bytes[central_offset_in_bytes + 30..central_offset_in_bytes + 32]
+                .copy_from_slice(&((extra_length + field.len()) as u16).to_le_bytes());
+        }
+        let eocd = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x05\x06")
+            .expect("ZIP footer");
+        let central_size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().expect("central size"));
+        let central_offset = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().expect("central offset"));
+        if central {
+            bytes[eocd + 12..eocd + 16].copy_from_slice(&(central_size + delta).to_le_bytes());
+        }
+        if local {
+            bytes[eocd + 16..eocd + 20].copy_from_slice(&(central_offset + delta).to_le_bytes());
+        }
+        bytes
     }
 
     fn symlink_archive() -> Vec<u8> {
@@ -590,6 +791,100 @@ mod tests {
         .expect("extract archive");
         assert_eq!(fs::read(staging.join("bin/node")).expect("node"), b"node");
         assert_eq!(fs::read(staging.join("cli.js")).expect("cli"), b"cli");
+    }
+
+    #[test]
+    fn verify_and_extract_publishes_valid_digest_without_candidate_residue() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let bytes = archive(&[("bin/node", b"node")]);
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        verify_and_extract_zip(&mut Cursor::new(bytes), &digest, &staging)
+            .expect("verify and extract archive");
+        let entries = fs::read_dir(&staging)
+            .expect("read published staging")
+            .map(|entry| entry.expect("published entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["bin"]);
+        assert_eq!(fs::read(staging.join("bin/node")).expect("published node"), b"node");
+    }
+
+    #[test]
+    fn accepts_false_eocd_signature_inside_legal_comment() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let mut comment = b"legal comment PK\x05\x06".to_vec();
+        comment.extend_from_slice(&[0xff; 18]);
+        extract_zip(&mut Cursor::new(commented_archive(&comment)), &staging)
+            .expect("false footer signature in comment");
+        assert_eq!(fs::read(staging.join("node")).expect("node"), b"node");
+    }
+
+    #[test]
+    fn rejects_windows_reserved_names_and_alias_collisions() {
+        for name in ["NUL", "con.txt", "COM1.bin", "lpt9"] {
+            assert_rejected_path(name);
+        }
+        for name in ["node.", "node ", "dir /file"] {
+            assert_rejected_path(name);
+        }
+    }
+
+    #[test]
+    fn rejects_local_and_central_unix_link_metadata() {
+        for (id, local, central) in [
+            (0x756e, true, false),
+            (0x756e, false, true),
+            (0x000d, true, false),
+            (0x000d, false, true),
+        ] {
+            let temp = TempDir::new();
+            let staging = temp.staging();
+            let error = extract_zip(
+                &mut Cursor::new(archive_with_unix_link_extra(id, local, central)),
+                &staging,
+            )
+            .expect_err("UNIX link metadata must fail");
+            assert!(matches!(error, RuntimeError::UnsupportedEntry(_)), "{error:?}");
+            assert_empty(&staging);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_root_replacement_cannot_redirect_writes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let outside = temp.0.join("outside");
+        let moved = temp.0.join("moved-candidate");
+        fs::create_dir(&outside).expect("outside directory");
+        let error = extract_zip_with_hook(
+            &mut Cursor::new(archive(&[("bin/node", b"owned")])),
+            &staging,
+            DEFAULT_EXTRACTION_LIMITS,
+            |candidate| {
+                fs::rename(candidate, &moved).expect("move candidate");
+                symlink(&outside, candidate).expect("replace candidate path");
+            },
+        )
+        .expect_err("replacement race must fail closed");
+        assert!(!outside.join("bin/node").exists());
+        assert!(!moved.exists(), "owned candidate must be removed by handle");
+        assert!(candidate_symlink_in(&staging), "attacker replacement remains caller-owned");
+        drop(error);
+    }
+
+    #[cfg(unix)]
+    fn candidate_symlink_in(staging: &Path) -> bool {
+        fs::read_dir(staging).expect("read staging").any(|entry| {
+            entry
+                .expect("staging entry")
+                .file_type()
+                .expect("entry type")
+                .is_symlink()
+        })
     }
 
     #[test]
