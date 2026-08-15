@@ -1,53 +1,78 @@
-//! Verified, non-destructive installation of target-native runtime seed files.
+//! Fail-closed validation and native probing for target-specific runtime seed payloads.
 
-use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+#[cfg(target_os = "linux")]
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+#[cfg(target_os = "linux")]
 use cap_std::ambient_authority;
+#[cfg(target_os = "linux")]
 use cap_std::fs::{Dir, OpenOptions};
-#[cfg(unix)]
-use cap_std::fs::{Permissions, PermissionsExt};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::fmt;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex};
-use std::thread;
+#[cfg(target_os = "linux")]
+use std::io::{self, Read};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+#[cfg(target_os = "linux")]
+use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
+#[cfg(target_os = "linux")]
+use std::path::{Component, Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::process::{Command, ExitStatus, Stdio};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
-use unicode_normalization::UnicodeNormalization;
+#[cfg(target_os = "linux")]
+use unicode_normalization::UnicodeNormalization as _;
 
+#[cfg(target_os = "linux")]
 use crate::process_tree::ProcessTree;
 
 const MAX_FILES: usize = 16_384;
 const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_COMPONENT_BYTES: usize = 128;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const PROBE_OUTPUT_BYTES: u64 = 64 * 1024;
+const PROBE_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const PROBE_STOP_GRACE: Duration = Duration::from_millis(100);
-const DESTINATION_LOCK: &str = ".melon-runtime-seed-lock-v1";
-const PROBE_OK: &str = "melon-runtime-seed-probe-v1-ok";
+const PROBE_OK: &[u8] = b"melon-runtime-seed-probe-v1-ok\n";
+
 const DURINDOOR_VERSION: &str = "3.15.2";
 const NODE_VERSION: &str = "20.20.2";
+const NODE_ABI: &str = "115";
+const RUNTIME_SEED_PATH: &str = "runtime-seed";
+const MANIFEST_PATH: &str = "metadata/runtime-seed-manifest.json";
+const CLI_PATH: &str = "app/node_modules/durindoor/cli.js";
+const NODE_PATH_UNIX: &str = "bin/node";
+const NODE_PATH_WINDOWS: &str = "bin/node.exe";
+const DURINDOOR_LICENSE_PATH: &str = "licenses/durindoor-LICENSE";
+const NODE_LICENSE_PATH: &str = "licenses/node-LICENSE";
+const NOTICES_PATH: &str = "licenses/THIRD_PARTY_NOTICES.json";
+const BETTER_PACKAGE: &str = "node_modules/better-sqlite3/package.json";
+const BETTER_ENTRY: &str = "node_modules/better-sqlite3/lib/index.js";
+const BETTER_BINARY: &str = "node_modules/better-sqlite3/build/Release/better_sqlite3.node";
 const BETTER_SQLITE_VERSION: &str = "12.6.2";
+const SQL_PACKAGE: &str = "node_modules/sql.js/package.json";
+const SQL_ENTRY: &str = "node_modules/sql.js/dist/sql-wasm.js";
+const SQL_WASM: &str = "node_modules/sql.js/dist/sql-wasm.wasm";
 const SQL_JS_VERSION: &str = "1.14.1";
-static THREAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const PROBE_V1: &str = r#"
 const path = require('node:path');
-const [root, betterPackage, sqlPackage, wasmPath] = process.argv.slice(1);
+const root = process.argv[1];
 try {
-  const Database = require(path.dirname(path.join(root, betterPackage)));
+  const Database = require(path.join(root, 'node_modules/better-sqlite3/lib/index.js'));
   const native = new Database(':memory:');
   native.exec('CREATE TABLE melon_probe(value INTEGER); INSERT INTO melon_probe VALUES (1)');
   if (native.prepare('SELECT value FROM melon_probe').pluck().get() !== 1) throw new Error('native probe mismatch');
   native.close();
-  const initSqlJs = require(path.dirname(path.join(root, sqlPackage)));
-  Promise.resolve(initSqlJs({ locateFile: () => path.join(root, wasmPath) })).then(SQL => {
+  const initSqlJs = require(path.join(root, 'node_modules/sql.js/dist/sql-wasm.js'));
+  Promise.resolve(initSqlJs({ locateFile: () => path.join(root, 'node_modules/sql.js/dist/sql-wasm.wasm') })).then(SQL => {
     const wasm = new SQL.Database();
     wasm.run('CREATE TABLE melon_probe(value INTEGER); INSERT INTO melon_probe VALUES (1)');
     if (wasm.exec('SELECT value FROM melon_probe')[0].values[0][0] !== 1) throw new Error('wasm probe mismatch');
@@ -57,13 +82,14 @@ try {
 } catch (_) { process.exit(1); }
 "#;
 
-/// Redacted runtime-seed installation failure.
+/// Redacted runtime-seed validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SeedError {
     Descriptor,
     Manifest,
     UnsafePath,
-    Conflict,
+    NativeProbeRequired,
+    UnsupportedPlatform,
     ProbeFailed,
     ProbeTimeout,
     ProbeOutputLimit,
@@ -77,23 +103,18 @@ impl fmt::Display for SeedError {
             Self::Descriptor => "runtime seed descriptor is invalid",
             Self::Manifest => "runtime seed manifest validation failed",
             Self::UnsafePath => "runtime seed contains an unsafe path or object",
-            Self::Conflict => "runtime seed conflicts with an existing destination object",
+            Self::NativeProbeRequired => "runtime seed installation requires target-native release-gate evidence",
+            Self::UnsupportedPlatform => "runtime seed verification is unsupported on this platform",
             Self::ProbeFailed => "runtime seed probe failed",
             Self::ProbeTimeout => "runtime seed probe timed out",
             Self::ProbeOutputLimit => "runtime seed probe exceeded its output limit",
-            Self::Cleanup => "runtime seed rollback could not safely remove every created object",
+            Self::Cleanup => "runtime seed process cleanup failed",
             Self::Io => "runtime seed I/O failed",
         })
     }
 }
 
 impl std::error::Error for SeedError {}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct SeedInstallOutcome {
-    pub(crate) created_files: usize,
-    pub(crate) reused_files: usize,
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -199,141 +220,104 @@ struct SeedFile {
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Identity(u64, u64);
 
-struct CreatedObject {
-    relative: PathBuf,
+#[cfg(target_os = "linux")]
+struct CriticalFile {
+    path: &'static str,
     identity: Identity,
-    directory: bool,
+    file: cap_std::fs::File,
 }
 
+#[cfg(target_os = "linux")]
 struct ValidatedSeed {
-    payload_root: PathBuf,
     source: Dir,
-    descriptor: PayloadDescriptor,
-    files: Vec<SeedFile>,
     node: cap_std::fs::File,
+    files: Vec<SeedFile>,
+    critical: Vec<CriticalFile>,
 }
 
-/// Merges a validated seed beneath `destination`, probes both native modules, and rolls back only
-/// objects created by this call when any later step fails.
-pub(crate) fn install_runtime_seed(
-    payload_root: &Path,
-    destination: &Path,
-) -> Result<SeedInstallOutcome, SeedError> {
-    install_runtime_seed_with_probe(payload_root, destination, |context| run_probe_v1(context))
-}
-
-fn install_runtime_seed_with_probe<F>(
-    payload_root: &Path,
-    destination: &Path,
-    probe: F,
-) -> Result<SeedInstallOutcome, SeedError>
-where
-    F: FnOnce(&ProbeContext<'_>) -> Result<(), SeedError>,
-{
-    let _thread_lock = THREAD_LOCK.lock().map_err(|_| SeedError::Io)?;
-    let validated = validate_seed(payload_root)?;
-    let destination_dir = open_private_root(destination)?;
-    if roots_overlap(payload_root, destination)? {
-        return Err(SeedError::UnsafePath);
-    }
-    let _process_lock = DestinationLock::acquire(&destination_dir)?;
-    let mut created = Vec::new();
-    let mut reused = 0;
-    let result = merge_files(&validated, &destination_dir, &mut created, &mut reused).and_then(|created_files| {
-        let context = ProbeContext { validated: &validated, destination };
-        probe(&context)?;
-        Ok(SeedInstallOutcome { created_files, reused_files: reused })
-    });
-    if result.is_err() {
-        if rollback(&destination_dir, &created).is_err() {
-            return Err(SeedError::Cleanup);
-        }
-    }
-    result
-}
-
-struct DestinationLock(fs::File);
-
-impl DestinationLock {
-    fn acquire(destination: &Dir) -> Result<Self, SeedError> {
-        let mut created = false;
-        let file = {
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create_new(true).follow(FollowSymlinks::No);
-            match destination.open_with(DESTINATION_LOCK, &options) {
-                Ok(file) => {
-                    created = true;
-                    file
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let mut options = OpenOptions::new();
-                    options.read(true).write(true).follow(FollowSymlinks::No);
-                    destination.open_with(DESTINATION_LOCK, &options).map_err(|_| SeedError::UnsafePath)?
-                }
-                Err(_) => return Err(SeedError::Io),
-            }
-        };
-        if !file.metadata().map_err(|_| SeedError::Io)?.is_file() {
-            return Err(SeedError::UnsafePath);
-        }
-        #[cfg(unix)]
-        if created {
-            file.set_permissions(Permissions::from_mode(0o600)).map_err(|_| SeedError::Io)?;
-        }
-        #[cfg(unix)]
-        {
-            let metadata = file.metadata().map_err(|_| SeedError::Io)?;
-            if cap_std::fs::MetadataExt::uid(&metadata) != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o177 != 0 {
-                return Err(SeedError::UnsafePath);
-            }
-        }
-        let file = file.into_std();
-        file.lock().map_err(|_| SeedError::Io)?;
-        Ok(Self(file))
+/// Refuses installation until the exact target-native payload passes [`verify_native_runtime_seed`]
+/// on its release runner. No destination path is opened or mutated.
+pub(crate) fn install_runtime_seed(_payload_root: &Path, _destination: &Path) -> Result<(), SeedError> {
+    if cfg!(target_os = "linux") {
+        Err(SeedError::NativeProbeRequired)
+    } else {
+        Err(SeedError::UnsupportedPlatform)
     }
 }
 
-impl Drop for DestinationLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
+/// Performs the target-native release gate without installing or modifying runtime data.
+///
+/// Linux is the only implemented verifier because it can execute both Node and the seed root through
+/// inherited retained descriptors. Other platforms fail closed until equivalent native mechanisms and
+/// tests exist.
+pub(crate) fn verify_native_runtime_seed(payload_root: &Path) -> Result<(), SeedError> {
+    #[cfg(target_os = "linux")]
+    {
+        let validated = validate_seed(payload_root)?;
+        run_probe_v1(&validated, PROBE_V1)?;
+        revalidate_seed(&validated)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = payload_root;
+        Err(SeedError::UnsupportedPlatform)
     }
 }
 
+#[cfg(target_os = "linux")]
 fn validate_seed(payload_root: &Path) -> Result<ValidatedSeed, SeedError> {
     let payload = open_private_root(payload_root)?;
     let descriptor_bytes = read_cap_file(&payload, "payload.json", MAX_TOTAL_BYTES)?;
     let descriptor: PayloadDescriptor = serde_json::from_slice(&descriptor_bytes).map_err(|_| SeedError::Descriptor)?;
     validate_descriptor(&payload, &descriptor)?;
-    let manifest_bytes = read_cap_file(&payload, &descriptor.runtime_seed_manifest.path, MAX_TOTAL_BYTES)?;
+    let manifest_bytes = read_cap_file(&payload, MANIFEST_PATH, MAX_TOTAL_BYTES)?;
     if sha256(&manifest_bytes) != descriptor.runtime_seed_manifest.sha256 {
         return Err(SeedError::Manifest);
     }
     let manifest: SeedManifest = serde_json::from_slice(&manifest_bytes).map_err(|_| SeedError::Manifest)?;
     validate_manifest(&manifest, &descriptor.runtime_seed_manifest)?;
-    let node = open_cap_file(&payload, &descriptor.node).map_err(|_| SeedError::Descriptor)?;
-    let source = open_cap_directory(&payload, &descriptor.runtime_seed_path)?;
+    let source = open_cap_directory(&payload, RUNTIME_SEED_PATH)?;
     validate_source_set(&source, &manifest.files)?;
-    validate_package(&source, &descriptor.runtime_seed_manifest.modules.better_sqlite3.package_path, "better-sqlite3", BETTER_SQLITE_VERSION)?;
-    validate_package(&source, &descriptor.runtime_seed_manifest.modules.sql_js.package_path, "sql.js", SQL_JS_VERSION)?;
-    Ok(ValidatedSeed { payload_root: payload_root.to_owned(), source, descriptor, files: manifest.files, node })
+    validate_package(&source, BETTER_PACKAGE, "better-sqlite3", BETTER_SQLITE_VERSION)?;
+    validate_package(&source, SQL_PACKAGE, "sql.js", SQL_JS_VERSION)?;
+    let node = open_cap_file(&payload, current_node_path())?;
+    validate_file_security(&node, 0o755, SeedError::Descriptor)?;
+    let mut critical = Vec::new();
+    for path in [BETTER_PACKAGE, BETTER_ENTRY, BETTER_BINARY, SQL_PACKAGE, SQL_ENTRY, SQL_WASM] {
+        let file = open_cap_file(&source, path).map_err(|_| SeedError::Manifest)?;
+        let metadata = file.metadata().map_err(|_| SeedError::Manifest)?;
+        critical.push(CriticalFile { path, identity: identity(&metadata), file });
+    }
+    Ok(ValidatedSeed { source, node, files: manifest.files, critical })
 }
 
+#[cfg(target_os = "linux")]
 fn validate_descriptor(payload: &Dir, descriptor: &PayloadDescriptor) -> Result<(), SeedError> {
+    let modules = &descriptor.runtime_seed_manifest.modules;
     if descriptor.schema_version != 1
+        || descriptor.target != current_target()
         || descriptor.durindoor_version != DURINDOOR_VERSION
         || descriptor.node_version != NODE_VERSION
+        || descriptor.node_abi != NODE_ABI
+        || descriptor.cli != CLI_PATH
+        || descriptor.node != current_node_path()
+        || descriptor.runtime_seed_path != RUNTIME_SEED_PATH
         || descriptor.managed_launch_ready
+        || descriptor.runtime_seed_manifest.path != MANIFEST_PATH
         || descriptor.runtime_seed_manifest.destination != "data-runtime-root"
         || descriptor.runtime_seed_manifest.probe_version != 1
         || descriptor.runtime_seed_manifest.file_count == 0
         || descriptor.runtime_seed_manifest.file_count > MAX_FILES
         || descriptor.runtime_seed_manifest.total_bytes > MAX_TOTAL_BYTES
-        || descriptor.runtime_seed_manifest.modules.better_sqlite3.version != BETTER_SQLITE_VERSION
-        || descriptor.runtime_seed_manifest.modules.sql_js.version != SQL_JS_VERSION
-        || descriptor.target != current_target()
-        || descriptor.node != current_node_path()
-        || descriptor.node_abi.is_empty()
-        || !descriptor.node_abi.bytes().all(|byte| byte.is_ascii_digit())
+        || modules.better_sqlite3.package_path != BETTER_PACKAGE
+        || modules.better_sqlite3.binary_path != BETTER_BINARY
+        || modules.better_sqlite3.version != BETTER_SQLITE_VERSION
+        || modules.sql_js.package_path != SQL_PACKAGE
+        || modules.sql_js.wasm_path != SQL_WASM
+        || modules.sql_js.version != SQL_JS_VERSION
+        || descriptor.licenses.durindoor != DURINDOOR_LICENSE_PATH
+        || descriptor.licenses.node != NODE_LICENSE_PATH
+        || descriptor.licenses.notices != NOTICES_PATH
     {
         return Err(SeedError::Descriptor);
     }
@@ -348,65 +332,31 @@ fn validate_descriptor(payload: &Dir, descriptor: &PayloadDescriptor) -> Result<
     ] {
         validate_digest(digest).map_err(|_| SeedError::Descriptor)?;
     }
-    for path in [
-        &descriptor.cli,
-        &descriptor.node,
-        &descriptor.runtime_seed_path,
-        &descriptor.runtime_seed_manifest.path,
-        &descriptor.licenses.durindoor,
-        &descriptor.licenses.node,
-        &descriptor.licenses.notices,
-        &descriptor.runtime_seed_manifest.modules.better_sqlite3.package_path,
-        &descriptor.runtime_seed_manifest.modules.better_sqlite3.binary_path,
-        &descriptor.runtime_seed_manifest.modules.sql_js.package_path,
-        &descriptor.runtime_seed_manifest.modules.sql_js.wasm_path,
-    ] {
-        safe_relative(path).map_err(|_| SeedError::Descriptor)?;
-    }
-    let mut module_keys = HashSet::new();
-    for path in [
-        &descriptor.runtime_seed_manifest.modules.better_sqlite3.package_path,
-        &descriptor.runtime_seed_manifest.modules.better_sqlite3.binary_path,
-        &descriptor.runtime_seed_manifest.modules.sql_js.package_path,
-        &descriptor.runtime_seed_manifest.modules.sql_js.wasm_path,
-    ] {
-        if !module_keys.insert(path_key(path).map_err(|_| SeedError::Descriptor)?) {
-            return Err(SeedError::Descriptor);
-        }
-    }
     for evidence in [&descriptor.toolchain.python, &descriptor.toolchain.cc, &descriptor.toolchain.cxx] {
-        if evidence.name.is_empty() || evidence.version.is_empty() || evidence.version.len() > 256 || evidence.version.contains(['/', '\\']) {
+        if evidence.name.is_empty()
+            || evidence.version.is_empty()
+            || evidence.version.len() > 256
+            || evidence.version.contains(['/', '\\'])
+        {
             return Err(SeedError::Descriptor);
         }
     }
-    for path in [&descriptor.node, &descriptor.cli] {
-        open_cap_file(payload, path).map_err(|_| SeedError::Descriptor)?;
+    for (path, mode) in [
+        ("payload.json", 0o644),
+        (MANIFEST_PATH, 0o644),
+        (CLI_PATH, 0o644),
+        (current_node_path(), 0o755),
+        (DURINDOOR_LICENSE_PATH, 0o644),
+        (NODE_LICENSE_PATH, 0o644),
+        (NOTICES_PATH, 0o644),
+    ] {
+        let file = open_cap_file(payload, path).map_err(|_| SeedError::Descriptor)?;
+        validate_file_security(&file, mode, SeedError::Descriptor)?;
     }
     Ok(())
 }
-fn current_target() -> &'static str {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    { "x86_64-unknown-linux-gnu" }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    { "x86_64-apple-darwin" }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    { "aarch64-apple-darwin" }
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    { "x86_64-pc-windows-msvc" }
-    #[cfg(not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(windows, target_arch = "x86_64")
-    )))]
-    { "unsupported" }
-}
 
-fn current_node_path() -> &'static str {
-    if cfg!(windows) { "bin/node.exe" } else { "bin/node" }
-}
-
-
+#[cfg(target_os = "linux")]
 fn validate_manifest(manifest: &SeedManifest, descriptor: &ManifestDescriptor) -> Result<(), SeedError> {
     if manifest.schema_version != 1
         || manifest.files.is_empty()
@@ -433,12 +383,7 @@ fn validate_manifest(manifest: &SeedManifest, descriptor: &ManifestDescriptor) -
         return Err(SeedError::Manifest);
     }
     let paths = manifest.files.iter().map(|file| path_key(&file.path)).collect::<Result<HashSet<_>, _>>()?;
-    for path in [
-        &descriptor.modules.better_sqlite3.package_path,
-        &descriptor.modules.better_sqlite3.binary_path,
-        &descriptor.modules.sql_js.package_path,
-        &descriptor.modules.sql_js.wasm_path,
-    ] {
+    for path in [BETTER_PACKAGE, BETTER_ENTRY, BETTER_BINARY, SQL_PACKAGE, SQL_ENTRY, SQL_WASM] {
         if !paths.contains(&path_key(path)?) {
             return Err(SeedError::Manifest);
         }
@@ -446,24 +391,25 @@ fn validate_manifest(manifest: &SeedManifest, descriptor: &ManifestDescriptor) -
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_source_set(source: &Dir, files: &[SeedFile]) -> Result<(), SeedError> {
     let mut actual = Vec::new();
     walk_source(source, Path::new(""), &mut actual)?;
     actual.sort();
-    let mut expected = files.iter().map(|file| path_key(&file.path)).collect::<Result<Vec<_>, _>>().map_err(|_| SeedError::Manifest)?;
+    let mut expected = files.iter().map(|file| path_key(&file.path)).collect::<Result<Vec<_>, _>>()?;
     expected.sort();
     if actual != expected {
         return Err(SeedError::Manifest);
     }
     for file in files {
-        validate_exact_file(source, file, SeedError::Manifest)?;
+        validate_exact_file(source, file)?;
     }
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn walk_source(directory: &Dir, prefix: &Path, files: &mut Vec<String>) -> Result<(), SeedError> {
-    let entries = directory.entries().map_err(|_| SeedError::Manifest)?;
-    for entry in entries {
+    for entry in directory.entries().map_err(|_| SeedError::Manifest)? {
         let entry = entry.map_err(|_| SeedError::Manifest)?;
         let name = entry.file_name();
         let name = name.to_str().ok_or(SeedError::Manifest)?;
@@ -473,11 +419,11 @@ fn walk_source(directory: &Dir, prefix: &Path, files: &mut Vec<String>) -> Resul
             return Err(SeedError::Manifest);
         }
         if metadata.is_dir() {
-            let child = open_child_dir(directory, name).map_err(|_| SeedError::Manifest)?;
+            let child = directory.open_dir_nofollow(name).map_err(|_| SeedError::Manifest)?;
+            validate_directory_security(&child, SeedError::Manifest)?;
             walk_source(&child, &relative, files)?;
         } else if metadata.is_file() {
-            let path = relative.to_str().ok_or(SeedError::Manifest)?;
-            files.push(path_key(path).map_err(|_| SeedError::Manifest)?);
+            files.push(path_key(relative.to_str().ok_or(SeedError::Manifest)?)?);
         } else {
             return Err(SeedError::Manifest);
         }
@@ -485,6 +431,7 @@ fn walk_source(directory: &Dir, prefix: &Path, files: &mut Vec<String>) -> Resul
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_package(source: &Dir, path: &str, name: &str, version: &str) -> Result<(), SeedError> {
     #[derive(Deserialize)]
     struct Package<'a> {
@@ -499,324 +446,261 @@ fn validate_package(source: &Dir, path: &str, name: &str, version: &str) -> Resu
     Ok(())
 }
 
-fn merge_files(
-    validated: &ValidatedSeed,
-    destination: &Dir,
-    created: &mut Vec<CreatedObject>,
-    reused: &mut usize,
-) -> Result<usize, SeedError> {
-    let mut created_files = 0;
-    for expected in &validated.files {
-        let components = safe_relative(&expected.path)?;
-        let (parent, parent_relative) = ensure_directories(destination, &components[..components.len() - 1], created)?;
-        let name = components.last().ok_or(SeedError::Manifest)?;
-        let relative = parent_relative.join(name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true).follow(FollowSymlinks::No);
-        match parent.open_with(name, &options) {
-            Ok(mut output) => {
-                let identity = identity(&output.metadata().map_err(|_| SeedError::Io)?);
-                created.push(CreatedObject { relative, identity, directory: false });
-                let mut input = open_cap_file(&validated.source, &expected.path).map_err(|_| SeedError::Manifest)?;
-                copy_exact(&mut input, &mut output, expected.size, &expected.sha256)?;
-                #[cfg(unix)]
-                output.set_permissions(Permissions::from_mode(if expected.executable { 0o755 } else { 0o644 })).map_err(|_| SeedError::Io)?;
-                output.sync_all().map_err(|_| SeedError::Io)?;
-                created_files += 1;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                validate_exact_file(destination, expected, SeedError::Conflict)?;
-                *reused += 1;
-            }
-            Err(_) => return Err(SeedError::Io),
-        }
+#[cfg(target_os = "linux")]
+fn validate_exact_file(root: &Dir, expected: &SeedFile) -> Result<(), SeedError> {
+    let mut file = open_cap_file(root, &expected.path).map_err(|_| SeedError::Manifest)?;
+    let mode = if expected.executable { 0o755 } else { 0o644 };
+    validate_file_security(&file, mode, SeedError::Manifest)?;
+    let before = file.metadata().map_err(|_| SeedError::Manifest)?;
+    if before.len() != expected.size {
+        return Err(SeedError::Manifest);
     }
-    Ok(created_files)
-}
-
-fn ensure_directories(
-    root: &Dir,
-    components: &[String],
-    created: &mut Vec<CreatedObject>,
-) -> Result<(Dir, PathBuf), SeedError> {
-    let mut current = root.try_clone().map_err(|_| SeedError::Io)?;
-    let mut relative = PathBuf::new();
-    for component in components {
-        relative.push(component);
-        match current.create_dir(component) {
-            Ok(()) => {
-                let child = open_child_dir(&current, component).map_err(|_| SeedError::Io)?;
-                #[cfg(unix)]
-                child.set_permissions(".", Permissions::from_mode(0o700)).map_err(|_| SeedError::Io)?;
-                let metadata = child.dir_metadata().map_err(|_| SeedError::Io)?;
-                created.push(CreatedObject { relative: relative.clone(), identity: identity(&metadata), directory: true });
-                current = child;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                current = open_child_dir(&current, component).map_err(|_| SeedError::Conflict)?;
-            }
-            Err(_) => return Err(SeedError::Io),
-        }
-    }
-    Ok((current, relative))
-}
-
-fn validate_exact_file(root: &Dir, expected: &SeedFile, failure: SeedError) -> Result<(), SeedError> {
-    let mut file = open_cap_file(root, &expected.path).map_err(|_| failure)?;
-    let before = file.metadata().map_err(|_| failure)?;
-    if !before.is_file() || before.len() != expected.size {
-        return Err(failure);
-    }
-    #[cfg(unix)]
-    if (before.permissions().mode() & 0o111 != 0) != expected.executable {
-        return Err(failure);
-    }
-    let actual = hash_reader(&mut file).map_err(|_| failure)?;
-    let after = file.metadata().map_err(|_| failure)?;
-    if identity(&before) != identity(&after) || before.len() != after.len() || actual != expected.sha256 {
-        return Err(failure);
-    }
-    Ok(())
-}
-
-fn copy_exact(input: &mut cap_std::fs::File, output: &mut cap_std::fs::File, size: u64, digest: &str) -> Result<(), SeedError> {
-    let before = input.metadata().map_err(|_| SeedError::Manifest)?;
-    let mut hasher = Sha256::new();
-    let mut copied = 0_u64;
-    let mut buffer = [0; COPY_BUFFER_BYTES];
-    loop {
-        let read = input.read(&mut buffer).map_err(|_| SeedError::Manifest)?;
-        if read == 0 {
-            break;
-        }
-        copied = copied.checked_add(read as u64).ok_or(SeedError::Manifest)?;
-        if copied > size {
-            return Err(SeedError::Manifest);
-        }
-        hasher.update(&buffer[..read]);
-        output.write_all(&buffer[..read]).map_err(|_| SeedError::Io)?;
-    }
-    let after = input.metadata().map_err(|_| SeedError::Manifest)?;
-    if copied != size || identity(&before) != identity(&after) || before.len() != after.len() || format!("{:x}", hasher.finalize()) != digest {
+    let actual = hash_reader(&mut file).map_err(|_| SeedError::Manifest)?;
+    let after = file.metadata().map_err(|_| SeedError::Manifest)?;
+    if identity(&before) != identity(&after)
+        || before.len() != after.len()
+        || actual != expected.sha256
+    {
         return Err(SeedError::Manifest);
     }
     Ok(())
 }
 
-fn rollback(root: &Dir, created: &[CreatedObject]) -> Result<(), SeedError> {
-    let mut clean = true;
-    for object in created.iter().rev() {
-        let result = if object.directory {
-            remove_created_directory(root, object)
-        } else {
-            remove_created_file(root, object)
-        };
-        clean &= result.is_ok();
+#[cfg(target_os = "linux")]
+fn revalidate_seed(validated: &ValidatedSeed) -> Result<(), SeedError> {
+    validate_source_set(&validated.source, &validated.files)?;
+    for critical in &validated.critical {
+        let current = open_cap_file(&validated.source, critical.path).map_err(|_| SeedError::Manifest)?;
+        let current_metadata = current.metadata().map_err(|_| SeedError::Manifest)?;
+        let retained_metadata = critical.file.metadata().map_err(|_| SeedError::Manifest)?;
+        if identity(&current_metadata) != critical.identity || identity(&retained_metadata) != critical.identity {
+            return Err(SeedError::Manifest);
+        }
     }
-    if clean { Ok(()) } else { Err(SeedError::Cleanup) }
+    Ok(())
 }
 
-fn remove_created_file(root: &Dir, object: &CreatedObject) -> Result<(), SeedError> {
-    let (parent, name) = open_parent(root, &object.relative)?;
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    let file = match parent.open_with(&name, &options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(SeedError::Cleanup),
-    };
-    if identity(&file.metadata().map_err(|_| SeedError::Cleanup)?) != object.identity {
-        return Err(SeedError::Cleanup);
+#[cfg(target_os = "linux")]
+fn identity(metadata: &cap_std::fs::Metadata) -> Identity {
+    Identity(cap_fs_ext::MetadataExt::dev(metadata), cap_fs_ext::MetadataExt::ino(metadata))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_file_security(file: &cap_std::fs::File, mode: u32, failure: SeedError) -> Result<(), SeedError> {
+    let metadata = file.metadata().map_err(|_| failure)?;
+    if !metadata.is_file()
+        || cap_fs_ext::MetadataExt::nlink(&metadata) != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o7777 != mode
+    {
+        return Err(failure);
     }
-    parent.remove_file(name).map_err(|_| SeedError::Cleanup)
+    Ok(())
 }
 
-fn remove_created_directory(root: &Dir, object: &CreatedObject) -> Result<(), SeedError> {
-    let (parent, name) = open_parent(root, &object.relative)?;
-    let directory = match open_child_dir(&parent, name.to_str().ok_or(SeedError::Cleanup)?) {
-        Ok(directory) => directory,
-        Err(SeedError::Io) => return Ok(()),
-        Err(_) => return Err(SeedError::Cleanup),
-    };
-    if identity(&directory.dir_metadata().map_err(|_| SeedError::Cleanup)?) != object.identity {
-        return Err(SeedError::Cleanup);
+#[cfg(target_os = "linux")]
+fn validate_directory_security(directory: &Dir, failure: SeedError) -> Result<(), SeedError> {
+    let metadata = directory.dir_metadata().map_err(|_| failure)?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(failure);
     }
-    parent.remove_dir(name).map_err(|_| SeedError::Cleanup)
+    Ok(())
 }
 
-struct ProbeContext<'a> {
-    validated: &'a ValidatedSeed,
-    destination: &'a Path,
+#[cfg(target_os = "linux")]
+fn probe_context(node: cap_std::fs::File, source: Dir) -> ValidatedSeed {
+    ValidatedSeed { source, node, files: Vec::new(), critical: Vec::new() }
 }
 
-/// Runs the fixed native-module probe and tears down its entire owned process tree before returning.
-fn run_probe_v1(context: &ProbeContext<'_>) -> Result<(), SeedError> {
-    let modules = &context.validated.descriptor.runtime_seed_manifest.modules;
-    let (reader, writer) = os_pipe::pipe().map_err(|_| SeedError::Io)?;
+#[cfg(target_os = "linux")]
+fn run_probe_v1(validated: &ValidatedSeed, script: &str) -> Result<(), SeedError> {
+    let node = inherited_file_path(&validated.node)?;
+    let root = inherited_dir_path(&validated.source)?;
+    let (mut reader, writer) = os_pipe::pipe().map_err(|_| SeedError::Io)?;
+    set_nonblocking(reader.as_raw_fd())?;
     let stderr = writer.try_clone().map_err(|_| SeedError::Io)?;
-    let probe_node = probe_node(&context.validated)?;
-    let mut command = Command::new(&probe_node.path);
+    let mut command = Command::new(&node.path);
     command
         .arg("-e")
-        .arg(PROBE_V1)
-        .arg(context.destination)
-        .arg(&modules.better_sqlite3.package_path)
-        .arg(&modules.sql_js.package_path)
-        .arg(&modules.sql_js.wasm_path)
+        .arg(script)
+        .arg(&root.path)
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::from(writer))
         .stderr(Stdio::from(stderr))
-        .current_dir(context.destination);
-    #[cfg(windows)]
-    for name in ["SYSTEMROOT", "WINDIR"] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    let mut capture = Some(thread::spawn(move || read_probe_output(reader)));
-    let mut tree = match ProcessTree::spawn(&mut command) {
-        Ok(tree) => tree,
-        Err(_) => {
-            drop(command);
-            let _ = capture.take().expect("capture retained").join();
-            return Err(SeedError::ProbeFailed);
-        }
-    };
-    drop(probe_node);
+        .current_dir(&root.path);
+    let mut tree = ProcessTree::spawn(&mut command).map_err(|_| SeedError::ProbeFailed)?;
     drop(command);
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    let mut captured = None;
-    let direct = loop {
+    let mut bytes = Vec::new();
+    let outcome = loop {
         match tree.try_wait_direct() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break classify_direct(status),
             Ok(None) if Instant::now() >= deadline => break Err(SeedError::ProbeTimeout),
             Ok(None) => {}
             Err(_) => break Err(SeedError::ProbeFailed),
         }
-        if capture.as_ref().is_some_and(|handle| handle.is_finished()) {
-            match capture.take().expect("finished capture retained").join() {
-                Ok(result) => {
-                    let failure = result.as_ref().err().copied();
-                    captured = Some(result);
-                    if let Some(error) = failure {
-                        break Err(error);
-                    }
-                }
-                Err(_) => break Err(SeedError::ProbeFailed),
-            }
+        match drain_probe_output(&mut reader, &mut bytes) {
+            // EOF does not prove whole-tree exit; only ProcessTree teardown owns that decision.
+            Ok(_) => {}
+            Err(error) => break Err(error),
         }
-        thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
     };
-    let stop = tree.stop(PROBE_STOP_GRACE).map_err(|_| SeedError::ProbeFailed);
-    let captured = match captured {
-        Some(result) => result,
-        None => capture.take().expect("unfinished capture retained").join().map_err(|_| SeedError::ProbeFailed)?,
-    };
-
-    let status = direct?;
+    let stop = tree.stop(PROBE_STOP_GRACE).map_err(|_| SeedError::Cleanup);
+    if stop.is_err() {
+        return Err(SeedError::Cleanup);
+    }
+    let drained = drain_probe_output(&mut reader, &mut bytes);
+    let status = outcome?;
+    let eof = drained?;
     if !status.success() {
         return Err(SeedError::ProbeFailed);
     }
-    let bytes = captured?;
-    stop?;
-    let output = std::str::from_utf8(&bytes).map_err(|_| SeedError::ProbeFailed)?;
-    if output != format!("{PROBE_OK}\n") {
+    if !eof || bytes != PROBE_OK {
         return Err(SeedError::ProbeFailed);
     }
     Ok(())
 }
 
-fn read_probe_output(mut reader: os_pipe::PipeReader) -> Result<Vec<u8>, SeedError> {
-    let mut bytes = Vec::new();
-    reader
-        .by_ref()
-        .take(PROBE_OUTPUT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| SeedError::ProbeFailed)?;
-    if bytes.len() as u64 > PROBE_OUTPUT_BYTES {
-        return Err(SeedError::ProbeOutputLimit);
+#[cfg(target_os = "linux")]
+fn classify_direct(status: ExitStatus) -> Result<ExitStatus, SeedError> {
+    if status.success() { Ok(status) } else { Err(SeedError::ProbeFailed) }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_probe_output(reader: &mut os_pipe::PipeReader, bytes: &mut Vec<u8>) -> Result<bool, SeedError> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                if bytes.len().checked_add(read).is_none_or(|length| length > PROBE_OUTPUT_BYTES) {
+                    return Err(SeedError::ProbeOutputLimit);
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(SeedError::ProbeFailed),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_nonblocking(descriptor: libc::c_int) -> Result<(), SeedError> {
+    // SAFETY: descriptor is a live pipe owned by this function.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(SeedError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct InheritedPath {
+    path: PathBuf,
+    _descriptor: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_file_path(file: &cap_std::fs::File) -> Result<InheritedPath, SeedError> {
+    inherited_path(file.as_raw_fd())
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_dir_path(directory: &Dir) -> Result<InheritedPath, SeedError> {
+    inherited_path(directory.as_raw_fd())
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_path(source: libc::c_int) -> Result<InheritedPath, SeedError> {
+    // SAFETY: F_DUPFD duplicates the retained descriptor and returns new ownership on success.
+    let descriptor = unsafe { libc::fcntl(source, libc::F_DUPFD, 3) };
+    if descriptor < 0 {
+        return Err(SeedError::ProbeFailed);
+    }
+    // SAFETY: successful F_DUPFD returns a unique descriptor.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    Ok(InheritedPath { path: PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd())), _descriptor: descriptor })
+}
+
+#[cfg(target_os = "linux")]
+fn open_private_root(path: &Path) -> Result<Dir, SeedError> {
+    if !path.is_absolute() {
+        return Err(SeedError::UnsafePath);
+    }
+    let mut directory = Dir::open_ambient_dir("/", ambient_authority()).map_err(|_| SeedError::UnsafePath)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory = directory.open_dir_nofollow(name).map_err(|_| SeedError::UnsafePath)?;
+            }
+            _ => return Err(SeedError::UnsafePath),
+        }
+    }
+    let metadata = directory.dir_metadata().map_err(|_| SeedError::UnsafePath)?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(SeedError::UnsafePath);
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn read_cap_file(root: &Dir, path: &str, limit: u64) -> Result<Vec<u8>, SeedError> {
+    let file = open_cap_file(root, path)?;
+    let length = file.metadata().map_err(|_| SeedError::Io)?.len();
+    if length > limit {
+        return Err(SeedError::Manifest);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).map_err(|_| SeedError::Manifest)?);
+    file.take(limit + 1).read_to_end(&mut bytes).map_err(|_| SeedError::Io)?;
+    if bytes.len() as u64 > limit {
+        return Err(SeedError::Manifest);
     }
     Ok(bytes)
 }
 
-struct ProbeNode {
-    path: PathBuf,
-    #[cfg(unix)]
-    _descriptor: OwnedFd,
-    #[cfg(windows)]
-    _lock: fs::File,
-}
-
-#[cfg(unix)]
-fn probe_node(validated: &ValidatedSeed) -> Result<ProbeNode, SeedError> {
-    // SAFETY: F_DUPFD duplicates the retained, validated Node handle and returns a new owned descriptor.
-    let descriptor = unsafe { libc::fcntl(validated.node.as_raw_fd(), libc::F_DUPFD, 3) };
-    if descriptor < 0 {
-        return Err(SeedError::ProbeFailed);
-    }
-    // SAFETY: successful F_DUPFD returns unique ownership of this descriptor.
-    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    #[cfg(target_os = "linux")]
-    let path = PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()));
-    #[cfg(target_os = "macos")]
-    let path = PathBuf::from(format!("/dev/fd/{}", descriptor.as_raw_fd()));
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let path = validated.payload_root_path(&validated.descriptor.node)?;
-    Ok(ProbeNode { path, _descriptor: descriptor })
-}
-
-#[cfg(windows)]
-fn probe_node(validated: &ValidatedSeed) -> Result<ProbeNode, SeedError> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-
-    let path = validated.payload_root_path(&validated.descriptor.node)?;
-    let lock = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).map_err(|_| SeedError::ProbeFailed)?;
-    let file = cap_std::fs::File::from_std(lock.try_clone().map_err(|_| SeedError::ProbeFailed)?);
-    if identity(&file.metadata().map_err(|_| SeedError::ProbeFailed)?)
-        != identity(&validated.node.metadata().map_err(|_| SeedError::ProbeFailed)?)
-    {
-        return Err(SeedError::ProbeFailed);
-    }
-    Ok(ProbeNode { path, _lock: lock })
-}
-
-
-impl ValidatedSeed {
-    fn payload_root_path(&self, relative: &str) -> Result<PathBuf, SeedError> {
-        safe_relative(relative)?;
-        let canonical = self.payload_root.join(relative).canonicalize().map_err(|_| SeedError::UnsafePath)?;
-        if !canonical.starts_with(&self.payload_root) {
-            return Err(SeedError::UnsafePath);
-        }
-        Ok(canonical)
-    }
-}
-
-fn open_private_root(path: &Path) -> Result<Dir, SeedError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| SeedError::UnsafePath)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+#[cfg(target_os = "linux")]
+fn open_cap_file(root: &Dir, path: &str) -> Result<cap_std::fs::File, SeedError> {
+    let components = safe_relative(path)?;
+    let (parent, name) = traverse_parent(root, &components)?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options).map_err(|_| SeedError::Io)?;
+    if !file.metadata().map_err(|_| SeedError::Io)?.is_file() {
         return Err(SeedError::UnsafePath);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(SeedError::UnsafePath);
-        }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_cap_directory(root: &Dir, path: &str) -> Result<Dir, SeedError> {
+    let components = safe_relative(path)?;
+    let mut current = root.try_clone().map_err(|_| SeedError::Io)?;
+    for component in components {
+        current = current.open_dir_nofollow(component).map_err(|_| SeedError::UnsafePath)?;
     }
-    Dir::open_ambient_dir(path, ambient_authority()).map_err(|_| SeedError::UnsafePath)
+    Ok(current)
 }
 
-fn roots_overlap(payload_root: &Path, destination: &Path) -> Result<bool, SeedError> {
-    let payload = payload_root.canonicalize().map_err(|_| SeedError::UnsafePath)?;
-    let destination = destination.canonicalize().map_err(|_| SeedError::UnsafePath)?;
-    Ok(payload.starts_with(&destination) || destination.starts_with(&payload))
+#[cfg(target_os = "linux")]
+fn traverse_parent(root: &Dir, components: &[String]) -> Result<(Dir, String), SeedError> {
+    let mut current = root.try_clone().map_err(|_| SeedError::Io)?;
+    for component in &components[..components.len().saturating_sub(1)] {
+        current = current.open_dir_nofollow(component).map_err(|_| SeedError::UnsafePath)?;
+    }
+    Ok((current, components.last().ok_or(SeedError::UnsafePath)?.clone()))
 }
 
+#[cfg(target_os = "linux")]
 fn safe_relative(path: &str) -> Result<Vec<String>, SeedError> {
-    if path.is_empty() || path.starts_with('/') || path.contains(['\\', ':']) || path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains(['\\', ':'])
+        || path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+    {
         return Err(SeedError::UnsafePath);
     }
     let mut components = Vec::new();
@@ -835,7 +719,9 @@ fn safe_relative(path: &str) -> Result<Vec<String>, SeedError> {
         let key = normalized.to_lowercase();
         let stem = key.split('.').next().unwrap_or_default();
         let reserved = matches!(stem, "con" | "prn" | "aux" | "nul")
-            || stem.strip_prefix("com").or_else(|| stem.strip_prefix("lpt")).is_some_and(|number| matches!(number, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
+            || stem.strip_prefix("com").or_else(|| stem.strip_prefix("lpt")).is_some_and(|number| {
+                matches!(number, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            });
         if reserved || key.starts_with(".melon-runtime-seed-") {
             return Err(SeedError::UnsafePath);
         }
@@ -844,10 +730,12 @@ fn safe_relative(path: &str) -> Result<Vec<String>, SeedError> {
     Ok(components)
 }
 
+#[cfg(target_os = "linux")]
 fn path_key(path: &str) -> Result<String, SeedError> {
     Ok(safe_relative(path)?.into_iter().map(|component| component.to_lowercase()).collect::<Vec<_>>().join("/"))
 }
 
+#[cfg(target_os = "linux")]
 fn validate_digest(digest: &str) -> Result<(), SeedError> {
     if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
         Ok(())
@@ -856,10 +744,12 @@ fn validate_digest(digest: &str) -> Result<(), SeedError> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(target_os = "linux")]
 fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0; COPY_BUFFER_BYTES];
@@ -873,79 +763,41 @@ fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn read_cap_file(root: &Dir, path: &str, limit: u64) -> Result<Vec<u8>, SeedError> {
-    let file = open_cap_file(root, path)?;
-    let length = file.metadata().map_err(|_| SeedError::Io)?.len();
-    if length > limit {
-        return Err(SeedError::Manifest);
-    }
-    let capacity = usize::try_from(length).map_err(|_| SeedError::Manifest)?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(limit + 1).read_to_end(&mut bytes).map_err(|_| SeedError::Io)?;
-    if bytes.len() as u64 > limit {
-        return Err(SeedError::Manifest);
-    }
-    Ok(bytes)
+#[cfg(target_os = "linux")]
+fn current_target() -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    { "x86_64-unknown-linux-gnu" }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    { "x86_64-apple-darwin" }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    { "aarch64-apple-darwin" }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    { "x86_64-pc-windows-msvc" }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(windows, target_arch = "x86_64")
+    )))]
+    { "unsupported" }
 }
 
-fn open_cap_file(root: &Dir, path: &str) -> Result<cap_std::fs::File, SeedError> {
-    let components = safe_relative(path)?;
-    let (parent, name) = traverse_parent(root, &components)?;
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    let file = parent.open_with(name, &options).map_err(|_| SeedError::Io)?;
-    if !file.metadata().map_err(|_| SeedError::Io)?.is_file() {
-        return Err(SeedError::UnsafePath);
-    }
-    Ok(file)
-}
-
-fn open_cap_directory(root: &Dir, path: &str) -> Result<Dir, SeedError> {
-    let components = safe_relative(path)?;
-    let mut current = root.try_clone().map_err(|_| SeedError::Io)?;
-    for component in components {
-        current = open_child_dir(&current, &component)?;
-    }
-    Ok(current)
-}
-
-fn traverse_parent(root: &Dir, components: &[String]) -> Result<(Dir, String), SeedError> {
-    let mut current = root.try_clone().map_err(|_| SeedError::Io)?;
-    for component in &components[..components.len().saturating_sub(1)] {
-        current = open_child_dir(&current, component)?;
-    }
-    Ok((current, components.last().ok_or(SeedError::UnsafePath)?.clone()))
-}
-
-fn open_parent(root: &Dir, relative: &Path) -> Result<(Dir, std::ffi::OsString), SeedError> {
-    let path = relative.to_str().ok_or(SeedError::Cleanup)?;
-    let components = safe_relative(path).map_err(|_| SeedError::Cleanup)?;
-    let (parent, name) = traverse_parent(root, &components).map_err(|_| SeedError::Cleanup)?;
-    Ok((parent, name.into()))
-}
-
-fn open_child_dir(parent: &Dir, component: &str) -> Result<Dir, SeedError> {
-    parent.open_dir_nofollow(component).map_err(|_| SeedError::Io)
-}
-
-fn identity(metadata: &cap_std::fs::Metadata) -> Identity {
-    Identity(metadata.dev(), metadata.ino())
+#[cfg(target_os = "linux")]
+fn current_node_path() -> &'static str {
+    if cfg!(windows) { NODE_PATH_WINDOWS } else { NODE_PATH_UNIX }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use serde_json::json;
-    use sha2::{Digest, Sha256};
     use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::time::{Duration, Instant};
-
-    const BETTER_PACKAGE: &str = "node_modules/better-sqlite3/package.json";
-    const BETTER_BINARY: &str = "node_modules/better-sqlite3/build/Release/better_sqlite3.node";
-    const SQL_PACKAGE: &str = "node_modules/sql.js/package.json";
-    const SQL_WASM: &str = "node_modules/sql.js/dist/sql-wasm.wasm";
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
 
     struct TempDir(PathBuf);
 
@@ -957,22 +809,16 @@ mod tests {
                 getrandom::u64().expect("random temp name")
             ));
             fs::create_dir(&path).expect("create temp directory");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("secure temp directory");
-            }
+            #[cfg(target_os = "linux")]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("secure temp directory");
             Self(path)
         }
 
         fn child(&self, name: &str) -> PathBuf {
             let path = self.0.join(name);
             fs::create_dir(&path).expect("create child directory");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("secure child directory");
-            }
+            #[cfg(target_os = "linux")]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("secure child directory");
             path
         }
     }
@@ -983,34 +829,52 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     struct Fixture {
         _temp: TempDir,
         payload: PathBuf,
         destination: PathBuf,
     }
 
+    #[cfg(target_os = "linux")]
     impl Fixture {
         fn new(node_body: &str) -> Self {
             let temp = TempDir::new();
             let payload = temp.child("payload");
             let destination = temp.child("destination");
-            let source = payload.join("runtime-seed");
-            fs::create_dir_all(source.join("node_modules/better-sqlite3/build/Release")).expect("better directories");
-            fs::create_dir_all(source.join("node_modules/sql.js/dist")).expect("sql directories");
-            fs::create_dir_all(payload.join("metadata")).expect("metadata directory");
-            fs::create_dir_all(payload.join("bin")).expect("bin directory");
-            fs::create_dir_all(payload.join("app/node_modules/durindoor")).expect("CLI directory");
-            fs::write(payload.join("app/node_modules/durindoor/cli.js"), b"cli").expect("CLI entrypoint");
-            fs::write(source.join(BETTER_PACKAGE), br#"{"name":"better-sqlite3","version":"12.6.2"}"#).expect("better package");
-            fs::write(source.join(BETTER_BINARY), b"native").expect("better binary");
-            fs::write(source.join(SQL_PACKAGE), br#"{"name":"sql.js","version":"1.14.1"}"#).expect("sql package");
-            fs::write(source.join(SQL_WASM), b"\0asm").expect("sql wasm");
-            let node = payload.join(current_node_path());
-            fs::write(&node, node_body).expect("fake node");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).expect("executable fake node");
+            for directory in [
+                "runtime-seed/node_modules/better-sqlite3/build/Release",
+                "runtime-seed/node_modules/better-sqlite3/lib",
+                "runtime-seed/node_modules/sql.js/dist",
+                "metadata",
+                "bin",
+                "app/node_modules/durindoor",
+                "licenses",
+            ] {
+                fs::create_dir_all(payload.join(directory)).expect("fixture directory");
+            }
+            let writes: [(&str, &[u8]); 12] = [
+                ("runtime-seed/node_modules/better-sqlite3/package.json", br#"{"name":"better-sqlite3","version":"12.6.2"}"#),
+                ("runtime-seed/node_modules/better-sqlite3/lib/index.js", b"module.exports = {}"),
+                ("runtime-seed/node_modules/better-sqlite3/build/Release/better_sqlite3.node", b"native"),
+                ("runtime-seed/node_modules/sql.js/package.json", br#"{"name":"sql.js","version":"1.14.1"}"#),
+                ("runtime-seed/node_modules/sql.js/dist/sql-wasm.js", b"module.exports = {}"),
+                ("runtime-seed/node_modules/sql.js/dist/sql-wasm.wasm", b"\0asm"),
+                (CLI_PATH, b"cli"),
+                (DURINDOOR_LICENSE_PATH, b"durindoor license"),
+                (NODE_LICENSE_PATH, b"node license"),
+                (NOTICES_PATH, b"notices"),
+                (current_node_path(), node_body.as_bytes()),
+                ("placeholder", b"placeholder"),
+            ];
+            for (path, bytes) in writes {
+                let target = payload.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).expect("write parent");
+                }
+                fs::write(&target, bytes).expect("write fixture file");
+                let mode = if path == current_node_path() { 0o755 } else { 0o644 };
+                fs::set_permissions(&target, fs::Permissions::from_mode(mode)).expect("fixture mode");
             }
             let fixture = Self { _temp: temp, payload, destination };
             fixture.rebuild_authority();
@@ -1018,55 +882,61 @@ mod tests {
         }
 
         fn source(&self) -> PathBuf {
-            self.payload.join("runtime-seed")
+            self.payload.join(RUNTIME_SEED_PATH)
         }
 
         fn rebuild_authority(&self) {
             let mut files = Vec::new();
             collect_manifest_files(&self.source(), &self.source(), &mut files);
-            files.sort_by(|left, right| collision_key(&left["path"].as_str().expect("path")).cmp(&collision_key(right["path"].as_str().expect("path"))));
+            files.sort_by(|left, right| {
+                path_key(left["path"].as_str().expect("left path")).expect("left key")
+                    .cmp(&path_key(right["path"].as_str().expect("right path")).expect("right key"))
+            });
             let manifest = format!("{}\n", serde_json::to_string_pretty(&json!({ "schemaVersion": 1, "files": files })).expect("manifest JSON"));
-            fs::write(self.payload.join("metadata/runtime-seed-manifest.json"), &manifest).expect("write manifest");
+            fs::write(self.payload.join(MANIFEST_PATH), &manifest).expect("write manifest");
+            fs::set_permissions(self.payload.join(MANIFEST_PATH), fs::Permissions::from_mode(0o644)).expect("manifest mode");
             let count = files.len();
             let total: u64 = files.iter().map(|file| file["size"].as_u64().expect("size")).sum();
             let descriptor = json!({
                 "schemaVersion": 1,
                 "target": current_target(),
-                "durindoorVersion": "3.15.2",
-                "nodeVersion": "20.20.2",
-                "nodeAbi": "115",
+                "durindoorVersion": DURINDOOR_VERSION,
+                "nodeVersion": NODE_VERSION,
+                "nodeAbi": NODE_ABI,
                 "toolchain": {
                     "python": { "name": "python", "version": "Python 3", "sha256": digest(b"python") },
                     "cc": { "name": "cc", "version": "cc 1", "sha256": digest(b"cc") },
                     "cxx": { "name": "cxx", "version": "cxx 1", "sha256": digest(b"cxx") }
                 },
-                "cli": "app/node_modules/durindoor/cli.js",
+                "cli": CLI_PATH,
                 "node": current_node_path(),
-                "runtimeSeedPath": "runtime-seed",
+                "runtimeSeedPath": RUNTIME_SEED_PATH,
                 "runtimeSeedManifest": {
-                    "path": "metadata/runtime-seed-manifest.json",
+                    "path": MANIFEST_PATH,
                     "sha256": digest(manifest.as_bytes()),
                     "fileCount": count,
                     "totalBytes": total,
                     "destination": "data-runtime-root",
                     "probeVersion": 1,
                     "modules": {
-                        "betterSqlite3": { "packagePath": BETTER_PACKAGE, "binaryPath": BETTER_BINARY, "version": "12.6.2" },
-                        "sqlJs": { "packagePath": SQL_PACKAGE, "wasmPath": SQL_WASM, "version": "1.14.1" }
+                        "betterSqlite3": { "packagePath": BETTER_PACKAGE, "binaryPath": BETTER_BINARY, "version": BETTER_SQLITE_VERSION },
+                        "sqlJs": { "packagePath": SQL_PACKAGE, "wasmPath": SQL_WASM, "version": SQL_JS_VERSION }
                     }
                 },
                 "managedLaunchReady": false,
                 "licenses": {
-                    "durindoor": "licenses/durindoor-LICENSE",
-                    "node": "licenses/node-LICENSE",
-                    "notices": "licenses/THIRD_PARTY_NOTICES.json",
-                    "sha256": { "durindoor": digest(b"d"), "node": digest(b"n"), "notices": digest(b"l") }
+                    "durindoor": DURINDOOR_LICENSE_PATH,
+                    "node": NODE_LICENSE_PATH,
+                    "notices": NOTICES_PATH,
+                    "sha256": { "durindoor": digest(b"durindoor license"), "node": digest(b"node license"), "notices": digest(b"notices") }
                 }
             });
             fs::write(self.payload.join("payload.json"), format!("{}\n", serde_json::to_string_pretty(&descriptor).expect("descriptor JSON"))).expect("write descriptor");
+            fs::set_permissions(self.payload.join("payload.json"), fs::Permissions::from_mode(0o644)).expect("descriptor mode");
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn collect_manifest_files(root: &Path, directory: &Path, files: &mut Vec<serde_json::Value>) {
         for entry in fs::read_dir(directory).expect("read seed directory") {
             let entry = entry.expect("seed entry");
@@ -1076,13 +946,7 @@ mod tests {
             } else {
                 let path = entry.path().strip_prefix(root).expect("relative seed path").to_string_lossy().replace('\\', "/");
                 let bytes = fs::read(entry.path()).expect("seed bytes");
-                #[cfg(unix)]
-                let executable = {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.permissions().mode() & 0o111 != 0
-                };
-                #[cfg(not(unix))]
-                let executable = false;
+                let executable = metadata.permissions().mode() & 0o111 != 0;
                 files.push(json!({ "path": path, "size": bytes.len(), "sha256": digest(&bytes), "executable": executable }));
             }
         }
@@ -1092,239 +956,183 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
-    fn collision_key(path: &str) -> String {
-        path.to_lowercase()
-    }
-
-    #[cfg(unix)]
-    const SUCCESS_NODE: &str = "#!/bin/sh\n[ -z \"$MELON_SECRET_TOKEN\" ] || exit 9\nprintf 'melon-runtime-seed-probe-v1-ok\\n'\n";
-    #[cfg(windows)]
-    const SUCCESS_NODE: &str = "";
-
     #[test]
-    fn installs_into_empty_destination_and_reuses_exact_partial_files() {
-        let fixture = Fixture::new(SUCCESS_NODE);
-        fs::create_dir_all(fixture.destination.join("node_modules/sql.js/dist")).expect("partial directories");
-        fs::copy(fixture.source().join(SQL_WASM), fixture.destination.join(SQL_WASM)).expect("partial exact file");
-        let before = fs::metadata(fixture.destination.join(SQL_WASM)).expect("partial metadata");
-
-        let outcome = install_runtime_seed(&fixture.payload, &fixture.destination).expect("install seed");
-
-        assert_eq!(outcome.created_files, 3);
-        assert_eq!(outcome.reused_files, 1);
-        assert_eq!(fs::metadata(fixture.destination.join(SQL_WASM)).expect("reused metadata").modified().ok(), before.modified().ok());
-        for path in [BETTER_PACKAGE, BETTER_BINARY, SQL_PACKAGE, SQL_WASM] {
-            assert_eq!(fs::read(fixture.destination.join(path)).expect("installed file"), fs::read(fixture.source().join(path)).expect("source file"));
-        }
-    }
-
-    #[test]
-    fn conflicting_existing_file_is_preserved_and_new_files_roll_back() {
-        let fixture = Fixture::new(SUCCESS_NODE);
-        let conflict = fixture.destination.join(SQL_WASM);
-        fs::create_dir_all(conflict.parent().expect("conflict parent")).expect("conflict directories");
-        fs::write(&conflict, b"user-owned").expect("conflict file");
-
-        let error = install_runtime_seed(&fixture.payload, &fixture.destination).expect_err("conflict must fail");
-
-        assert!(matches!(error, SeedError::Conflict));
-        assert_eq!(fs::read(conflict).expect("preserved conflict"), b"user-owned");
-        assert!(!fixture.destination.join(BETTER_PACKAGE).exists(), "new files rolled back");
-    }
-
-    #[test]
-    fn manifest_tamper_missing_and_extra_source_files_fail_closed() {
-        for mutation in ["tamper", "missing", "extra"] {
-            let fixture = Fixture::new(SUCCESS_NODE);
-            match mutation {
-                "tamper" => fs::write(fixture.payload.join("metadata/runtime-seed-manifest.json"), b"{}\n").expect("tamper manifest"),
-                "missing" => fs::remove_file(fixture.source().join(SQL_WASM)).expect("remove source"),
-                "extra" => fs::write(fixture.source().join("extra"), b"extra").expect("extra source"),
-                _ => unreachable!(),
-            }
-            assert!(install_runtime_seed(&fixture.payload, &fixture.destination).is_err(), "{mutation} rejected");
-            assert!(fs::read_dir(&fixture.destination).expect("destination entries").next().is_none());
-        }
-    }
-
-    #[test]
-    fn strict_descriptor_and_package_versions_are_enforced() {
-        let fixture = Fixture::new(SUCCESS_NODE);
-        let descriptor_path = fixture.payload.join("payload.json");
-        let mut descriptor: serde_json::Value = serde_json::from_slice(&fs::read(&descriptor_path).expect("descriptor")).expect("descriptor JSON");
-        descriptor["unexpected"] = json!(true);
-        fs::write(&descriptor_path, serde_json::to_vec(&descriptor).expect("descriptor bytes")).expect("unknown field");
-        assert!(matches!(install_runtime_seed(&fixture.payload, &fixture.destination), Err(SeedError::Descriptor)));
-
-        let fixture = Fixture::new(SUCCESS_NODE);
-        fs::write(fixture.source().join(BETTER_PACKAGE), br#"{"name":"better-sqlite3","version":"0.0.0"}"#).expect("wrong version");
-        fixture.rebuild_authority();
-        assert!(matches!(install_runtime_seed(&fixture.payload, &fixture.destination), Err(SeedError::Manifest)));
-    }
-    #[cfg(windows)]
-    #[test]
-    fn windows_descriptor_uses_builder_node_path() {
-        assert_eq!(current_node_path(), "bin/node.exe");
-    }
-
-
-    #[cfg(unix)]
-    #[test]
-    fn unsafe_source_destination_links_and_special_files_are_rejected() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-        let fixture = Fixture::new(SUCCESS_NODE);
-        let outside = fixture._temp.child("outside");
-
-        fs::remove_dir(&fixture.destination).expect("remove destination");
-        symlink(&outside, &fixture.destination).expect("destination symlink");
-        assert!(install_runtime_seed(&fixture.payload, &fixture.destination).is_err());
-
-        let fixture = Fixture::new(SUCCESS_NODE);
-        let wasm = fixture.source().join(SQL_WASM);
-        fs::remove_file(&wasm).expect("remove wasm");
-        symlink("elsewhere", &wasm).expect("source symlink");
-        assert!(install_runtime_seed(&fixture.payload, &fixture.destination).is_err());
-
-        let fixture = Fixture::new(SUCCESS_NODE);
-        let special = fixture.source().join(SQL_WASM);
-        fs::remove_file(&special).expect("remove wasm");
-        let special_c = std::ffi::CString::new(special.as_os_str().as_encoded_bytes()).expect("FIFO path");
-        assert_eq!(unsafe { libc::mkfifo(special_c.as_ptr(), 0o600) }, 0);
-        assert!(install_runtime_seed(&fixture.payload, &fixture.destination).is_err());
-
-        let fixture = Fixture::new(SUCCESS_NODE);
-        fs::set_permissions(&fixture.destination, fs::Permissions::from_mode(0o755)).expect("unsafe destination mode");
-        assert!(install_runtime_seed(&fixture.payload, &fixture.destination).is_err());
-    }
-
-    #[test]
-    fn probe_failure_rolls_back_only_new_identity_retained_objects() {
-        let fixture = Fixture::new(SUCCESS_NODE);
-        fs::create_dir_all(fixture.destination.join("node_modules/sql.js/dist")).expect("existing directories");
-        fs::copy(fixture.source().join(SQL_WASM), fixture.destination.join(SQL_WASM)).expect("existing exact file");
-
-        let error = install_runtime_seed_with_probe(&fixture.payload, &fixture.destination, |_| Err(SeedError::ProbeFailed))
-            .expect_err("probe failure");
-
-        assert!(matches!(error, SeedError::ProbeFailed));
-        assert_eq!(fs::read(fixture.destination.join(SQL_WASM)).expect("pre-existing file remains"), b"\0asm");
-        assert!(!fixture.destination.join(BETTER_PACKAGE).exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn validated_node_handle_survives_path_replacement() {
-        let fixture = Fixture::new(SUCCESS_NODE);
-        let validated = validate_seed(&fixture.payload).expect("validate seed");
-        let node = fixture.payload.join(current_node_path());
-        fs::rename(&node, node.with_extension("validated")).expect("move validated node path");
-        fs::write(&node, "#!/bin/sh\nexit 91\n").expect("replace node path");
-        let probe = probe_node(&validated).expect("resolve retained node handle");
-
-        let status = Command::new(&probe.path).env_clear().status().expect("run retained node");
-
-        assert!(status.success(), "replacement path was not executed");
-    }
-
-    #[test]
-    fn rollback_cleanup_failure_is_reported_without_unlinking_replacement() {
-        let fixture = Fixture::new(SUCCESS_NODE);
-        let replacement = fixture.destination.join(BETTER_PACKAGE);
-        let error = install_runtime_seed_with_probe(&fixture.payload, &fixture.destination, |_| {
-            fs::remove_file(&replacement).expect("remove newly-created file");
-            fs::create_dir(&replacement).expect("replace file with directory identity");
-            Err(SeedError::ProbeFailed)
-        }).expect_err("cleanup failure");
-
-        assert!(matches!(error, SeedError::Cleanup), "{error:?}");
-        assert!(replacement.is_dir(), "replacement preserved");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fixed_probe_succeeds_with_scrubbed_environment_and_retry() {
-        let fixture = Fixture::new(SUCCESS_NODE);
-        unsafe { std::env::set_var("MELON_SECRET_TOKEN", "must-not-leak") };
-        let first = install_runtime_seed(&fixture.payload, &fixture.destination).expect("first install");
-        unsafe { std::env::remove_var("MELON_SECRET_TOKEN") };
-        let second = install_runtime_seed(&fixture.payload, &fixture.destination).expect("retry exact install");
-        assert_eq!(first.created_files, 4);
-        assert_eq!(second.reused_files, 4);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fixed_probe_failure_is_redacted_and_preserves_exact_preexisting_files() {
-        let fixture = Fixture::new("#!/bin/sh\nsleep 10 &\nprintf 'plaintext secret' >&2\nexit 7\n");
-        for path in [BETTER_PACKAGE, BETTER_BINARY, SQL_PACKAGE, SQL_WASM] {
-            let destination = fixture.destination.join(path);
-            fs::create_dir_all(destination.parent().expect("destination parent")).expect("destination directories");
-            fs::copy(fixture.source().join(path), destination).expect("pre-existing exact file");
-        }
-        let started = Instant::now();
-        let error = install_runtime_seed(&fixture.payload, &fixture.destination).expect_err("probe failure");
-        assert!(matches!(error, SeedError::ProbeFailed), "{error:?}");
-        assert!(!error.to_string().contains("secret"));
-        assert!(started.elapsed() < Duration::from_secs(5), "nonzero probe and descendants are bounded");
-        for path in [BETTER_PACKAGE, BETTER_BINARY, SQL_PACKAGE, SQL_WASM] {
-            assert!(fixture.destination.join(path).exists(), "pre-existing {path} remains");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fixed_probe_timeout_is_bounded_and_reaped() {
-        let fixture = Fixture::new("#!/bin/sh\nsleep 10\n");
-        let started = Instant::now();
-        let error = install_runtime_seed(&fixture.payload, &fixture.destination).expect_err("probe must time out");
-        assert!(matches!(error, SeedError::ProbeTimeout), "{error:?}");
-        assert!(started.elapsed() < Duration::from_secs(5), "probe and reap are bounded");
-        assert!(fs::read_dir(&fixture.destination).expect("destination entries").all(|entry| entry.expect("destination entry").file_name() == DESTINATION_LOCK), "failed probe rolled back");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fixed_probe_output_cap_is_bounded_and_reaped() {
-        let fixture = Fixture::new("#!/bin/sh\ntrap '' PIPE\nwhile :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' || :; done\n");
-        let started = Instant::now();
-        let error = install_runtime_seed(&fixture.payload, &fixture.destination).expect_err("probe output must exceed cap");
-        assert!(matches!(error, SeedError::ProbeOutputLimit), "{error:?}");
-        assert!(started.elapsed() < Duration::from_secs(5), "probe and reap are bounded");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn same_destination_is_serialized_across_processes() {
-        if let Ok(root) = std::env::var("MELON_SEED_CHILD_ROOT") {
-            let payload = PathBuf::from(&root).join("payload");
-            let destination = PathBuf::from(&root).join("destination");
-            let result = install_runtime_seed(&payload, &destination);
-            fs::write(PathBuf::from(root).join(format!("done-{}", std::process::id())), format!("{result:?}")).expect("child result");
-            assert!(result.is_ok());
-            return;
-        }
-        let fixture = Fixture::new("#!/bin/sh\nsleep 1\nprintf 'melon-runtime-seed-probe-v1-ok\\n'\n");
-        let spawn = || Command::new(std::env::current_exe().expect("test binary"))
-            .arg("runtime_seed::tests::same_destination_is_serialized_across_processes")
-            .arg("--exact")
-            .env("MELON_SEED_CHILD_ROOT", &fixture._temp.0)
-            .spawn()
-            .expect("seed child");
-        let mut first = spawn();
-        std::thread::sleep(Duration::from_millis(100));
-        let mut second = spawn();
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(second.try_wait().expect("second state").is_none(), "second install waits for destination lock");
-        assert!(first.wait().expect("first exit").success());
-        assert!(second.wait().expect("second exit").success());
-    }
-
-    #[test]
-    #[ignore = "requires an unpacked target-native payload matching this host; native runner evidence only"]
-    fn real_native_payload_fixture_runs_probe_when_explicitly_supplied() {
-        let payload = PathBuf::from(std::env::var_os("MELON_NATIVE_PAYLOAD_ROOT").expect("MELON_NATIVE_PAYLOAD_ROOT"));
+    fn install_fails_closed_before_destination_mutation() {
         let temp = TempDir::new();
+        let payload = temp.child("payload");
         let destination = temp.child("destination");
-        install_runtime_seed(&payload, &destination).expect("native payload seed and probe");
+        let error = install_runtime_seed(&payload, &destination).expect_err("installation remains blocked");
+        let expected = if cfg!(target_os = "linux") { SeedError::NativeProbeRequired } else { SeedError::UnsupportedPlatform };
+        assert_eq!(error, expected);
+        assert!(fs::read_dir(destination).expect("destination entries").next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_descriptor_paths_and_abi_are_required() {
+        for (pointer, replacement) in [
+            ("/nodeAbi", json!("116")),
+            ("/runtimeSeedPath", json!("other")),
+            ("/runtimeSeedManifest/path", json!("other.json")),
+            ("/runtimeSeedManifest/modules/betterSqlite3/packagePath", json!("node_modules/other/package.json")),
+            ("/runtimeSeedManifest/modules/sqlJs/wasmPath", json!("node_modules/other.wasm")),
+            ("/cli", json!("other.js")),
+            ("/licenses/node", json!("other-license")),
+        ] {
+            let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+            let path = fixture.payload.join("payload.json");
+            let mut descriptor: serde_json::Value = serde_json::from_slice(&fs::read(&path).expect("descriptor")).expect("JSON");
+            *descriptor.pointer_mut(pointer).expect("descriptor pointer") = replacement;
+            fs::write(&path, serde_json::to_vec(&descriptor).expect("descriptor bytes")).expect("mutate descriptor");
+            assert!(matches!(validate_seed(&fixture.payload), Err(SeedError::Descriptor)), "{pointer}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_hardlinks_and_unsafe_modes_are_rejected() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let package = fixture.source().join(BETTER_PACKAGE);
+        fs::hard_link(&package, fixture.source().join("alias")).expect("hardlink alias");
+        fixture.rebuild_authority();
+        assert!(matches!(validate_seed(&fixture.payload), Err(SeedError::Manifest)));
+
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        fs::set_permissions(fixture.source().join(SQL_WASM), fs::Permissions::from_mode(0o666)).expect("unsafe mode");
+        fixture.rebuild_authority();
+        assert!(matches!(validate_seed(&fixture.payload), Err(SeedError::Manifest)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestor_symlinks_are_rejected() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let link = fixture._temp.0.join("payload-link");
+        symlink(&fixture.payload, &link).expect("payload link");
+        assert!(matches!(validate_seed(&link), Err(SeedError::UnsafePath)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_capabilities_survive_payload_ancestor_replacement() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let payload = open_private_root(&fixture.payload).expect("payload");
+        let source = open_cap_directory(&payload, RUNTIME_SEED_PATH).expect("source");
+        let node = open_cap_file(&payload, current_node_path()).expect("node");
+        let validated = probe_context(node, source);
+        fs::write(fixture.payload.join(current_node_path()), "#!/bin/sh\nprintf 'melon-runtime-seed-probe-v1-ok\\n'\n").expect("success node");
+        let moved = fixture._temp.0.join("payload-moved");
+        fs::rename(&fixture.payload, &moved).expect("move payload namespace");
+        fs::create_dir(&fixture.payload).expect("replace payload namespace");
+
+        let retained = inherited_dir_path(&validated.source).expect("retained source path");
+        assert_eq!(fs::read(retained.path.join(SQL_WASM)).expect("read retained WASM"), b"\0asm");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn critical_path_replacement_is_detected_after_probe() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let payload = open_private_root(&fixture.payload).expect("payload");
+        let source = open_cap_directory(&payload, RUNTIME_SEED_PATH).expect("source");
+        let node = open_cap_file(&payload, current_node_path()).expect("node");
+        let mut validated = probe_context(node, source);
+        fs::write(fixture.payload.join(current_node_path()), "#!/bin/sh\nprintf 'melon-runtime-seed-probe-v1-ok\\n'\n").expect("success node");
+        validated.critical = [BETTER_PACKAGE, BETTER_ENTRY, BETTER_BINARY, SQL_PACKAGE, SQL_ENTRY, SQL_WASM]
+            .into_iter()
+            .map(|path| {
+                let file = open_cap_file(&validated.source, path).expect("critical file");
+                CriticalFile { path, identity: identity(&file.metadata().expect("critical metadata")), file }
+            })
+            .collect();
+        let wasm = fixture.source().join(SQL_WASM);
+        fs::rename(&wasm, wasm.with_extension("validated")).expect("move validated WASM");
+        fs::write(&wasm, b"replacement").expect("replace WASM path");
+        fs::set_permissions(&wasm, fs::Permissions::from_mode(0o644)).expect("replacement mode");
+
+        run_probe_v1(&validated, PROBE_V1).expect("probe uses retained root");
+        assert_eq!(revalidate_seed(&validated).expect_err("replacement rejected"), SeedError::Manifest);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonzero_direct_exit_with_descendant_is_bounded_and_absent() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let source = open_cap_directory(&open_private_root(&fixture.payload).expect("payload"), RUNTIME_SEED_PATH).expect("source");
+        let marker = fixture._temp.0.join("descendant.pid");
+        let node_path = fixture.payload.join(current_node_path());
+        fs::write(&node_path, format!("#!/bin/sh\nsleep 10 &\necho $! > '{}'\nexit 7\n", marker.display())).expect("failure node");
+        let node = cap_std::fs::File::from_std(fs::File::open(node_path).expect("node handle"));
+        let validated = probe_context(node, source);
+        let started = Instant::now();
+
+        assert_eq!(run_probe_v1(&validated, PROBE_V1).expect_err("nonzero probe"), SeedError::ProbeFailed);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid: libc::pid_t = fs::read_to_string(marker).expect("descendant pid").trim().parse().expect("PID");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "owned descendant remains absent");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_child_timeout_is_bounded() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let source = open_cap_directory(&open_private_root(&fixture.payload).expect("payload"), RUNTIME_SEED_PATH).expect("source");
+        let node_path = fixture.payload.join(current_node_path());
+        fs::write(&node_path, "#!/bin/sh\nsleep 10\n").expect("timeout node");
+        let node = cap_std::fs::File::from_std(fs::File::open(node_path).expect("node handle"));
+        let validated = probe_context(node, source);
+        let started = Instant::now();
+
+        assert_eq!(run_probe_v1(&validated, PROBE_V1).expect_err("timeout probe"), SeedError::ProbeTimeout);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_capture_is_bounded_without_reader_threads() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let source = open_cap_directory(&open_private_root(&fixture.payload).expect("payload"), RUNTIME_SEED_PATH).expect("source");
+        let node_path = fixture.payload.join(current_node_path());
+        fs::write(&node_path, "#!/bin/sh\nwhile :; do printf x; done\n").expect("output node");
+        let node = cap_std::fs::File::from_std(fs::File::open(node_path).expect("node handle"));
+        let validated = probe_context(node, source);
+        let started = Instant::now();
+
+        assert_eq!(run_probe_v1(&validated, PROBE_V1).expect_err("output cap"), SeedError::ProbeOutputLimit);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_writer_cannot_block_probe_completion() {
+        let fixture = Fixture::new("#!/bin/sh\nexit 1\n");
+        let source = open_cap_directory(&open_private_root(&fixture.payload).expect("payload"), RUNTIME_SEED_PATH).expect("source");
+        let node_path = fixture.payload.join(current_node_path());
+        fs::write(&node_path, "#!/bin/sh\n(sleep 10) &\nprintf 'melon-runtime-seed-probe-v1-ok\\n'\n").expect("writer node");
+        let node = cap_std::fs::File::from_std(fs::File::open(node_path).expect("node handle"));
+        let validated = probe_context(node, source);
+        let started = Instant::now();
+
+        run_probe_v1(&validated, PROBE_V1).expect("tree stop closes inherited writer");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires MELON_NATIVE_PAYLOAD_ROOT on a target-native release runner"]
+    fn release_gate_exercises_real_native_modules_when_payload_is_supplied() {
+        let payload = std::env::var_os("MELON_NATIVE_PAYLOAD_ROOT").expect("MELON_NATIVE_PAYLOAD_ROOT");
+        let validated = validate_seed(Path::new(&payload)).expect("validate native payload");
+        run_probe_v1(&validated, PROBE_V1).expect("real native probe");
+
+        let native_mutation = PROBE_V1.replacen("!== 1", "=== 1", 1);
+        assert_eq!(run_probe_v1(&validated, &native_mutation).expect_err("native query mutation must fail"), SeedError::ProbeFailed);
+        let (prefix, suffix) = PROBE_V1.rsplit_once("!== 1").expect("WASM predicate");
+        let wasm_mutation = format!("{prefix}=== 1{suffix}");
+        assert_eq!(run_probe_v1(&validated, &wasm_mutation).expect_err("WASM query mutation must fail"), SeedError::ProbeFailed);
     }
 }
