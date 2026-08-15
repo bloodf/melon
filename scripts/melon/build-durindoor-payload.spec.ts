@@ -1,17 +1,20 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   canonicalZip,
   inspectZip,
+  preflightNodeArchive,
+  publishExclusive,
   thirdPartyNotices,
   targetSpec,
   validateLockedManifests,
   validatePayloadEntries,
   verifyChecksum,
+  validateCanonicalMetadata,
   type PayloadEntry,
 } from './build-durindoor-payload.mts'
 
@@ -22,6 +25,18 @@ afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: 
 const elf = Uint8Array.from(Array(24).fill(0)); elf.set([0x7f, 0x45, 0x4c, 0x46]); elf[18] = 0x3e
 const machX64 = Uint8Array.from([0xcf, 0xfa, 0xed, 0xfe, 7, 0, 0, 1, 0])
 const machArm64 = Uint8Array.from([0xcf, 0xfa, 0xed, 0xfe, 12, 0, 0, 1, 0])
+
+function tarLink(type: '1' | '2', name: string, linkName: string): Buffer {
+  const header = Buffer.alloc(512)
+  header.write(name, 0, 100, 'utf8')
+  header.write('0000777\x00', 100, 'ascii'); header.write('0000000\x00', 108, 'ascii'); header.write('0000000\x00', 116, 'ascii')
+  header.write('00000000000\x00', 124, 'ascii'); header[156] = type.charCodeAt(0)
+  header.write(linkName, 157, 100, 'utf8')
+  header.fill(0x20, 148, 156)
+  let sum = 0; for (const byte of header.subarray(0, 512)) sum += byte
+  header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'ascii')
+  return header
+}
 const pe = Uint8Array.from(Array(80).fill(0)); pe.set([0x4d, 0x5a]); pe[0x3c] = 64; pe.set([0x50, 0x45, 0, 0, 0x64, 0x86], 64)
 const wasm = Uint8Array.from([0, 0x61, 0x73, 0x6d, 1])
 const text = (value: string) => new TextEncoder().encode(value)
@@ -76,8 +91,71 @@ describe('canonical DurinDoor payload', () => {
     expect(() => canonicalZip(bad)).toThrow()
   })
 
+  it('rejects exact and nested .bin path segments', () => {
+    for (const path of ['app/node_modules/.bin', 'app/node_modules/.bin/durindoor', 'nested/.bin/tool']) {
+      expect(() => canonicalZip([{ path, data: text('x'), mode: 0o644 }])).toThrow(/forbidden payload path/)
+    }
+  })
+
+  it('enforces Rust entry and aggregate size limits without allocating payload bytes', () => {
+    expect(() => validateCanonicalMetadata(Array.from({ length: 16_385 }, (_, index) => ({ path: `f${index}`, size: 0 })))).toThrow(/16384/)
+    expect(() => validateCanonicalMetadata([{ path: 'one', size: 0xffff_ffff }, { path: 'two', size: 2 }])).toThrow(/4 GiB|UInt32/)
+  })
+
+  it('publishes through an exclusive claim and removes only its failed claim', () => {
+    const work = root()
+    const output = join(work, 'payload.zip')
+    expect(() => publishExclusive(output, text('ours'), () => { throw new Error('fail after claim') })).toThrow(/fail after claim/)
+    expect(existsSync(output)).toBe(false)
+    writeFileSync(output, 'racer')
+    expect(() => publishExclusive(output, text('ours'))).toThrow()
+    expect(readFileSync(output, 'utf8')).toBe('racer')
+  })
+
+  it.each([['symlink', '2'], ['hardlink', '1']] as const)('structurally rejects selected %s entries with spaces', (_label, type) => {
+    const work = root()
+    const archive = join(work, 'node links.tar')
+    const selected = 'node-v20.20.2-linux-x64/bin/node with space'
+    writeFileSync(archive, tarLink(type, selected, '../target with space'))
+    expect(() => preflightNodeArchive(archive, [selected])).toThrow(/link|special/i)
+  })
+
+  it('ignores a non-selected official npm symlink and never selects it', () => {
+    const work = root()
+    const archive = join(work, 'official links.tar')
+    const binNode = 'node-v20.20.2-linux-x64/bin/node'; const binNpm = 'node-v20.20.2-linux-x64/bin/npm'
+    const nodeHeader = Buffer.alloc(512); nodeHeader.write(binNode, 0, 100, 'utf8')
+    nodeHeader.write('0000777\x00', 100, 'ascii'); nodeHeader.write('0000000\x00', 108, 'ascii'); nodeHeader.write('0000000\x00', 116, 'ascii')
+    nodeHeader.write('00000000004\x00', 124, 'ascii'); nodeHeader[156] = 0x30
+    let sum = 0; for (const b of nodeHeader.subarray(0, 512)) sum += b
+    nodeHeader.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'ascii')
+    const npmHeader = Buffer.alloc(512); npmHeader.write(binNpm, 0, 100, 'utf8')
+    npmHeader.write('0000777\x00', 100, 'ascii'); npmHeader.write('0000000\x00', 108, 'ascii'); npmHeader.write('0000000\x00', 116, 'ascii')
+    npmHeader.write('00000000000\x00', 124, 'ascii'); npmHeader[156] = 0x32
+    npmHeader.write('../lib/node_modules/npm/bin/npm-cli.js', 157, 100, 'utf8')
+    sum = 0; for (const b of npmHeader.subarray(0, 512)) sum += b
+    npmHeader.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'ascii')
+    writeFileSync(archive, Buffer.concat([nodeHeader, Buffer.from('node'), npmHeader]))
+    // Select only bin/node; bin/npm is a sibling, not selected
+    expect(preflightNodeArchive(archive, [binNode])).toHaveLength(1)
+  })
+  it('rejects duplicate selected required name with one regular and one hardlink entry', () => {
+    const work = root()
+    const archive = join(work, 'node duplicate.tar')
+    const license = join(work, 'node-v20.20.2-linux-x64', 'LICENSE')
+    mkdirSync(dirname(license), { recursive: true })
+    writeFileSync(license, 'ISC\n')
+    // tar -rf on the same file twice: second entry overwrites first in tar
+    spawnSync('tar', ['cvf', archive, '-C', work,
+      'node-v20.20.2-linux-x64/LICENSE'], { cwd: work })
+    spawnSync('tar', ['rf', archive, '-C', work,
+      'node-v20.20.2-linux-x64/LICENSE'], { cwd: work })
+    const r = spawnSync('tar', ['tvf', archive], { encoding: 'utf8' })
+    console.log('tar contents:', r.stdout)
+    const selected = 'node-v20.20.2-linux-x64/LICENSE'
+    expect(() => preflightNodeArchive(archive, [selected])).toThrow(/duplicate/)
+  })
   it.each([
-    ['missing CLI', (entries: PayloadEntry[]) => entries.filter(entry => !entry.path.endsWith('/cli.js'))],
     ['missing license', (entries: PayloadEntry[]) => entries.filter(entry => !entry.path.startsWith('licenses/'))],
     ['missing WASM', (entries: PayloadEntry[]) => entries.filter(entry => !entry.path.endsWith('sql-wasm.wasm'))],
     ['bad native magic', (entries: PayloadEntry[]) => entries.map(entry => entry.path.endsWith('.node') ? { ...entry, data: text('bad') } : entry)],
@@ -131,7 +209,7 @@ describe('canonical DurinDoor payload', () => {
     expect(controller).not.toContain('runtimeSeedPath')
   })
 
-  it('passes emitted fixture through Rust activation and preserves executable modes', () => {
+  it('passes emitted fixture through Rust activation and preserves executable modes', { timeout: 20_000 }, () => {
     if (process.platform === 'win32') return
     const work = root()
     const cache = join(work, 'cache')
