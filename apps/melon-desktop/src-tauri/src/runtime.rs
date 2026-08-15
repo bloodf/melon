@@ -1,10 +1,43 @@
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+#[cfg(not(windows))]
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::Permissions;
+#[cfg(unix)]
+use cap_std::fs::PermissionsExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(windows)]
+use std::mem::{offset_of, size_of};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+#[cfg(windows)]
+use std::ptr;
+#[cfg(windows)]
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+#[cfg(windows)]
+use windows_sys::Wdk::Storage::FileSystem::{
+    NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    RtlNtStatusToDosError, SetLastError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, STATUS_SUCCESS,
+    UNICODE_STRING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileDispositionInfo, FileRenameInfo, OPEN_EXISTING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -121,6 +154,7 @@ enum EntryKind {
 struct EntryPlan {
     path: PathBuf,
     kind: EntryKind,
+    mode: Option<u32>,
 }
 
 /// Verifies one candidate before rewinding and extracting it into the caller-owned empty staging directory.
@@ -144,13 +178,13 @@ fn extract_zip_with_limits(
     staging: &Path,
     limits: ExtractionLimits,
 ) -> Result<(), RuntimeError> {
-    let declared_entries = preflight_archive(reader)?;
-    if declared_entries > limits.max_entries {
+    let preflight = preflight_archive(reader)?;
+    if preflight.declared_entries > limits.max_entries {
         return Err(RuntimeError::TooManyEntries);
     }
     let staging_dir = open_empty_staging(staging)?;
-    let mut archive = ZipArchive::new(reader)?;
-    if declared_entries != archive.len() {
+    let mut archive = ZipArchive::new(MaskedReader::new(reader, preflight.false_eocd_offsets))?;
+    if preflight.declared_entries != archive.len() {
         return Err(RuntimeError::PathCollision("duplicate central-directory name".into()));
     }
     let plans = validate_entries(&mut archive, limits)?;
@@ -170,10 +204,10 @@ fn extract_zip_with_hook(
     limits: ExtractionLimits,
     hook: impl FnOnce(&Path),
 ) -> Result<(), RuntimeError> {
-    let declared_entries = preflight_archive(reader)?;
+    let preflight = preflight_archive(reader)?;
     let staging_dir = open_empty_staging(staging)?;
-    let mut archive = ZipArchive::new(reader)?;
-    if declared_entries != archive.len() {
+    let mut archive = ZipArchive::new(MaskedReader::new(reader, preflight.false_eocd_offsets))?;
+    if preflight.declared_entries != archive.len() {
         return Err(RuntimeError::PathCollision("duplicate central-directory name".into()));
     }
     let plans = validate_entries(&mut archive, limits)?;
@@ -182,26 +216,111 @@ fn extract_zip_with_hook(
     extract_entries(&mut archive, &plans, candidate.dir(), limits)?;
     candidate.publish(staging)
 }
+#[cfg(test)]
+fn extract_zip_with_publish_hook(
+    reader: &mut (impl Read + Seek),
+    staging: &Path,
+    hook: impl FnOnce(&Path),
+) -> Result<(), RuntimeError> {
+    let preflight = preflight_archive(reader)?;
+    let staging_dir = open_empty_staging(staging)?;
+    let mut archive = ZipArchive::new(MaskedReader::new(reader, preflight.false_eocd_offsets))?;
+    let plans = validate_entries(&mut archive, DEFAULT_EXTRACTION_LIMITS)?;
+    assert_eq!(preflight.declared_entries, archive.len());
+    let mut candidate = CandidateDir::create(staging, &staging_dir)?;
+    extract_entries(
+        &mut archive,
+        &plans,
+        candidate.dir(),
+        DEFAULT_EXTRACTION_LIMITS,
+    )?;
+    candidate.publish_with_hook(staging, hook)
+}
 
+
+struct MaskedReader<'a, R> {
+    inner: &'a mut R,
+    false_eocd_offsets: Vec<u64>,
+    position: u64,
+}
+
+impl<'a, R> MaskedReader<'a, R> {
+    fn new(inner: &'a mut R, false_eocd_offsets: Vec<u64>) -> Self {
+        Self {
+            inner,
+            false_eocd_offsets,
+            position: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for MaskedReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        for (index, byte) in buffer[..read].iter_mut().enumerate() {
+            let absolute = self.position + index as u64;
+            if self.false_eocd_offsets.iter().any(|offset| absolute >= *offset && absolute < *offset + 4) {
+                *byte = 0;
+            }
+        }
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for MaskedReader<'_, R> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.position = self.inner.seek(position)?;
+        Ok(self.position)
+    }
+}
 
 fn open_empty_staging(staging: &Path) -> Result<Dir, RuntimeError> {
-    let parent = staging
-        .parent()
-        .ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
-    let name = staging
-        .file_name()
-        .ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
-    let parent = Dir::open_ambient_dir(parent, ambient_authority())?;
-    let staging = parent
-        .open_dir_nofollow(name)
-        .map_err(|_| RuntimeError::StagingNotEmpty)?;
+    let staging = open_runtime_directory(staging)?;
     if staging.entries()?.next().is_some() {
         return Err(RuntimeError::StagingNotEmpty);
     }
     Ok(staging)
 }
 
-fn preflight_archive(reader: &mut (impl Read + Seek)) -> Result<usize, RuntimeError> {
+#[cfg(not(windows))]
+fn open_runtime_directory(path: &Path) -> Result<Dir, RuntimeError> {
+    Dir::open_ambient_dir(path, ambient_authority()).map_err(RuntimeError::Io)
+}
+
+#[cfg(windows)]
+fn open_runtime_directory(path: &Path) -> Result<Dir, RuntimeError> {
+    let path = wide_path(path)?;
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error().into());
+    }
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Result<Vec<u16>, RuntimeError> {
+    let path = fs::canonicalize(path)?;
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(RuntimeError::UnsafePath(path.display().to_string()));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+fn preflight_archive(reader: &mut (impl Read + Seek)) -> Result<ArchivePreflight, RuntimeError> {
     let footer = find_eocd(reader)?;
     if footer.total_entries == u16::MAX {
         return Err(RuntimeError::InvalidArchive("ZIP64 entry tables are unsupported"));
@@ -237,12 +356,21 @@ fn preflight_archive(reader: &mut (impl Read + Seek)) -> Result<usize, RuntimeEr
         reader.read_exact(&mut extra)?;
         reject_link_extra(&extra)?;
     }
-    Ok(footer.total_entries as usize)
+    Ok(ArchivePreflight {
+        declared_entries: footer.total_entries as usize,
+        false_eocd_offsets: footer.false_eocd_offsets,
+    })
+}
+
+struct ArchivePreflight {
+    declared_entries: usize,
+    false_eocd_offsets: Vec<u64>,
 }
 
 struct Eocd {
     total_entries: u16,
     central_offset: u32,
+    false_eocd_offsets: Vec<u64>,
 }
 
 fn find_eocd(reader: &mut (impl Read + Seek)) -> Result<Eocd, RuntimeError> {
@@ -254,28 +382,45 @@ fn find_eocd(reader: &mut (impl Read + Seek)) -> Result<Eocd, RuntimeError> {
     }
     let tail_length = usize::try_from(length.min((EOCD_BYTES + MAX_COMMENT_BYTES) as u64))
         .map_err(|_| RuntimeError::InvalidArchive("oversized ZIP footer"))?;
-    reader.seek(io::SeekFrom::End(-(tail_length as i64)))?;
+    let tail_start = length - tail_length as u64;
+    reader.seek(io::SeekFrom::Start(tail_start))?;
     let mut tail = vec![0; tail_length];
     reader.read_exact(&mut tail)?;
-    let offset = tail
-        .windows(4)
-        .enumerate()
-        .rev()
-        .find_map(|(offset, window)| {
-            (window == b"PK\x05\x06" && valid_eocd_candidate(&tail, offset)).then_some(offset)
-        })
-        .ok_or(RuntimeError::InvalidArchive("missing end-of-central-directory record"))?;
-    let disk = u16::from_le_bytes([tail[offset + 4], tail[offset + 5]]);
-    let directory_disk = u16::from_le_bytes([tail[offset + 6], tail[offset + 7]]);
-    let disk_entries = u16::from_le_bytes([tail[offset + 8], tail[offset + 9]]);
-    let total_entries = u16::from_le_bytes([tail[offset + 10], tail[offset + 11]]);
-    if disk != 0 || directory_disk != 0 || disk_entries != total_entries {
-        return Err(RuntimeError::InvalidArchive("multi-disk ZIPs are unsupported"));
+    let mut false_eocd_offsets = Vec::new();
+    for (offset, window) in tail.windows(4).enumerate().rev() {
+        if window != b"PK\x05\x06" || !valid_eocd_candidate(&tail, offset) {
+            continue;
+        }
+        let disk = u16::from_le_bytes([tail[offset + 4], tail[offset + 5]]);
+        let directory_disk = u16::from_le_bytes([tail[offset + 6], tail[offset + 7]]);
+        let disk_entries = u16::from_le_bytes([tail[offset + 8], tail[offset + 9]]);
+        let total_entries = u16::from_le_bytes([tail[offset + 10], tail[offset + 11]]);
+        let directory_size = u32::from_le_bytes(tail[offset + 12..offset + 16].try_into().expect("fixed field"));
+        let central_offset = u32::from_le_bytes(tail[offset + 16..offset + 20].try_into().expect("fixed field"));
+        let absolute_eocd = tail_start + offset as u64;
+        if disk == 0
+            && directory_disk == 0
+            && disk_entries == total_entries
+            && u64::from(central_offset) + u64::from(directory_size) == absolute_eocd
+            && (total_entries == 0 || central_signature(reader, central_offset)?)
+        {
+            return Ok(Eocd {
+                total_entries,
+                central_offset,
+                false_eocd_offsets,
+            });
+        }
+        false_eocd_offsets.push(absolute_eocd);
     }
-    Ok(Eocd {
-        total_entries,
-        central_offset: u32::from_le_bytes(tail[offset + 16..offset + 20].try_into().expect("fixed field")),
-    })
+    Err(RuntimeError::InvalidArchive("missing end-of-central-directory record"))
+}
+
+fn central_signature(
+    reader: &mut (impl Read + Seek),
+    offset: u32,
+) -> Result<bool, RuntimeError> {
+    reader.seek(io::SeekFrom::Start(offset.into()))?;
+    Ok(read_exact_array::<4>(reader)? == *b"PK\x01\x02")
 }
 
 fn read_exact_array<const N: usize>(reader: &mut impl Read) -> Result<[u8; N], RuntimeError> {
@@ -309,7 +454,6 @@ fn valid_eocd_candidate(tail: &[u8], offset: usize) -> bool {
     let comment_length = u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize;
     offset + 22 + comment_length == tail.len()
 }
-
 fn validate_entries<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     limits: ExtractionLimits,
@@ -329,7 +473,11 @@ fn validate_entries<R: Read + Seek>(
             return Err(RuntimeError::TooManyBytes);
         }
         register_path(&mut paths, &components, kind, entry.name())?;
-        plans.push(EntryPlan { path, kind });
+        plans.push(EntryPlan {
+            path,
+            kind,
+            mode: entry.unix_mode().map(|mode| mode & 0o777),
+        });
     }
     Ok(plans)
 }
@@ -372,7 +520,9 @@ fn windows_component_key(component: &str) -> Result<String, RuntimeError> {
         || stem
             .strip_prefix("com")
             .or_else(|| stem.strip_prefix("lpt"))
-            .is_some_and(|number| matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"));
+            .is_some_and(|number| {
+                matches!(number, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            });
     if reserved {
         return Err(RuntimeError::UnsafePath(component.into()));
     }
@@ -460,6 +610,7 @@ fn extract_entries<R: Read + Seek>(
                     }
                     output.write_all(&buffer[..read])?;
                 }
+                apply_file_mode(&output, plan.mode)?;
                 output.sync_all()?;
             } else {
                 directory = open_or_create_directory(&directory, component)?;
@@ -475,9 +626,68 @@ fn open_or_create_directory(parent: &Dir, component: &OsStr) -> Result<Dir, Runt
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    parent
-        .open_dir_nofollow(component)
+    open_child_directory(parent, component)
         .map_err(|_| RuntimeError::PathCollision(component.to_string_lossy().into_owned()))
+}
+
+#[cfg(not(windows))]
+fn open_child_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeError> {
+    parent.open_dir_nofollow(component).map_err(RuntimeError::Io)
+}
+
+#[cfg(windows)]
+fn open_child_directory(parent: &Dir, component: &OsStr) -> Result<Dir, RuntimeError> {
+    let name = component.encode_wide().collect::<Vec<_>>();
+    let byte_length = u16::try_from(name.len().checked_mul(2).ok_or(RuntimeError::UnsafePath(component.to_string_lossy().into_owned()))?)
+        .map_err(|_| RuntimeError::UnsafePath(component.to_string_lossy().into_owned()))?;
+    let mut unicode = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: name.as_ptr().cast_mut(),
+    };
+    let mut attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle() as HANDLE,
+        ObjectName: &mut unicode,
+        Attributes: 0,
+        SecurityDescriptor: ptr::null_mut(),
+        SecurityQualityOfService: ptr::null_mut(),
+    };
+    let mut handle = INVALID_HANDLE_VALUE;
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            GENERIC_READ | DELETE,
+            &mut attributes,
+            &mut status_block,
+            ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ptr::null(),
+            0,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        unsafe { SetLastError(RtlNtStatusToDosError(status)) };
+        return Err(io::Error::last_os_error().into());
+    }
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    Ok(Dir::from_std_file(file))
+}
+#[cfg(unix)]
+fn apply_file_mode(file: &cap_std::fs::File, mode: Option<u32>) -> Result<(), RuntimeError> {
+    if let Some(mode) = mode {
+        file.set_permissions(Permissions::from_mode(mode & 0o777))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_file_mode(_file: &cap_std::fs::File, _mode: Option<u32>) -> Result<(), RuntimeError> {
+    Ok(())
 }
 
 struct CandidateDir {
@@ -494,7 +704,7 @@ impl CandidateDir {
             let name = OsString::from(format!(".melon-candidate-{}-{id}", std::process::id()));
             match staging_dir.create_dir(&name) {
                 Ok(()) => {
-                    let dir = staging_dir.open_dir_nofollow(&name)?;
+                    let dir = open_child_directory(staging_dir, &name)?;
                     let metadata = dir.dir_metadata()?;
                     return Ok(Self {
                         path: staging.join(&name),
@@ -518,12 +728,43 @@ impl CandidateDir {
     }
 
     fn publish(&mut self, staging: &Path) -> Result<(), RuntimeError> {
+        self.publish_impl(staging, |_| {})
+    }
+
+    fn cleanup(&mut self) -> Result<(), RuntimeError> {
+        if self.armed {
+            cleanup_candidate(self.dir.take().expect("candidate handle remains live"))?;
+            self.armed = false;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn publish_with_hook(
+        &mut self,
+        staging: &Path,
+        hook: impl FnOnce(&Path),
+    ) -> Result<(), RuntimeError> {
+        self.publish_impl(staging, hook)
+    }
+
+    #[cfg(not(windows))]
+    fn publish_impl(
+        &mut self,
+        staging: &Path,
+        hook: impl FnOnce(&Path),
+    ) -> Result<(), RuntimeError> {
         require_owned_candidate(staging, &self.path, self.identity)?;
+        hook(&self.path);
         let parent = staging.parent().ok_or_else(|| RuntimeError::UnsafePath(staging.display().to_string()))?;
         let name = self.path.file_name().ok_or_else(|| RuntimeError::UnsafePath(self.path.display().to_string()))?;
         let lifted = parent.join(name);
         fs::rename(&self.path, &lifted)?;
         self.path = lifted;
+        if candidate_identity(&self.path)? != self.identity {
+            self.cleanup()?;
+            return Err(RuntimeError::StagingNotEmpty);
+        }
         drop(open_empty_staging(staging)?);
         fs::remove_dir(staging)?;
         if let Err(error) = fs::rename(&self.path, staging) {
@@ -535,15 +776,129 @@ impl CandidateDir {
         Ok(())
     }
 
-    fn cleanup(&mut self) -> Result<(), RuntimeError> {
-        if self.armed {
-            if let Some(dir) = self.dir.take() {
-                dir.remove_open_dir_all()?;
-            }
-            self.armed = false;
-        }
+    #[cfg(windows)]
+    fn publish_impl(
+        &mut self,
+        staging: &Path,
+        hook: impl FnOnce(&Path),
+    ) -> Result<(), RuntimeError> {
+        require_owned_candidate(staging, &self.path, self.identity)?;
+        hook(&self.path);
+        windows_publish_candidate(self.dir.as_ref().expect("candidate handle remains live"), staging)?;
+        self.path = staging.to_path_buf();
+        self.armed = false;
         Ok(())
     }
+}
+
+fn candidate_identity(path: &Path) -> Result<(u64, u64), RuntimeError> {
+    let dir = open_runtime_directory(path)?;
+    let metadata = dir.dir_metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(windows))]
+fn cleanup_candidate(dir: Dir) -> Result<(), RuntimeError> {
+    dir.remove_open_dir_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_candidate(dir: Dir) -> Result<(), RuntimeError> {
+    windows_delete_candidate(dir)
+}
+#[cfg(windows)]
+fn windows_publish_candidate(candidate: &Dir, staging: &Path) -> Result<(), RuntimeError> {
+    let staging_handle = open_runtime_directory(staging)?;
+    windows_mark_delete(staging_handle.as_raw_handle() as HANDLE)?;
+    drop(staging_handle);
+    windows_rename_handle(candidate.as_raw_handle() as HANDLE, staging)
+}
+
+#[cfg(windows)]
+fn windows_delete_candidate(dir: Dir) -> Result<(), RuntimeError> {
+    remove_directory_contents(&dir)?;
+    windows_mark_delete(dir.as_raw_handle() as HANDLE)?;
+    drop(dir);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_directory_contents(dir: &Dir) -> Result<(), RuntimeError> {
+    let entries = dir.entries()?.collect::<Result<Vec<_>, _>>()?;
+    for entry in entries {
+        let name = entry.file_name();
+        let metadata = dir.symlink_metadata(&name)?;
+        if metadata.is_dir() && !metadata.is_symlink() {
+            let child = dir.open_dir_nofollow(&name)?;
+            remove_directory_contents(&child)?;
+            windows_mark_delete(child.as_raw_handle() as HANDLE)?;
+            drop(child);
+        } else {
+            dir.remove_file(&name)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_mark_delete(handle: HANDLE) -> Result<(), RuntimeError> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let success = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            ptr::from_ref(&disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_rename_handle(handle: HANDLE, destination: &Path) -> Result<(), RuntimeError> {
+    let destination = fs::canonicalize(
+        destination
+            .parent()
+            .ok_or_else(|| RuntimeError::UnsafePath(destination.display().to_string()))?,
+    )?
+    .join(
+        destination
+            .file_name()
+            .ok_or_else(|| RuntimeError::UnsafePath(destination.display().to_string()))?,
+    );
+    let name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = name.len().checked_mul(2).ok_or(RuntimeError::InvalidArchive("runtime path is too long"))?;
+    let bytes = offset_of!(FILE_RENAME_INFO, FileName) + name_bytes;
+    let words = bytes.div_ceil(size_of::<usize>());
+    let mut storage = vec![0_usize; words];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = ptr::null_mut();
+        (*info).FileNameLength = u32::try_from(name_bytes)
+            .map_err(|_| RuntimeError::InvalidArchive("runtime path is too long"))?;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    let success = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(bytes).map_err(|_| RuntimeError::InvalidArchive("runtime path is too long"))?,
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 
@@ -557,7 +912,7 @@ fn require_owned_candidate(
     if only != candidate || entries.next().is_some() {
         return Err(RuntimeError::StagingNotEmpty);
     }
-    let candidate_dir = Dir::open_ambient_dir(candidate, ambient_authority())?;
+    let candidate_dir = open_runtime_directory(candidate)?;
     let metadata = candidate_dir.dir_metadata()?;
     if (metadata.dev(), metadata.ino()) != identity {
         return Err(RuntimeError::StagingNotEmpty);
@@ -570,7 +925,7 @@ impl Drop for CandidateDir {
         if self.armed
             && let Some(dir) = self.dir.take()
         {
-            let _ = dir.remove_open_dir_all();
+            let _ = cleanup_candidate(dir);
         }
     }
 }
@@ -611,6 +966,27 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).expect("remove test directory");
         }
+    }
+    fn archive_with_mode(name: &str, contents: &[u8], mode: u32) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(name, SimpleFileOptions::default().unix_permissions(mode))
+            .expect("start mode ZIP entry");
+        writer.write_all(contents).expect("write mode ZIP entry");
+        writer.finish().expect("finish mode ZIP").into_inner()
+    }
+
+    fn matching_false_eocd_comment() -> Vec<u8> {
+        let mut comment = vec![0; 40];
+        comment[..4].copy_from_slice(b"PK\x05\x06");
+        comment[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        comment[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        comment[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        comment[10..12].copy_from_slice(&1_u16.to_le_bytes());
+        comment[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        comment[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        comment[20..22].copy_from_slice(&18_u16.to_le_bytes());
+        commented_archive(&comment)
     }
 
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -818,6 +1194,61 @@ mod tests {
         extract_zip(&mut Cursor::new(commented_archive(&comment)), &staging)
             .expect("false footer signature in comment");
         assert_eq!(fs::read(staging.join("node")).expect("node"), b"node");
+    }
+    #[test]
+    fn accepts_matching_length_false_eocd_inside_comment() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        extract_zip(&mut Cursor::new(matching_false_eocd_comment()), &staging)
+            .expect("structurally false footer in comment");
+        assert_eq!(fs::read(staging.join("node")).expect("node"), b"node");
+    }
+
+    #[test]
+    fn rejects_extended_windows_device_stems() {
+        for name in ["COM0", "LPT0.txt", "COM¹.log", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"] {
+            assert_rejected_path(name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_sanitized_unix_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (mode, expected) in [(0o100755, 0o755), (0o107755, 0o755)] {
+            let temp = TempDir::new();
+            let staging = temp.staging();
+            extract_zip(&mut Cursor::new(archive_with_mode("node", b"node", mode)), &staging)
+                .expect("extract executable");
+            assert_eq!(fs::metadata(staging.join("node")).expect("node metadata").permissions().mode() & 0o7777, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_identity_replacement_never_publishes_attacker_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let attacker = temp.0.join("attacker");
+        let moved = temp.0.join("owned-moved");
+        fs::create_dir(&attacker).expect("attacker directory");
+        fs::write(attacker.join("marker"), b"attacker").expect("attacker marker");
+        let error = extract_zip_with_publish_hook(
+            &mut Cursor::new(archive(&[("node", b"owned")])),
+            &staging,
+            |candidate| {
+                fs::rename(candidate, &moved).expect("move verified candidate");
+                symlink(&attacker, candidate).expect("replace verified candidate");
+            },
+        )
+        .expect_err("post-identity replacement must fail closed");
+        assert!(!staging.join("marker").exists(), "attacker directory must not publish");
+        assert!(!moved.exists(), "owned original must be cleaned by handle");
+        assert_eq!(fs::read(attacker.join("marker")).expect("attacker untouched"), b"attacker");
+        drop(error);
     }
 
     #[test]
@@ -1036,4 +1467,27 @@ mod tests {
         assert!(!outside.join("node").exists());
         assert!(staging.join("bin").symlink_metadata().expect("symlink remains").file_type().is_symlink());
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_publication_succeeds() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        extract_zip(&mut Cursor::new(archive(&[("node", b"node")])), &staging)
+            .expect("publish through Windows directory handle");
+        assert_eq!(fs::read(staging.join("node")).expect("published node"), b"node");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_cleanup_removes_owned_candidate() {
+        let temp = TempDir::new();
+        let staging = temp.staging();
+        let staging_dir = open_empty_staging(&staging).expect("staging handle");
+        let mut candidate = CandidateDir::create(&staging, &staging_dir).expect("candidate");
+        candidate.dir().create_dir("nested").expect("nested candidate content");
+        let path = candidate.path().to_path_buf();
+        candidate.cleanup().expect("handle cleanup");
+        assert!(!path.exists());
+    }
+
 }
