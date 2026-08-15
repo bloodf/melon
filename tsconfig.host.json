@@ -88,6 +88,7 @@
     "examples/*/tests/**/*.ts",
     "packages/*/*/tests/**/*.ts",
     "scripts/**/*.ts",
+    "scripts/**/*.mts",
     "website/**/*.ts",
     "website/.vitepress/**/*.ts"
   ],

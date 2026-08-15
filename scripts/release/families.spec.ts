@@ -91,6 +91,14 @@ describe('release families', () => {
     expect(releaseFamily('vendor').installedEntry).toBeUndefined()
   })
 
+  it('excludes private workspace applications from release members', () => {
+    const dsh = releaseFamily('dsh')
+    const members = dsh.members(process.cwd())
+
+    expect(members.map(member => member.name)).toContain('@deepseek-ai/dsh')
+    expect(members.map(member => member.name)).not.toContain('@bloodf/melon-desktop')
+  })
+
   it('rejects an unknown family identifier', () => {
     expect(() => { releaseFamily('native') }).toThrow(/unknown release family/)
   })

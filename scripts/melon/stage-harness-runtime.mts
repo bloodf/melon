@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process'
 import {
   cpSync,
   existsSync,
+  globSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -224,6 +225,41 @@ function findLink(directory: string): string | undefined {
   return undefined
 }
 
+function workspacePackages(repoRoot: string): Map<string, string> {
+  const packages = new Map<string, string>()
+  for (const manifestPath of globSync(['apps/*/package.json', 'packages/*/*/package.json', 'vendor/*/package.json'], { cwd: repoRoot }).sort()) {
+    const root = dirname(join(repoRoot, manifestPath))
+    const name = readManifest(join(root, 'package.json')).name
+    if (typeof name === 'string') packages.set(name, root)
+  }
+  return packages
+}
+
+function restoreWorkspaceDependencies(candidate: string, repoRoot: string): void {
+  const workspaces = workspacePackages(repoRoot)
+  for (;;) {
+    let restored = false
+    for (const installedRoot of packageRoots(candidate)) {
+      const manifest = readManifest(join(installedRoot, 'package.json'))
+      for (const dependency of requiredDependencies(manifest)) {
+        if (installedPackageManifest(candidate, installedRoot, dependency) !== undefined) continue
+        const source = workspaces.get(dependency)
+        if (source === undefined) continue
+        const destination = join(candidate, 'node_modules', ...dependency.split('/'))
+        const sourceNodeModules = join(source, 'node_modules')
+        mkdirSync(dirname(destination), { recursive: true })
+        cpSync(source, destination, {
+          recursive: true,
+          dereference: true,
+          filter: path => path !== sourceNodeModules && !path.startsWith(`${sourceNodeModules}${sep}`),
+        })
+        restored = true
+      }
+    }
+    if (!restored) return
+  }
+}
+
 function closureDigest(root: string, files: readonly string[]): ValidatedHarnessClosure['closure'] {
   const hash = createHash('sha256')
   let totalBytes = 0
@@ -373,6 +409,7 @@ export function stageHarnessRuntime(options: StageHarnessOptions = {}): StageHar
       '--config.node-linker=hoisted', '--config.auto-install-peers=false', '--config.link-workspace-packages=true',
       candidate,
     ])
+    restoreWorkspaceDependencies(candidate, repoRoot)
     materializeLinks(candidate)
 
     const closure = validateHarnessClosure(candidate)

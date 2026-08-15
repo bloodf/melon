@@ -59,6 +59,7 @@ function repository(root: string): void {
     melonVersion: '0.1.0',
     harness: { sourceSha: '47f943859bef60e4160492346772ded9b24f765a' },
   })
+  writeJson(join(root, 'vendor/cosmokit/package.json'), { name: '@deepseek-ai/cosmokit', version: '1.8.2' })
   mkdirSync(join(root, 'apps/melon-desktop/src-tauri/resources'), { recursive: true })
 }
 

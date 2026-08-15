@@ -441,7 +441,7 @@ function collectFiles(root: string, prefix: string, omit: (path: string) => bool
     for (const name of readdirSync(directory).sort()) {
       const path = join(directory, name)
       const relativePath = relative(root, path).split(sep).join('/')
-      if (relativePath.split('/').includes('.bin')) continue
+      if (omit(relativePath)) continue
       const info = lstatSync(path)
       if (info.isSymbolicLink()) throw new Error(`symlink in staged closure: ${relativePath}`)
       if (info.isDirectory()) visit(path)
@@ -520,7 +520,7 @@ function tarEntries(bytes: Buffer): ArchiveEntry[] {
     const field = (start: number, length: number) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/, '')
     const name = safeArchiveEntryName([field(345, 155), field(0, 100)].filter(Boolean).join('/'))
     const linkName = field(157, 100)
-    const type = header[156]
+    const type = header[156]!
     const sizeText = field(124, 12).trim()
     const size = sizeText.length === 0 ? 0 : Number.parseInt(sizeText, 8)
     if (!Number.isSafeInteger(size) || size < 0) throw new Error(`invalid tar entry size: ${name}`)
@@ -895,7 +895,12 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
 
 function main(): void {
   const args = process.argv.slice(2)
-  const value = (flag: string) => { const index = args.indexOf(flag); if (index < 0 || args[index + 1] === undefined) throw new Error(`missing ${flag}`); return args[index + 1] }
+  const value = (flag: string): string => {
+    const index = args.indexOf(flag)
+    const result = args[index + 1]
+    if (index < 0 || result === undefined) throw new Error(`missing ${flag}`)
+    return result
+  }
   const toolchain = { directories: value('--toolchain-dir').split(delimiter).map(directory => resolve(directory)), python: resolve(value('--python')), cc: resolve(value('--cc')), cxx: resolve(value('--cxx')) }
   const result = buildPayload({ target: value('--target'), nodeArchive: resolve(value('--node-archive')), headersArchive: resolve(value('--headers-archive')), checksums: resolve(value('--checksums')), output: resolve(value('--output')), sandboxRunner: resolve(value('--sandbox-runner')), toolchain })
   process.stdout.write(`${JSON.stringify(result)}\n`)
