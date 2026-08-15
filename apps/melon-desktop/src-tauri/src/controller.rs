@@ -1,9 +1,11 @@
 use crate::config::normalize_endpoint;
+use crate::process_tree::ProcessTree;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
-
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,11 +29,229 @@ struct ProbeLimits {
     models_body_limit: usize,
 }
 
+const PROCESS_STOP_GRACE: Duration = Duration::from_secs(2);
+
+trait OwnedTree: Send {
+    fn is_running(&mut self) -> io::Result<bool>;
+    fn stop(&mut self, grace: Duration) -> io::Result<()>;
+}
+
+impl OwnedTree for ProcessTree {
+    fn is_running(&mut self) -> io::Result<bool> { ProcessTree::is_running(self) }
+    fn stop(&mut self, grace: Duration) -> io::Result<()> { ProcessTree::stop(self, grace) }
+}
+
+#[derive(Default)]
+struct OwnedProcesses {
+    harness: Option<Box<dyn OwnedTree>>,
+    managed_durindoor: Option<Box<dyn OwnedTree>>,
+}
+
+impl std::fmt::Debug for OwnedProcesses {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedProcesses")
+            .field("harness", &self.harness.is_some())
+            .field("managed_durindoor", &self.managed_durindoor.is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
-pub struct ConnectionController;
+struct ControllerState {
+    mutating: bool,
+    shutting_down: bool,
+    shutdown_active: bool,
+    teardown_harness: bool,
+    teardown_managed: bool,
+    owned: OwnedProcesses,
+    recoverable_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ConnectionController {
+    state: Mutex<ControllerState>,
+    key_persistence_available: bool,
+    stop_grace: Duration,
+}
+
+impl Default for ConnectionController {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ControllerState::default()),
+            key_persistence_available: false,
+            stop_grace: PROCESS_STOP_GRACE,
+        }
+    }
+}
 
 impl ConnectionController {
-    pub fn shutdown(&self) {}
+    fn lock(&self) -> MutexGuard<'_, ControllerState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin_operation(&self) -> Result<Operation<'_>, ControllerError> {
+        let mut state = self.lock();
+        if state.shutting_down {
+            return Err(ControllerError::ShuttingDown);
+        }
+        if state.mutating {
+            return Err(ControllerError::Busy);
+        }
+        state.mutating = true;
+        Ok(Operation { controller: self, active: true })
+    }
+
+    #[cfg(test)]
+    fn run_serialized<T>(&self, work: impl FnOnce() -> T) -> Result<T, ControllerError> {
+        let operation = self.begin_operation()?;
+        let result = work();
+        drop(operation);
+        Ok(result)
+    }
+
+    fn status_snapshot(&self) -> ControllerStatus {
+        let mut state = self.lock();
+        let mut query_error = None;
+        let mut running = state.teardown_harness || state.teardown_managed;
+        for tree in [&mut state.owned.harness] {
+            match tree.as_mut().map(|tree| tree.is_running()) {
+                Some(Ok(true)) => running = true,
+                Some(Ok(false)) => *tree = None,
+                Some(Err(error)) => {
+                    running = true;
+                    query_error.get_or_insert_with(|| error.to_string());
+                }
+                None => {}
+            }
+        }
+        for tree in [&mut state.owned.managed_durindoor] {
+            match tree.as_mut().map(|tree| tree.is_running()) {
+                Some(Ok(true)) => running = true,
+                Some(Ok(false)) => *tree = None,
+                Some(Err(error)) => {
+                    running = true;
+                    query_error.get_or_insert_with(|| error.to_string());
+                }
+                None => {}
+            }
+        }
+        if query_error.is_some() {
+            state.recoverable_error = query_error;
+        }
+        ControllerStatus {
+            key_persistence_available: self.key_persistence_available,
+            running,
+            recoverable_error: state.recoverable_error.clone(),
+        }
+    }
+
+    pub fn shutdown(&self) -> Result<(), ControllerError> {
+        let mut owned = {
+            let mut state = self.lock();
+            state.shutting_down = true;
+            if state.shutdown_active {
+                return Err(ControllerError::Busy);
+            }
+            state.shutdown_active = true;
+            let owned = std::mem::take(&mut state.owned);
+            state.teardown_harness = owned.harness.is_some();
+            state.teardown_managed = owned.managed_durindoor.is_some();
+            owned
+        };
+
+        let (first_error, harness_stopped, managed_stopped) = stop_owned_processes(&mut owned, self.stop_grace);
+        let mut state = self.lock();
+        state.shutdown_active = false;
+        state.teardown_harness = false;
+        state.teardown_managed = false;
+        if !harness_stopped {
+            state.owned.harness = owned.harness.take();
+        }
+        if !managed_stopped {
+            state.owned.managed_durindoor = owned.managed_durindoor.take();
+        }
+        match first_error {
+            Some(error) => {
+                state.recoverable_error = Some(error.to_string());
+                Err(ControllerError::ShutdownFailed)
+            }
+            None => {
+                state.recoverable_error = None;
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(key_persistence_available: bool, stop_grace: Duration) -> Self {
+        Self { state: Mutex::new(ControllerState::default()), key_persistence_available, stop_grace }
+    }
+}
+
+fn stop_tree(tree: &mut Option<Box<dyn OwnedTree>>, grace: Duration) -> (Option<io::Error>, bool) {
+    let Some(tree) = tree.as_mut() else { return (None, true) };
+    let stop_error = tree.stop(grace).err();
+    match tree.is_running() {
+        Ok(false) => (stop_error, true),
+        Ok(true) => (
+            stop_error.or_else(|| Some(io::Error::new(io::ErrorKind::TimedOut, "owned process tree remains running"))),
+            false,
+        ),
+        Err(error) => (stop_error.or(Some(error)), false),
+    }
+}
+
+fn stop_owned_processes(
+    owned: &mut OwnedProcesses,
+    grace: Duration,
+) -> (Option<io::Error>, bool, bool) {
+    let (mut first_error, harness_stopped) = stop_tree(&mut owned.harness, grace);
+    let (managed_error, managed_stopped) = stop_tree(&mut owned.managed_durindoor, grace);
+    if first_error.is_none() {
+        first_error = managed_error;
+    }
+    (first_error, harness_stopped, managed_stopped)
+}
+
+#[derive(Debug)]
+struct Operation<'a> {
+    controller: &'a ConnectionController,
+    active: bool,
+}
+
+impl Operation<'_> {
+    fn adopt(mut self, mut attempted: OwnedProcesses, succeeded: bool) -> Result<(), ControllerError> {
+        if !succeeded {
+            let _ = stop_owned_processes(&mut attempted, self.controller.stop_grace);
+            return Err(ControllerError::ActivationFailed);
+        }
+        let mut replaced = {
+            let mut state = self.controller.lock();
+            if state.shutting_down {
+                drop(state);
+                let _ = stop_owned_processes(&mut attempted, self.controller.stop_grace);
+                return Err(ControllerError::ShuttingDown);
+            }
+            std::mem::replace(&mut state.owned, attempted)
+        };
+        let (error, _, _) = stop_owned_processes(&mut replaced, self.controller.stop_grace);
+        let mut state = self.controller.lock();
+        if let Some(error) = error {
+            state.recoverable_error = Some(error.to_string());
+        }
+        state.mutating = false;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.controller.lock().mutating = false;
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +259,8 @@ impl ConnectionController {
 pub struct ControllerStatus {
     pub key_persistence_available: bool,
     pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recoverable_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +333,10 @@ pub enum ControllerError {
     NotImplemented(String),
     ProbeFailed,
     ProbeTimedOut,
+    ActivationFailed,
+    Busy,
+    ShutdownFailed,
+    ShuttingDown,
 }
 
 impl Serialize for ControllerError {
@@ -120,7 +346,9 @@ impl Serialize for ControllerError {
     {
         use serde::ser::SerializeStruct;
         let (code, message) = match self {
+            Self::ActivationFailed => ("activation-failed", "Connection activation failed"),
             Self::ApiKeyRequired => ("auth-required", "API key required"),
+            Self::Busy => ("busy", "Another connection operation is already running"),
             Self::AuthProbeFailed => ("auth-unverified", "API key could not be verified"),
             Self::EmptyModels => ("empty-models", "DurinDoor returned no models"),
             Self::HealthProbeFailed => ("health-failed", "DurinDoor health check failed"),
@@ -135,6 +363,8 @@ impl Serialize for ControllerError {
             Self::NotImplemented(message) => ("not-implemented", message.as_str()),
             Self::ProbeFailed => ("probe-failed", "DurinDoor probe failed"),
             Self::ProbeTimedOut => ("probe-timed-out", "DurinDoor probe timed out"),
+            Self::ShutdownFailed => ("shutdown-failed", "Owned process shutdown failed"),
+            Self::ShuttingDown => ("shutting-down", "Melon is shutting down"),
         };
         let mut state = serializer.serialize_struct("ControllerError", 2)?;
         state.serialize_field("code", code)?;
@@ -144,15 +374,16 @@ impl Serialize for ControllerError {
 }
 
 #[tauri::command]
-pub fn status(_controller: tauri::State<'_, ConnectionController>) -> ControllerStatus {
-    ControllerStatus { key_persistence_available: false, running: false }
+pub fn status(controller: tauri::State<'_, ConnectionController>) -> ControllerStatus {
+    controller.status_snapshot()
 }
 
 #[tauri::command]
 pub async fn probe(
-    _controller: tauri::State<'_, ConnectionController>,
+    controller: tauri::State<'_, ConnectionController>,
     input: ProbeInput,
 ) -> Result<ProbeResult, ControllerError> {
+    let _operation = controller.begin_operation()?;
     match input.mode {
         ConnectionMode::External => probe_external(&input, PROBE_LIMITS).await,
         ConnectionMode::ManagedLocal => {
@@ -297,19 +528,19 @@ fn map_request_error(error: reqwest::Error) -> ControllerError {
 
 #[tauri::command]
 pub fn activate(
-    _controller: tauri::State<'_, ConnectionController>,
+    controller: tauri::State<'_, ConnectionController>,
     probe: Value,
     model: String,
 ) -> Result<SavedConnection, ControllerError> {
+    let _operation = controller.begin_operation()?;
     let _ = (probe, model);
     Err(ControllerError::NotImplemented("connection activation is not available yet".into()))
 }
 
 #[tauri::command]
-pub fn shutdown(controller: tauri::State<'_, ConnectionController>) {
-    controller.shutdown();
+pub fn shutdown(controller: tauri::State<'_, ConnectionController>) -> Result<(), ControllerError> {
+    controller.shutdown()
 }
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -639,5 +870,247 @@ mod tests {
             tauri::async_runtime::block_on(probe_external(&input, limits)),
             Err(ControllerError::ProbeTimedOut)
         );
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::{ConnectionController, ControllerError, OwnedProcesses, OwnedTree};
+    use crate::process_tree::ProcessTree;
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::io;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct FakeState {
+        running: bool,
+        stops: usize,
+        stop_results: VecDeque<io::Result<()>>,
+    }
+
+    struct FakeTree(Arc<Mutex<FakeState>>);
+
+    impl FakeTree {
+        fn running() -> (Box<dyn OwnedTree>, Arc<Mutex<FakeState>>) {
+            let state = Arc::new(Mutex::new(FakeState { running: true, ..Default::default() }));
+            (Box::new(Self(Arc::clone(&state))), state)
+        }
+
+        fn with_results(results: Vec<io::Result<()>>) -> (Box<dyn OwnedTree>, Arc<Mutex<FakeState>>) {
+            let state = Arc::new(Mutex::new(FakeState {
+                running: true,
+                stop_results: results.into(),
+                ..Default::default()
+            }));
+            (Box::new(Self(Arc::clone(&state))), state)
+        }
+    }
+
+    impl OwnedTree for FakeTree {
+        fn is_running(&mut self) -> io::Result<bool> {
+            Ok(self.0.lock().expect("fake state").running)
+        }
+
+        fn stop(&mut self, _grace: Duration) -> io::Result<()> {
+            let mut state = self.0.lock().expect("fake state");
+            state.stops += 1;
+            let result = state.stop_results.pop_front().unwrap_or(Ok(()));
+            if result.is_ok() {
+                state.running = false;
+            }
+            result
+        }
+    }
+
+    fn processes(harness: Option<Box<dyn OwnedTree>>, managed: Option<Box<dyn OwnedTree>>) -> OwnedProcesses {
+        OwnedProcesses { harness, managed_durindoor: managed }
+    }
+
+    #[test]
+    fn serializes_mutations_without_duplicate_execution() {
+        let controller = Arc::new(ConnectionController::for_test(true, Duration::from_millis(50)));
+        let first = controller.begin_operation().expect("first operation");
+        assert_eq!(controller.begin_operation().unwrap_err(), ControllerError::Busy);
+        drop(first);
+        assert!(controller.begin_operation().is_ok());
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let controller = Arc::clone(&controller);
+            let executions = Arc::clone(&executions);
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                let result = controller.run_serialized(|| {
+                    executions.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(40));
+                });
+                results.lock().expect("results").push(result);
+            }));
+        }
+        barrier.wait();
+        for thread in threads { thread.join().expect("operation thread"); }
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(results.lock().expect("results").iter().filter(|result| **result == Err(ControllerError::Busy)).count(), 1);
+    }
+
+    #[test]
+    fn status_derives_from_live_tracked_handles_and_key_availability() {
+        let controller = ConnectionController::for_test(true, Duration::from_millis(50));
+        let (tree, state) = FakeTree::running();
+        let operation = controller.begin_operation().expect("operation");
+        operation.adopt(processes(Some(tree), None), true).expect("adopt tree");
+        assert_eq!(controller.status_snapshot().key_persistence_available, true);
+        assert!(controller.status_snapshot().running);
+        state.lock().expect("fake state").running = false;
+        assert!(!controller.status_snapshot().running);
+    }
+
+    #[test]
+    fn no_handle_shutdown_is_idempotent() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(50));
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert_eq!(controller.begin_operation().unwrap_err(), ControllerError::ShuttingDown);
+    }
+    #[test]
+    fn shutdown_blocks_new_operations_and_late_adoption_rolls_back_attempt() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(50));
+        let operation = controller.begin_operation().expect("operation");
+        assert_eq!(controller.shutdown(), Ok(()));
+        let (attempt, attempt_state) = FakeTree::running();
+        assert_eq!(
+            operation.adopt(processes(Some(attempt), None), true),
+            Err(ControllerError::ShuttingDown),
+        );
+        assert_eq!(attempt_state.lock().expect("attempt").stops, 1);
+        assert_eq!(controller.begin_operation().unwrap_err(), ControllerError::ShuttingDown);
+    }
+
+
+    #[test]
+    fn two_handle_shutdown_attempts_both_and_retries_only_live_failure() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(50));
+        let (harness, harness_state) = FakeTree::with_results(vec![Err(io::Error::other("first failure")), Ok(())]);
+        let (managed, managed_state) = FakeTree::running();
+        controller
+            .begin_operation().expect("operation")
+            .adopt(processes(Some(harness), Some(managed)), true).expect("adopt trees");
+
+        assert_eq!(controller.shutdown(), Err(ControllerError::ShutdownFailed));
+        assert_eq!(harness_state.lock().expect("harness").stops, 1);
+        assert_eq!(managed_state.lock().expect("managed").stops, 1);
+        assert!(controller.status_snapshot().running);
+
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert_eq!(harness_state.lock().expect("harness").stops, 2);
+        assert_eq!(managed_state.lock().expect("managed").stops, 1);
+        assert!(!controller.status_snapshot().running);
+    }
+
+    #[test]
+    fn failed_adoption_stops_attempt_and_preserves_prior_tree() {
+        let controller = ConnectionController::for_test(false, Duration::from_millis(50));
+        let (prior, prior_state) = FakeTree::running();
+        controller
+            .begin_operation().expect("prior operation")
+            .adopt(processes(Some(prior), None), true).expect("adopt prior");
+        let (attempt, attempt_state) = FakeTree::running();
+        let result = controller
+            .begin_operation().expect("attempt operation")
+            .adopt(processes(Some(attempt), None), false);
+        assert_eq!(result, Err(ControllerError::ActivationFailed));
+        assert_eq!(attempt_state.lock().expect("attempt").stops, 1);
+        assert_eq!(prior_state.lock().expect("prior").stops, 0);
+        assert!(controller.status_snapshot().running);
+    }
+
+    struct BlockingTree {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        running: Arc<AtomicBool>,
+    }
+
+    impl OwnedTree for BlockingTree {
+        fn is_running(&mut self) -> io::Result<bool> { Ok(self.running.load(Ordering::SeqCst)) }
+        fn stop(&mut self, _grace: Duration) -> io::Result<()> {
+            self.entered.wait();
+            self.release.wait();
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn status_does_not_wait_for_blocking_teardown_lock() {
+        let controller = Arc::new(ConnectionController::for_test(false, Duration::from_millis(50)));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let running = Arc::new(AtomicBool::new(true));
+        controller
+            .begin_operation().expect("operation")
+            .adopt(
+                processes(Some(Box::new(BlockingTree {
+                    entered: Arc::clone(&entered), release: Arc::clone(&release), running,
+                })), None),
+                true,
+            )
+            .expect("adopt blocking tree");
+        let shutdown_controller = Arc::clone(&controller);
+        let shutdown = thread::spawn(move || shutdown_controller.shutdown());
+        entered.wait();
+        let started = Instant::now();
+        assert!(controller.status_snapshot().running);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        release.wait();
+        assert_eq!(shutdown.join().expect("shutdown thread"), Ok(()));
+    }
+
+    #[cfg(unix)]
+    fn process_running(pid: u32) -> bool {
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        !matches!(stat.rsplit_once(") ").and_then(|(_, fields)| fields.chars().next()), Some('Z' | 'X'))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_shutdown_stops_real_parent_and_grandchild_only() {
+        let ready = std::env::temp_dir().join(format!(
+            "melon-controller-tree-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos(),
+        ));
+        let script = format!("sleep 60 & echo $! > '{}'; wait", ready.display());
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let tree = ProcessTree::spawn(&mut command).expect("spawn real tree");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Ok(text) = fs::read_to_string(&ready) {
+                break text.trim().parse::<u32>().expect("grandchild pid");
+            }
+            assert!(Instant::now() < deadline, "grandchild readiness timeout");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let controller = ConnectionController::for_test(false, Duration::from_millis(50));
+        controller
+            .begin_operation().expect("operation")
+            .adopt(processes(Some(Box::new(tree)), None), true).expect("adopt real tree");
+        assert_eq!(controller.shutdown(), Ok(()));
+        assert!(!process_running(grandchild));
+        fs::remove_file(ready).expect("remove readiness");
     }
 }

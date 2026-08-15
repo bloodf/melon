@@ -7,7 +7,7 @@ use controller::{ConnectionController, activate, probe, shutdown, status};
 
 fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
-        .manage(ConnectionController)
+        .manage(ConnectionController::default())
         .invoke_handler(tauri::generate_handler![status, probe, activate, shutdown])
 }
 
@@ -18,7 +18,7 @@ pub fn run() {
         .expect("failed to build Melon");
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            handle.state::<ConnectionController>().shutdown();
+            let _ = handle.state::<ConnectionController>().shutdown();
         }
     });
 }
