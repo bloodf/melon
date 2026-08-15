@@ -1,6 +1,7 @@
 mod controller;
 mod config;
 mod runtime;
+mod process_tree;
 
 use controller::{ConnectionController, activate, probe, shutdown, status};
 
