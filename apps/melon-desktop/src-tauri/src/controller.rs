@@ -11,6 +11,8 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_BODY_LIMIT: usize = 16 * 1_024;
 const MODELS_BODY_LIMIT: usize = 1_000_000;
+const MANAGED_LOCAL_PORT: u16 = 20_128;
+const MANAGED_LOCAL_BASE_URL: &str = "http://127.0.0.1:20128/v1";
 
 const PROBE_LIMITS: ProbeLimits = ProbeLimits {
     connect_timeout: PROBE_CONNECT_TIMEOUT,
@@ -378,7 +380,7 @@ pub struct ProbeInput {
     pub allow_insecure_http: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConnectionMode {
     ManagedLocal,
@@ -392,7 +394,16 @@ pub struct ProbeResult {
     pub base_url: String,
     pub auth: AuthStatus,
     pub health: HealthStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<ConnectionOwnership>,
     pub models: Vec<ModelInfo>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectionOwnership {
+    Managed,
+    External,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -436,6 +447,8 @@ pub enum ControllerError {
     MalformedModels,
     ModelsRequestFailed,
     ModelsResponseTooLarge,
+    InstallationNeeded,
+    ManagedPortOccupied,
     NotImplemented(String),
     ProbeFailed,
     ProbeTimedOut,
@@ -467,6 +480,13 @@ impl Serialize for ControllerError {
             Self::MalformedModels | Self::ModelsResponseTooLarge => {
                 ("malformed-models", "DurinDoor returned an invalid model list")
             }
+            Self::InstallationNeeded => {
+                ("installation-needed", "DurinDoor installation is required")
+            }
+            Self::ManagedPortOccupied => (
+                "port-occupied",
+                "Port 20128 is occupied by a service that is not DurinDoor",
+            ),
             Self::ModelsRequestFailed => ("models-failed", "DurinDoor model request failed"),
             Self::NotImplemented(message) => ("not-implemented", message.as_str()),
             Self::ProbeFailed => ("probe-failed", "DurinDoor probe failed"),
@@ -491,13 +511,91 @@ pub async fn probe(
     controller: tauri::State<'_, ConnectionController>,
     input: ProbeInput,
 ) -> Result<ProbeResult, ControllerError> {
-    let _operation = controller.begin_operation()?;
     match input.mode {
-        ConnectionMode::External => probe_external(&input, PROBE_LIMITS).await,
-        ConnectionMode::ManagedLocal => {
-            Err(ControllerError::NotImplemented("managed probing is not available yet".into()))
+        ConnectionMode::External => {
+            let _operation = controller.begin_operation()?;
+            probe_external(&input, PROBE_LIMITS).await
         }
+        ConnectionMode::ManagedLocal => probe_managed(&controller, &input).await,
     }
+}
+
+/// Classifies the fixed managed-local endpoint without starting, adopting, or stopping a listener.
+async fn probe_managed(
+    controller: &ConnectionController,
+    input: &ProbeInput,
+) -> Result<ProbeResult, ControllerError> {
+    let address = ([127, 0, 0, 1], MANAGED_LOCAL_PORT).into();
+    probe_managed_endpoint(controller, input, address, MANAGED_LOCAL_BASE_URL, PROBE_LIMITS).await
+}
+
+#[cfg(test)]
+async fn probe_managed_at(
+    controller: &ConnectionController,
+    input: &ProbeInput,
+    address: std::net::SocketAddr,
+    limits: ProbeLimits,
+) -> Result<ProbeResult, ControllerError> {
+    let base_url = format!("http://{address}/v1");
+    probe_managed_endpoint(controller, input, address, &base_url, limits).await
+}
+
+async fn probe_managed_endpoint(
+    controller: &ConnectionController,
+    input: &ProbeInput,
+    address: std::net::SocketAddr,
+    base_url: &str,
+    limits: ProbeLimits,
+) -> Result<ProbeResult, ControllerError> {
+    let _operation = controller.begin_operation()?;
+    let deadline = tokio::time::Instant::now() + limits.overall_timeout;
+    tokio::time::timeout_at(
+        deadline,
+        tauri::async_runtime::spawn_blocking(move || {
+            std::net::TcpStream::connect_timeout(&address, limits.connect_timeout)
+        }),
+    )
+    .await
+    .map_err(|_| ControllerError::ManagedPortOccupied)?
+    .map_err(|_| ControllerError::ProbeFailed)?
+    .map_err(|error| match error.kind() {
+        io::ErrorKind::ConnectionRefused => ControllerError::InstallationNeeded,
+        _ => ControllerError::ManagedPortOccupied,
+    })?;
+    let base = Url::parse(base_url).map_err(|_| ControllerError::ProbeFailed)?;
+    let client = probe_client(limits)?;
+    let health = tokio::time::timeout_at(deadline, async {
+        let response = client
+            .get(endpoint_url(&base, "api/health")?)
+            .send()
+            .await
+            .map_err(|_| ControllerError::ManagedPortOccupied)?;
+        if response.status() != StatusCode::OK {
+            return Err(ControllerError::ManagedPortOccupied);
+        }
+        let body = read_capped(
+            response,
+            limits.health_body_limit,
+            ControllerError::ManagedPortOccupied,
+        )
+        .await
+        .map_err(|_| ControllerError::ManagedPortOccupied)?;
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| ControllerError::ManagedPortOccupied)?;
+        if value.get("ok") != Some(&Value::Bool(true)) {
+            return Err(ControllerError::ManagedPortOccupied);
+        }
+        Ok(HealthStatus::Healthy)
+    })
+    .await
+    .map_err(|_| ControllerError::ManagedPortOccupied)??;
+
+    tokio::time::timeout_at(
+        deadline,
+        probe_after_health(&client, input, base, health, ConnectionMode::ManagedLocal, limits),
+    )
+    .await
+    .map_err(|_| ControllerError::ProbeTimedOut)?
 }
 
 /// Probes one normalized external DurinDoor endpoint without persisting configuration or secrets.
@@ -508,15 +606,19 @@ async fn probe_external(input: &ProbeInput, limits: ProbeLimits) -> Result<Probe
         return Err(ControllerError::InsecureHttpConfirmationRequired);
     }
     let base = Url::parse(normalized.as_str()).map_err(|_| ControllerError::InvalidEndpoint)?;
-    let client = Client::builder()
+    let client = probe_client(limits)?;
+    tokio::time::timeout(limits.overall_timeout, probe_with_client(&client, input, base, limits))
+        .await
+        .map_err(|_| ControllerError::ProbeTimedOut)?
+}
+
+fn probe_client(limits: ProbeLimits) -> Result<Client, ControllerError> {
+    Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(limits.connect_timeout)
         .read_timeout(limits.read_timeout)
         .build()
-        .map_err(|_| ControllerError::ProbeFailed)?;
-    tokio::time::timeout(limits.overall_timeout, probe_with_client(&client, input, base, limits))
-        .await
-        .map_err(|_| ControllerError::ProbeTimedOut)?
+        .map_err(|_| ControllerError::ProbeFailed)
 }
 
 async fn probe_with_client(
@@ -539,6 +641,17 @@ async fn probe_with_client(
         StatusCode::NOT_FOUND => HealthStatus::NotExposed,
         _ => return Err(ControllerError::HealthProbeFailed),
     };
+    probe_after_health(client, input, base, health, ConnectionMode::External, limits).await
+}
+
+async fn probe_after_health(
+    client: &Client,
+    input: &ProbeInput,
+    base: Url,
+    health: HealthStatus,
+    mode: ConnectionMode,
+    limits: ProbeLimits,
+) -> Result<ProbeResult, ControllerError> {
 
     let auth_response = send(
         client,
@@ -579,10 +692,11 @@ async fn probe_with_client(
         return Err(ControllerError::MalformedModels);
     }
     Ok(ProbeResult {
-        mode: ConnectionMode::External,
+        mode,
         base_url: base.to_string(),
         auth,
         health,
+        ownership: (mode == ConnectionMode::ManagedLocal).then_some(ConnectionOwnership::External),
         models: catalog.data,
     })
 }
@@ -658,7 +772,9 @@ pub async fn shutdown<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthStatus, ControllerError, HealthStatus, ProbeInput, ProbeLimits, probe_external,
+        AuthStatus, ConnectionController, ConnectionOwnership, ControllerError, HealthStatus,
+        MANAGED_LOCAL_BASE_URL, MANAGED_LOCAL_PORT, ProbeInput, ProbeLimits, probe_external,
+        probe_managed_at,
     };
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -816,8 +932,26 @@ mod tests {
         }
     }
 
+    fn managed_input(api_key: Option<&str>) -> ProbeInput {
+        ProbeInput {
+            mode: super::ConnectionMode::ManagedLocal,
+            base_url: None,
+            api_key: api_key.map(str::to_owned),
+            allow_insecure_http: None,
+        }
+    }
+
     fn run(input: &ProbeInput) -> Result<super::ProbeResult, ControllerError> {
         tauri::async_runtime::block_on(probe_external(input, FAST_LIMITS))
+    }
+
+    fn run_managed(
+        controller: &ConnectionController,
+        input: &ProbeInput,
+        address: SocketAddr,
+        limits: ProbeLimits,
+    ) -> Result<super::ProbeResult, ControllerError> {
+        tauri::async_runtime::block_on(probe_managed_at(controller, input, address, limits))
     }
 
     #[test]
@@ -828,6 +962,127 @@ mod tests {
             Reply::json(r#"{"data":[{"id":"model-a"}]}"#),
         );
         assert_eq!(server.address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn production_managed_endpoint_is_fixed_loopback() {
+        assert_eq!(MANAGED_LOCAL_PORT, 20_128);
+        assert_eq!(MANAGED_LOCAL_BASE_URL, "http://127.0.0.1:20128/v1");
+    }
+
+    #[test]
+    fn healthy_preexisting_managed_service_runs_auth_and_models_without_ownership() {
+        let server = Server::start(
+            Reply::json(r#"{"ok":true}"#),
+            Reply::status(200),
+            Reply::json(r#"{"data":[{"id":"model-a"}]}"#),
+        );
+        let controller = ConnectionController::default();
+        let result = run_managed(&controller, &managed_input(None), server.address, FAST_LIMITS).unwrap();
+
+        assert_eq!(result.mode, super::ConnectionMode::ManagedLocal);
+        assert_eq!(result.base_url, format!("http://{}/v1", server.address));
+        assert_eq!(result.health, HealthStatus::Healthy);
+        assert_eq!(result.auth, AuthStatus::NotRequired);
+        assert_eq!(result.ownership, Some(ConnectionOwnership::External));
+        assert_eq!(result.models, vec![super::ModelInfo { id: "model-a".into(), name: None }]);
+        assert_eq!(
+            server.observed().into_iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            ["/api/health", "/api/v1/realtime/auth", "/v1/models"]
+        );
+
+        controller.shutdown().unwrap();
+        assert!(TcpStream::connect(server.address).is_ok(), "classification and shutdown leave listener alive");
+    }
+
+    #[test]
+    fn managed_occupied_listener_rejects_non_durindoor_health_without_stopping_it() {
+        for health in [
+            Reply::status(503),
+            Reply::json(r#"{"ok":false}"#),
+            Reply::json(r#"{"ok":"true"}"#),
+            Reply::json(r#"{"ready":true}"#),
+            Reply::json("not-json"),
+            Reply::json(&"x".repeat(FAST_LIMITS.health_body_limit + 1)),
+            Reply {
+                status: 200,
+                body: br#"{"ok":true}"#.to_vec(),
+                delay: Duration::from_millis(100),
+            },
+        ] {
+            let server = Server::start(
+                health,
+                Reply::status(200),
+                Reply::json(r#"{"data":[{"id":"model-a"}]}"#),
+            );
+            let controller = ConnectionController::default();
+            assert_eq!(
+                run_managed(&controller, &managed_input(None), server.address, FAST_LIMITS),
+                Err(ControllerError::ManagedPortOccupied)
+            );
+            controller.shutdown().unwrap();
+            assert!(TcpStream::connect(server.address).is_ok(), "occupied listener remains alive");
+        }
+        assert_eq!(
+            serde_json::to_value(ControllerError::ManagedPortOccupied).unwrap(),
+            serde_json::json!({
+                "code": "port-occupied",
+                "message": "Port 20128 is occupied by a service that is not DurinDoor"
+            })
+        );
+    }
+
+    #[test]
+    fn free_managed_port_returns_typed_installation_needed_without_fake_success() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve free address");
+        let address = listener.local_addr().expect("free address");
+        drop(listener);
+        let controller = ConnectionController::default();
+
+        assert_eq!(
+            run_managed(&controller, &managed_input(None), address, FAST_LIMITS),
+            Err(ControllerError::InstallationNeeded)
+        );
+        assert_eq!(
+            serde_json::to_value(ControllerError::InstallationNeeded).unwrap(),
+            serde_json::json!({
+                "code": "installation-needed",
+                "message": "DurinDoor installation is required"
+            })
+        );
+    }
+
+    #[test]
+    fn concurrent_managed_probes_are_serialized() {
+        let server = Server::start(
+            Reply {
+                status: 200,
+                body: br#"{"ok":true}"#.to_vec(),
+                delay: Duration::from_millis(100),
+            },
+            Reply::status(200),
+            Reply::json(r#"{"data":[{"id":"model-a"}]}"#),
+        );
+        let controller = Arc::new(ConnectionController::default());
+        let first_controller = Arc::clone(&controller);
+        let address = server.address;
+        let first = thread::spawn(move || {
+            run_managed(&first_controller, &managed_input(None), address, ProbeLimits {
+                read_timeout: Duration::from_secs(1),
+                overall_timeout: Duration::from_secs(1),
+                ..FAST_LIMITS
+            })
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while server.observed().is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!server.observed().is_empty(), "first managed probe reached health endpoint");
+        assert_eq!(
+            run_managed(&controller, &managed_input(None), server.address, FAST_LIMITS),
+            Err(ControllerError::Busy)
+        );
+        assert!(first.join().expect("first probe thread").is_ok());
     }
 
     #[test]
@@ -929,6 +1184,8 @@ mod tests {
             Reply::json(r#"{"data":[{"id":"model-a"},{"id":"model-b","name":"Model B"}]}"#),
         );
         let result = run(&input(server.url("127.0.0.1", "/v1"), None, false)).unwrap();
+        assert_eq!(result.ownership, None);
+        assert!(serde_json::to_value(&result).unwrap().get("ownership").is_none());
         assert_eq!(result.base_url, server.url("127.0.0.1", "/v1"));
         assert_eq!(result.models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(), ["model-a", "model-b"]);
     }
