@@ -18,7 +18,7 @@ pub fn run() {
         .expect("failed to build Melon");
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            let _ = handle.state::<ConnectionController>().shutdown();
+            let _ = handle.state::<ConnectionController>().shutdown_terminal();
         }
     });
 }
