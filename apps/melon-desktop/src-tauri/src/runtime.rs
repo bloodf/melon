@@ -18,6 +18,10 @@ use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
 use std::ptr;
 #[cfg(windows)]
@@ -44,6 +48,7 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zip::ZipArchive;
 
@@ -56,6 +61,7 @@ const UNIX_FILE_TYPE_MASK: u32 = 0o170000;
 const UNIX_REGULAR_FILE: u32 = 0o100000;
 const UNIX_DIRECTORY: u32 = 0o040000;
 static NEXT_CANDIDATE: AtomicU64 = AtomicU64::new(0);
+static ACTIVATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone, Copy)]
 struct ExtractionLimits {
@@ -108,6 +114,272 @@ impl From<zip::result::ZipError> for RuntimeError {
     fn from(error: zip::result::ZipError) -> Self {
         Self::Zip(error)
     }
+}
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ActivationOutcome {
+    Published,
+    Reused,
+}
+
+/// Verifies, validates, and atomically publishes one cached runtime archive.
+///
+/// `required_entries` names regular payload files required by the caller's pinned runtime layout.
+pub(crate) fn activate_runtime(
+    archive_path: &Path,
+    expected_sha256: &str,
+    final_dir: &Path,
+    required_entries: &[&str],
+) -> Result<ActivationOutcome, RuntimeError> {
+    activate_runtime_with_hooks(
+        archive_path,
+        expected_sha256,
+        final_dir,
+        required_entries,
+        || Ok(()),
+        || Ok(()),
+    )
+}
+
+fn activate_runtime_with_hooks(
+    archive_path: &Path,
+    expected_sha256: &str,
+    final_dir: &Path,
+    required_entries: &[&str],
+    before_commit: impl FnOnce() -> io::Result<()>,
+    after_commit: impl FnOnce() -> io::Result<()>,
+) -> Result<ActivationOutcome, RuntimeError> {
+    let _lock = ACTIVATION_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("runtime activation lock was poisoned"))?;
+    let archive_cleanup = CacheArtifact::new(archive_path);
+    let digest = parse_sha256(expected_sha256)?;
+    validate_required_paths(required_entries)?;
+    if reusable_runtime(final_dir, &digest, required_entries)? {
+        drop(archive_cleanup);
+        return Ok(ActivationOutcome::Reused);
+    }
+
+    let parent = final_dir
+        .parent()
+        .ok_or_else(|| RuntimeError::UnsafePath(final_dir.display().to_string()))?;
+    let mut staging = ActivationDirectory::create(parent, ".melon-activate-staging")?;
+    let mut archive = fs::File::open(archive_path)?;
+    verify_and_extract_zip(&mut archive, expected_sha256, staging.path())?;
+    drop(archive);
+    staging.reopen()?;
+    validate_required_entries(staging.dir(), required_entries)?;
+    write_activation_marker(staging.dir(), expected_sha256)?;
+    before_commit()?;
+
+    if final_dir.try_exists()? {
+        atomic_replace_runtime(staging.path(), final_dir)?;
+        if let Err(error) = after_commit() {
+            atomic_replace_runtime(staging.path(), final_dir)?;
+            return Err(error.into());
+        }
+        if let Err(error) = validate_published_runtime(final_dir, &digest, required_entries) {
+            atomic_replace_runtime(staging.path(), final_dir)?;
+            return Err(error);
+        }
+        staging.reopen()?;
+        staging.cleanup()?;
+    } else {
+        fs::rename(staging.path(), final_dir)?;
+        staging.disarm();
+    }
+    drop(archive_cleanup);
+    Ok(ActivationOutcome::Published)
+}
+
+const ACTIVATION_MARKER: &str = ".melon-activation-sha256";
+fn validate_required_paths(required_entries: &[&str]) -> Result<(), RuntimeError> {
+    for path in required_entries {
+        let (validated, _) = validate_path(path)?;
+        if validated.as_os_str() == ACTIVATION_MARKER {
+            return Err(RuntimeError::UnsafePath((*path).into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_entries(dir: &Dir, required_entries: &[&str]) -> Result<(), RuntimeError> {
+    for path in required_entries {
+        let path = Path::new(path);
+        let mut current = dir.try_clone()?;
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(component) = component else {
+                return Err(RuntimeError::UnsafePath(path.display().to_string()));
+            };
+            if components.peek().is_some() {
+                current = open_child_directory(&current, component)
+                    .map_err(|_| RuntimeError::UnsafePath(path.display().to_string()))?;
+            } else {
+                let mut options = OpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                let file = current
+                    .open_with(component, &options)
+                    .map_err(|_| RuntimeError::UnsafePath(path.display().to_string()))?;
+                if !file.metadata()?.is_file() {
+                    return Err(RuntimeError::UnsafePath(path.display().to_string()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_activation_marker(dir: &Dir, digest: &str) -> Result<(), RuntimeError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).follow(FollowSymlinks::No);
+    let mut marker = dir.open_with(ACTIVATION_MARKER, &options)?;
+    marker.write_all(digest.as_bytes())?;
+    marker.sync_all()?;
+    Ok(())
+}
+
+fn reusable_runtime(
+    final_dir: &Path,
+    digest: &[u8; 32],
+    required_entries: &[&str],
+) -> Result<bool, RuntimeError> {
+    if !final_dir.try_exists()? {
+        return Ok(false);
+    }
+    Ok(validate_published_runtime(final_dir, digest, required_entries).is_ok())
+}
+
+fn validate_published_runtime(
+    final_dir: &Path,
+    digest: &[u8; 32],
+    required_entries: &[&str],
+) -> Result<(), RuntimeError> {
+    let dir = open_runtime_directory(final_dir)?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut marker = dir.open_with(ACTIVATION_MARKER, &options)?;
+    if marker.metadata()?.len() != 64 {
+        return Err(RuntimeError::InvalidDigest);
+    }
+    let mut value = String::with_capacity(64);
+    marker.read_to_string(&mut value)?;
+    if parse_sha256(&value)? != *digest {
+        return Err(RuntimeError::DigestMismatch);
+    }
+    validate_required_entries(&dir, required_entries)
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_replace_runtime(staging: &Path, final_dir: &Path) -> Result<(), RuntimeError> {
+    const RENAME_EXCHANGE: libc::c_uint = 2;
+    let staging = CString::new(staging.as_os_str().as_bytes())
+        .map_err(|_| RuntimeError::UnsafePath(staging.display().to_string()))?;
+    let final_dir = CString::new(final_dir.as_os_str().as_bytes())
+        .map_err(|_| RuntimeError::UnsafePath(final_dir.display().to_string()))?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            staging.as_ptr(),
+            libc::AT_FDCWD,
+            final_dir.as_ptr(),
+            RENAME_EXCHANGE,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn atomic_replace_runtime(_staging: &Path, _final_dir: &Path) -> Result<(), RuntimeError> {
+    Err(RuntimeError::InvalidArchive(
+        "atomic runtime replacement is unsupported on this platform",
+    ))
+}
+
+
+struct CacheArtifact<'a>(&'a Path);
+
+impl<'a> CacheArtifact<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self(path)
+    }
+}
+
+impl Drop for CacheArtifact<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0);
+    }
+}
+
+struct ActivationDirectory {
+    path: PathBuf,
+    dir: Option<Dir>,
+}
+
+impl ActivationDirectory {
+    fn create(parent: &Path, prefix: &str) -> Result<Self, RuntimeError> {
+        let parent_dir = open_runtime_directory(parent)?;
+        loop {
+            let path = random_sibling(parent, prefix)?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| RuntimeError::UnsafePath(path.display().to_string()))?;
+            match create_candidate_directory(&parent_dir, name) {
+                Ok(dir) => {
+                    #[cfg(unix)]
+                    fs::set_permissions(
+                        &path,
+                        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+                    )?;
+                    return Ok(Self { path, dir: Some(dir) });
+                }
+                Err(RuntimeError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn dir(&self) -> &Dir {
+        self.dir.as_ref().expect("activation directory handle remains live")
+    }
+
+    fn reopen(&mut self) -> Result<(), RuntimeError> {
+        self.dir = Some(open_runtime_directory(&self.path)?);
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.dir = None;
+    }
+
+    fn cleanup(&mut self) -> Result<(), RuntimeError> {
+        if let Some(dir) = self.dir.take() {
+            cleanup_candidate(dir)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ActivationDirectory {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+fn random_sibling(parent: &Path, prefix: &str) -> Result<PathBuf, RuntimeError> {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).map_err(|error| io::Error::other(format!("OS randomness failed: {error}")))?;
+    Ok(parent.join(format!(
+        "{prefix}-{}",
+        nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+    )))
 }
 
 /// Streams a runtime candidate through SHA-256 and accepts only an exact canonical trusted digest.
@@ -1691,6 +1963,258 @@ mod tests {
         assert!(!outside.join("node").exists());
         assert!(staging.join("bin").symlink_metadata().expect("symlink remains").file_type().is_symlink());
     }
+    fn runtime_archive(node: &[u8], cli: &[u8]) -> Vec<u8> {
+        archive(&[("bin/node", node), ("durindoor/cli.js", cli)])
+    }
+
+    fn write_archive_candidate(temp: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = temp.0.join(name);
+        fs::write(&path, bytes).expect("write archive candidate");
+        path
+    }
+
+    const REQUIRED_RUNTIME_ENTRIES: &[&str] = &["bin/node", "durindoor/cli.js"];
+
+    #[test]
+    fn activation_publishes_only_validated_runtime() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        let bytes = runtime_archive(b"node", b"cli");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "runtime.zip", &bytes);
+
+        let outcome = activate_runtime(&archive, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+            .expect("activate runtime");
+
+        assert_eq!(outcome, ActivationOutcome::Published);
+        assert_eq!(fs::read(final_dir.join("bin/node")).expect("node"), b"node");
+        assert_eq!(fs::read(final_dir.join("durindoor/cli.js")).expect("cli"), b"cli");
+        assert!(!archive.exists(), "consumed cache artifact removed");
+        assert_no_activation_residue(&temp.0);
+    }
+    #[test]
+    fn activation_hash_failure_removes_cache_before_extraction() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        let bytes = runtime_archive(b"node", b"cli");
+        let archive = write_archive_candidate(&temp, "bad-hash.zip", &bytes);
+
+        let error = activate_runtime(
+            &archive,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            &final_dir,
+            REQUIRED_RUNTIME_ENTRIES,
+        )
+        .expect_err("hash mismatch must fail before extraction");
+
+        assert!(matches!(error, RuntimeError::DigestMismatch), "{error:?}");
+        assert!(!archive.exists(), "failed cache artifact removed");
+        assert!(!final_dir.exists(), "no partial final runtime");
+        assert_no_activation_residue(&temp.0);
+    }
+    #[test]
+    fn activation_rejects_unsafe_required_entry_before_extraction() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        let bytes = runtime_archive(b"node", b"cli");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "unsafe-required.zip", &bytes);
+
+        let error = activate_runtime(&archive, &digest, &final_dir, &["../outside"])
+            .expect_err("unsafe required path must fail");
+
+        assert!(matches!(error, RuntimeError::UnsafePath(_)), "{error:?}");
+        assert!(!archive.exists(), "failed cache artifact removed");
+        assert!(!final_dir.exists(), "no partial final runtime");
+        assert_no_activation_residue(&temp.0);
+    }
+
+
+
+    #[test]
+    fn activation_failure_preserves_existing_runtime_and_app_data() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        let app_data = temp.0.join("app-data");
+        fs::create_dir(&app_data).expect("app data");
+        fs::write(app_data.join("state"), b"keep").expect("app state");
+        activate_fixture(&temp, &final_dir, b"old", b"old-cli");
+        let bytes = archive(&[("bin/node", b"new")]);
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "invalid-layout.zip", &bytes);
+
+        let error = activate_runtime(&archive, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+            .expect_err("missing required entry must fail");
+
+        assert!(matches!(error, RuntimeError::UnsafePath(_)), "{error:?}");
+        assert_eq!(fs::read(final_dir.join("bin/node")).expect("old node"), b"old");
+        assert_eq!(fs::read(app_data.join("state")).expect("app state"), b"keep");
+        assert!(!archive.exists(), "failed cache artifact removed");
+        assert_no_activation_residue(&temp.0);
+    }
+
+    #[test]
+    fn activation_reuses_identical_runtime() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        let bytes = runtime_archive(b"same", b"same-cli");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let first = write_archive_candidate(&temp, "first.zip", &bytes);
+        activate_runtime(&first, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+            .expect("initial activation");
+        let repeat = write_archive_candidate(&temp, "repeat.zip", &bytes);
+
+        assert_eq!(
+            activate_runtime(&repeat, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+                .expect("reuse runtime"),
+            ActivationOutcome::Reused,
+        );
+        assert!(!repeat.exists(), "reused cache artifact removed");
+        assert_no_activation_residue(&temp.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_fails_closed_until_atomic_swap_is_available() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        activate_fixture(&temp, &final_dir, b"old", b"old-cli");
+        let bytes = runtime_archive(b"new", b"new-cli");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "replacement.zip", &bytes);
+
+        let error = activate_runtime(&archive, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+            .expect_err("unsupported replacement must fail closed");
+
+        assert!(matches!(error, RuntimeError::InvalidArchive(_)), "{error:?}");
+        assert_eq!(fs::read(final_dir.join("bin/node")).expect("old node"), b"old");
+        assert!(!archive.exists(), "failed cache artifact removed");
+        assert_no_activation_residue(&temp.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activation_rolls_back_existing_runtime_on_precommit_failure() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        activate_fixture(&temp, &final_dir, b"old", b"old-cli");
+        let bytes = runtime_archive(b"new", b"new-cli");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "replacement.zip", &bytes);
+
+        let error = activate_runtime_with_hooks(
+            &archive,
+            &digest,
+            &final_dir,
+            REQUIRED_RUNTIME_ENTRIES,
+            || Err(io::Error::other("injected pre-commit failure")),
+            || Ok(()),
+        )
+        .expect_err("pre-commit failure must preserve existing runtime");
+
+        assert!(matches!(error, RuntimeError::Io(_)), "{error:?}");
+        assert_eq!(fs::read(final_dir.join("bin/node")).expect("rolled-back node"), b"old");
+        assert!(!archive.exists(), "failed cache artifact removed");
+        assert_no_activation_residue(&temp.0);
+    }
+
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activation_rolls_back_after_failed_atomic_commit() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        activate_fixture(&temp, &final_dir, b"old", b"old-cli");
+        let bytes = runtime_archive(b"new", b"new-cli");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "replacement.zip", &bytes);
+
+        let error = activate_runtime_with_hooks(
+            &archive,
+            &digest,
+            &final_dir,
+            REQUIRED_RUNTIME_ENTRIES,
+            || Ok(()),
+            || Err(io::Error::other("injected post-swap failure")),
+        )
+        .expect_err("post-swap failure must roll back");
+
+        assert!(matches!(error, RuntimeError::Io(_)), "{error:?}");
+        assert_eq!(fs::read(final_dir.join("bin/node")).expect("rolled-back node"), b"old");
+        assert!(!archive.exists(), "failed cache artifact removed");
+        assert_no_activation_residue(&temp.0);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activation_replaces_valid_runtime_and_reuses_identical_digest() {
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        activate_fixture(&temp, &final_dir, b"old", b"old-cli");
+        let bytes = runtime_archive(b"new", b"new-cli");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(&temp, "replacement.zip", &bytes);
+        assert_eq!(
+            activate_runtime(&archive, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+                .expect("replace runtime"),
+            ActivationOutcome::Published,
+        );
+        let repeat = write_archive_candidate(&temp, "repeat.zip", &bytes);
+        assert_eq!(
+            activate_runtime(&repeat, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+                .expect("reuse runtime"),
+            ActivationOutcome::Reused,
+        );
+        assert_eq!(fs::read(final_dir.join("bin/node")).expect("new node"), b"new");
+        assert!(!repeat.exists(), "reused cache artifact removed");
+        assert_no_activation_residue(&temp.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_same_target_activation_never_publishes_partial_runtime() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempDir::new();
+        let final_dir = temp.0.join("runtime");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for (index, value) in [b"one".as_slice(), b"two".as_slice()].into_iter().enumerate() {
+            let bytes = runtime_archive(value, value);
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            let archive = write_archive_candidate(&temp, &format!("runtime-{index}.zip"), &bytes);
+            let final_dir = final_dir.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                activate_runtime(&archive, &digest, &final_dir, REQUIRED_RUNTIME_ENTRIES)
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("activation thread").expect("serialized activation");
+        }
+        let node = fs::read(final_dir.join("bin/node")).expect("published node");
+        let cli = fs::read(final_dir.join("durindoor/cli.js")).expect("published cli");
+        assert_eq!(node, cli, "one complete candidate must win");
+        assert!(node == b"one" || node == b"two");
+        assert_no_activation_residue(&temp.0);
+    }
+
+    fn activate_fixture(temp: &TempDir, final_dir: &Path, node: &[u8], cli: &[u8]) {
+        let bytes = runtime_archive(node, cli);
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let archive = write_archive_candidate(temp, "fixture.zip", &bytes);
+        activate_runtime(&archive, &digest, final_dir, REQUIRED_RUNTIME_ENTRIES)
+            .expect("activate fixture");
+    }
+
+    fn assert_no_activation_residue(parent: &Path) {
+        let residue = fs::read_dir(parent)
+            .expect("activation parent")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".melon-activate-"));
+        assert!(!residue, "activation staging and backup residue removed");
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_rejects_staging_junction_without_touching_target() {
