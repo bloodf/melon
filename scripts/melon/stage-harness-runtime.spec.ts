@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -159,6 +159,53 @@ describe('Harness runtime staging', () => {
     expect(invocations.some(invocation => invocation.args.includes('release:verify-packed-install'))).toBe(true)
   })
 
+  it('restores the prior publication after one candidate rename failure', () => {
+    const root = temporaryRoot()
+    repository(root)
+    const resources = join(root, 'apps/melon-desktop/src-tauri/resources')
+    const published = join(resources, 'harness')
+    writeFile(join(published, 'previous.txt'), 'keep\n')
+    let renames = 0
+
+    expect(() => stageHarnessRuntime({
+      repoRoot: root,
+      run: fixtureRunner([]),
+      rename: (from, to) => {
+        renames += 1
+        if (renames === 2) throw new Error('candidate publication failed')
+        renameSync(from, to)
+      },
+    })).toThrow(/candidate publication failed/)
+
+    expect(readFileSync(join(published, 'previous.txt'), 'utf8')).toBe('keep\n')
+    expect(readdirSync(resources).filter(name => name.startsWith('.harness-backup-'))).toEqual([])
+  })
+
+  it('retains the prior publication outside candidate cleanup when publication and restore both fail', () => {
+    const root = temporaryRoot()
+    repository(root)
+    const resources = join(root, 'apps/melon-desktop/src-tauri/resources')
+    const published = join(resources, 'harness')
+    writeFile(join(published, 'previous.txt'), 'recover me\n')
+    let renames = 0
+
+    expect(() => stageHarnessRuntime({
+      repoRoot: root,
+      run: fixtureRunner([]),
+      rename: (from, to) => {
+        renames += 1
+        if (renames >= 2) throw new Error(`rename ${String(renames)} failed`)
+        renameSync(from, to)
+      },
+    })).toThrow(/prior runtime retained for recovery at .*\.harness-backup-/)
+
+    expect(existsSync(published)).toBe(false)
+    const backups = readdirSync(resources).filter(name => name.startsWith('.harness-backup-'))
+    expect(backups).toHaveLength(1)
+    expect(readFileSync(join(resources, backups[0]!, 'runtime', 'previous.txt'), 'utf8')).toBe('recover me\n')
+    expect(readdirSync(resources).some(name => name.startsWith('.harness-stage-'))).toBe(false)
+  })
+
   it('publishes a validated candidate and cleans staging state', () => {
     const root = temporaryRoot()
     repository(root)
@@ -188,6 +235,7 @@ describe('Harness runtime staging', () => {
       ['pnpm', '--filter', '@deepseek-ai/dsh', 'deploy', '--legacy', '--prod', '--config.node-linker=hoisted', '--config.auto-install-peers=false', '--config.link-workspace-packages=true', expect.any(String)],
     ])
     expect(existsSync(dirname(result.candidatePath))).toBe(false)
+    expect(readdirSync(join(root, 'apps/melon-desktop/src-tauri/resources')).filter(name => name.startsWith('.harness-backup-'))).toEqual([])
     expect(existsSync(result.candidatePath)).toBe(false)
   })
 })

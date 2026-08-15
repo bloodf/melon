@@ -13,10 +13,12 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import { isEntry } from '../release/process.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '../..')
@@ -78,6 +80,7 @@ export interface StageHarnessResult {
 interface StageHarnessOptions {
   readonly repoRoot?: string
   readonly run?: (invocation: CommandInvocation) => void
+  readonly rename?: (from: string, to: string) => void
 }
 
 function readManifest(path: string): PackageManifest {
@@ -362,16 +365,56 @@ function readHarnessSourceSha(repoRoot: string): string {
   return requireString(pins.harness?.sourceSha, 'harness.sourceSha', pinsPath)
 }
 
-function publishCandidate(candidate: string, publication: string, backup: string): void {
-  const hadPublication = existsSync(publication)
-  if (hadPublication) renameSync(publication, backup)
+function removeOwnedBackup(resources: string, backupRoot: string): void {
+  if (dirname(backupRoot) !== resources || !basename(backupRoot).startsWith('.harness-backup-')) {
+    throw new Error(`Harness staging: refusing to remove unowned backup path ${backupRoot}.`)
+  }
+  const remove = (path: string): void => {
+    const status = lstatSync(path)
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      unlinkSync(path)
+      return
+    }
+    for (const name of readdirSync(path)) remove(join(path, name))
+    rmdirSync(path)
+  }
+  remove(backupRoot)
+}
+
+function publishCandidate(
+  candidate: string,
+  publication: string,
+  resources: string,
+  rename: (from: string, to: string) => void,
+): void {
+  if (!existsSync(publication)) {
+    rename(candidate, publication)
+    return
+  }
+
+  const backupRoot = mkdtempSync(join(resources, '.harness-backup-'))
+  const backup = join(backupRoot, 'runtime')
   try {
-    renameSync(candidate, publication)
+    rename(publication, backup)
   } catch (error) {
-    if (hadPublication) renameSync(backup, publication)
+    removeOwnedBackup(resources, backupRoot)
     throw error
   }
-  if (hadPublication) rmSync(backup, { recursive: true, force: true })
+  try {
+    rename(candidate, publication)
+  } catch (publishError) {
+    try {
+      rename(backup, publication)
+    } catch (restoreError) {
+      throw new Error(
+        `Harness staging: candidate publication and prior-runtime restore failed; prior runtime retained for recovery at ${backup}.`,
+        { cause: new AggregateError([publishError, restoreError]) },
+      )
+    }
+    removeOwnedBackup(resources, backupRoot)
+    throw publishError
+  }
+  removeOwnedBackup(resources, backupRoot)
 }
 
 /**
@@ -392,8 +435,8 @@ export function stageHarnessRuntime(options: StageHarnessOptions = {}): StageHar
   const packedVendor = join(workspace, 'packed-vendor')
   const packedLandlock = join(workspace, 'packed-landlock')
   const publication = join(repoRoot, PUBLICATION_RELATIVE)
-  const backup = join(workspace, 'previous')
   const run = options.run ?? defaultRun
+  const rename = options.rename ?? renameSync
   const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
   const invoke = (args: readonly string[]): void => run({ command: pnpm, args, cwd: repoRoot, env: childEnvironment() })
 
@@ -415,7 +458,7 @@ export function stageHarnessRuntime(options: StageHarnessOptions = {}): StageHar
     const closure = validateHarnessClosure(candidate)
     const descriptor = createRuntimeDescriptor(closure, { harnessSourceSha: readHarnessSourceSha(repoRoot) })
     writeFileSync(join(candidate, DESCRIPTOR_NAME), `${JSON.stringify(descriptor, null, 2)}\n`, { mode: 0o644, flag: 'wx' })
-    publishCandidate(candidate, publication, backup)
+    publishCandidate(candidate, publication, resources, rename)
     return { publicationPath: publication, candidatePath: candidate, descriptor }
   } finally {
     rmSync(workspace, { recursive: true, force: true })
