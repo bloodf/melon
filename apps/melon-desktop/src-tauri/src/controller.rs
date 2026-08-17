@@ -1,11 +1,13 @@
-use crate::config::normalize_endpoint;
+use crate::config::{write_connection, ConnectionDocument, ModelRecord, normalize_endpoint};
 use crate::process_tree::ProcessTree;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,6 +92,9 @@ pub struct ConnectionController {
     key_persistence_available: bool,
     stop_grace: Duration,
     operation_wait_budget: Duration,
+    app_data: PathBuf,
+    harness_root: PathBuf,
+    node_sidecar: PathBuf,
 }
 
 impl Default for ConnectionController {
@@ -99,6 +104,9 @@ impl Default for ConnectionController {
             key_persistence_available: false,
             stop_grace: PROCESS_STOP_GRACE,
             operation_wait_budget: OPERATION_WAIT_BUDGET,
+            app_data: PathBuf::new(),
+            harness_root: PathBuf::new(),
+            node_sidecar: PathBuf::new(),
         }
     }
 }
@@ -232,6 +240,22 @@ impl ConnectionController {
             key_persistence_available,
             stop_grace,
             operation_wait_budget: stop_grace.saturating_mul(4) + Duration::from_millis(250),
+            app_data: PathBuf::new(),
+            harness_root: PathBuf::new(),
+            node_sidecar: PathBuf::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_activate(app_data: PathBuf, harness_root: PathBuf, node_sidecar: PathBuf) -> Self {
+        Self {
+            state: Mutex::new(ControllerState::default()),
+            key_persistence_available: false,
+            stop_grace: PROCESS_STOP_GRACE,
+            operation_wait_budget: OPERATION_WAIT_BUDGET,
+            app_data,
+            harness_root,
+            node_sidecar,
         }
     }
 }
@@ -387,7 +411,7 @@ pub enum ConnectionMode {
     External,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
     pub mode: ConnectionMode,
@@ -399,14 +423,14 @@ pub struct ProbeResult {
     pub models: Vec<ModelInfo>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConnectionOwnership {
     Managed,
     External,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthStatus {
     Verified,
@@ -414,7 +438,7 @@ pub enum AuthStatus {
     Unavailable,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HealthStatus {
     Healthy,
@@ -748,15 +772,124 @@ fn map_request_error(error: reqwest::Error) -> ControllerError {
     }
 }
 
+const PLACEHOLDER_KEY: &str = "sk_durindoor";
+const HARNESS_READY_BUDGET: Duration = Duration::from_secs(20);
+
+fn require_model(probe: &ProbeResult, model: &str) -> Result<(), ControllerError> {
+    if probe.models.iter().any(|entry| entry.id == model) {
+        Ok(())
+    } else {
+        Err(ControllerError::EmptyModels)
+    }
+}
+
+fn write_cordis_patch(path: &Path, base_url: &str, model: &str, models: &[ModelInfo]) -> Result<(), ControllerError> {
+    let catalog = models
+        .iter()
+        .map(|entry| format!("          - id: {}\n", entry.id))
+        .collect::<String>();
+    let yaml = format!(
+        "- id: llm-pi-ai\n  config:\n    providers:\n      durindoor:\n        displayName: DurinDoor\n        apiKeyEnv: MELON_DURINDOOR_API_KEY\n        api: openai-completions\n        baseURL: {base_url}\n        models:\n{catalog}- id: agent-default-model\n  config:\n    provider: durindoor\n    model: {model}\n- id: llm-deepseek\n  disabled: true\n- id: web-search-deepseek\n  disabled: true\n- id: tool-web\n  config:\n    search: false\n    fetch: false\n"
+    );
+    if yaml.contains(PLACEHOLDER_KEY) {
+        return Err(ControllerError::ActivationFailed);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| ControllerError::ActivationFailed)?;
+    }
+    std::fs::write(path, yaml).map_err(|_| ControllerError::ActivationFailed)
+}
+
+fn bind_loopback() -> Result<u16, ControllerError> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|_| ControllerError::ActivationFailed)?;
+    Ok(listener.local_addr().map_err(|_| ControllerError::ActivationFailed)?.port())
+}
+
+fn read_dsh_bin(harness_root: &Path) -> Result<PathBuf, ControllerError> {
+    let descriptor = std::fs::read_to_string(harness_root.join("melon-harness-runtime.json"))
+        .map_err(|_| ControllerError::ActivationFailed)?;
+    let value: Value = serde_json::from_str(&descriptor).map_err(|_| ControllerError::ActivationFailed)?;
+    let relative = value.get("dshBin").and_then(Value::as_str).ok_or(ControllerError::ActivationFailed)?;
+    let bin = harness_root.join(relative);
+    if bin.is_file() { Ok(bin) } else { Err(ControllerError::ActivationFailed) }
+}
+
+fn wait_http_ready(port: u16, deadline: Instant) -> Result<(), ControllerError> {
+    let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+            if std::io::Write::write_all(&mut stream, request.as_bytes()).is_ok() {
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(&mut stream, &mut body);
+                if body.starts_with("HTTP/1.1 200") || body.starts_with("HTTP/1.0 200") {
+                    return Ok(());
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(ControllerError::ActivationFailed)
+}
+fn activate_external(
+    controller: &ConnectionController,
+    probe: ProbeResult,
+    model: String,
+    api_key: Option<String>,
+) -> Result<SavedConnection, ControllerError> {
+    let operation = controller.begin_operation()?;
+    require_model(&probe, &model)?;
+    if controller.harness_root.as_os_str().is_empty() || controller.node_sidecar.as_os_str().is_empty() {
+        return Err(ControllerError::NotImplemented("connection activation is not available yet".into()));
+    }
+    let dsh = read_dsh_bin(&controller.harness_root)?;
+    let home = controller.app_data.join("harness");
+    let patch = home.join("melon.cordis.patch.yml");
+    write_cordis_patch(&patch, &probe.base_url, &model, &probe.models)?;
+    let port = bind_loopback()?;
+    let mut command = Command::new(&controller.node_sidecar);
+    command
+        .arg(&dsh)
+        .args(["--profile", "web", "--patch"])
+        .arg(&patch)
+        .args(["--", "--host", "127.0.0.1", "--port", &port.to_string()])
+        .current_dir(std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir))
+        .env("DSH_HOME", &home)
+        .env("DSH_TELEMETRY_DISABLED", "1")
+        .env("MELON_DURINDOOR_API_KEY", api_key.as_deref().filter(|key| !key.is_empty()).unwrap_or(PLACEHOLDER_KEY))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut tree = ProcessTree::spawn(&mut command).map_err(|_| ControllerError::ActivationFailed)?;
+    if let Err(error) = wait_http_ready(port, Instant::now() + HARNESS_READY_BUDGET) {
+        let _ = tree.stop(controller.stop_grace);
+        return Err(error);
+    }
+    operation.adopt(OwnedProcesses { harness: Some(Box::new(tree)), managed_durindoor: None }, true)?;
+    let connection = ConnectionDocument {
+        schema_version: 1,
+        mode: crate::config::ConnectionMode::External,
+        base_url: probe.base_url.clone(),
+        model: model.clone(),
+        allow_insecure_http: probe.base_url.starts_with("http://"),
+        credential_account: None,
+        catalog: probe.models.iter().map(|entry| ModelRecord { id: entry.id.clone() }).collect(),
+        managed_runtime_version: None,
+    };
+    write_connection(&controller.app_data.join("connection.json"), &connection)
+        .map_err(|_| ControllerError::ActivationFailed)?;
+    Ok(SavedConnection { mode: probe.mode, base_url: probe.base_url, model })
+}
+
 #[tauri::command]
 pub fn activate(
     controller: tauri::State<'_, ConnectionController>,
     probe: Value,
     model: String,
 ) -> Result<SavedConnection, ControllerError> {
-    let _operation = controller.begin_operation()?;
-    let _ = (probe, model);
-    Err(ControllerError::NotImplemented("connection activation is not available yet".into()))
+    let parsed: ProbeResult = serde_json::from_value(probe).map_err(|_| ControllerError::InvalidEndpoint)?;
+    activate_external(&controller, parsed, model, None)
 }
 
 #[tauri::command]
@@ -1241,6 +1374,64 @@ mod tests {
             tauri::async_runtime::block_on(probe_external(&input, limits)),
             Err(ControllerError::ProbeTimedOut)
         );
+    }
+
+    fn staged_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let harness = root.join("resources/harness");
+        let sidecar = root.join("binaries/node-x86_64-unknown-linux-gnu");
+        (harness.join("lib/bin.js").is_file() && sidecar.is_file()).then_some((harness, sidecar))
+    }
+
+    fn probe_result(base_url: &str, model: &str) -> super::ProbeResult {
+        super::ProbeResult {
+            mode: super::ConnectionMode::External,
+            base_url: base_url.into(),
+            auth: super::AuthStatus::NotRequired,
+            health: super::HealthStatus::Healthy,
+            ownership: None,
+            models: vec![super::ModelInfo { id: model.into(), name: None }],
+        }
+    }
+
+    #[test]
+    fn activate_rejects_a_model_missing_from_the_probe() {
+        let controller = ConnectionController::default();
+        let error = super::activate_external(
+            &controller,
+            probe_result("http://127.0.0.1:9/v1", "model-a"),
+            "missing".into(),
+            None,
+        ).unwrap_err();
+        assert_eq!(error, ControllerError::EmptyModels);
+        assert!(!controller.status_snapshot().running);
+    }
+
+    #[test]
+    fn activate_launches_staged_web_then_shutdown_stops_it() {
+        let Some((harness, sidecar)) = staged_paths() else {
+            panic!("stage Harness and Node sidecar before activate tests");
+        };
+        let data = std::env::temp_dir().join(format!("melon-activate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        let controller = ConnectionController::for_activate(data.clone(), harness, sidecar);
+        let saved = super::activate_external(
+            &controller,
+            probe_result("http://127.0.0.1:9/v1", "model-a"),
+            "model-a".into(),
+            None,
+        ).expect("activate");
+        assert_eq!(saved.model, "model-a");
+        assert!(controller.status_snapshot().running);
+        let patch = std::fs::read_to_string(data.join("harness/melon.cordis.patch.yml")).unwrap();
+        assert!(patch.contains("provider: durindoor"));
+        assert!(!patch.contains("sk_durindoor"));
+        let connection = std::fs::read_to_string(data.join("connection.json")).unwrap();
+        assert!(connection.contains("model-a"));
+        controller.shutdown().unwrap();
+        assert!(!controller.status_snapshot().running);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
 
