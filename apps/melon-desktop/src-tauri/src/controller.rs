@@ -1,4 +1,9 @@
-use crate::config::{write_connection, ConnectionDocument, ModelRecord, normalize_endpoint};
+use crate::config::{
+    write_connection, ConnectionDocument, CredentialStore, ModelRecord, NativeCredentialBackend,
+    Persistence, normalize_endpoint,
+};
+#[cfg(test)]
+use crate::config::MemoryCredentialBackend;
 use crate::process_tree::ProcessTree;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -93,15 +98,25 @@ struct RuntimeLayout {
     node_sidecar: PathBuf,
 }
 
-#[derive(Debug)]
 pub struct ConnectionController {
     state: Mutex<ControllerState>,
     key_persistence_available: bool,
     stop_grace: Duration,
     operation_wait_budget: Duration,
     layout: Mutex<RuntimeLayout>,
+    credentials: Mutex<CredentialStore<Box<dyn crate::config::CredentialBackend>>>,
 }
 
+
+impl std::fmt::Debug for ConnectionController {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectionController")
+            .field("key_persistence_available", &self.key_persistence_available)
+            .field("stop_grace", &self.stop_grace)
+            .finish_non_exhaustive()
+    }
+}
 impl Default for ConnectionController {
     fn default() -> Self {
         Self::with_runtime(PathBuf::new(), PathBuf::new(), PathBuf::new())
@@ -116,6 +131,7 @@ impl ConnectionController {
             stop_grace: PROCESS_STOP_GRACE,
             operation_wait_budget: OPERATION_WAIT_BUDGET,
             layout: Mutex::new(RuntimeLayout { app_data, harness_root, node_sidecar }),
+            credentials: Mutex::new(CredentialStore::new(Box::new(NativeCredentialBackend) as Box<dyn crate::config::CredentialBackend>)),
         }
     }
 
@@ -257,7 +273,10 @@ impl ConnectionController {
 
     #[cfg(test)]
     fn for_activate(app_data: PathBuf, harness_root: PathBuf, node_sidecar: PathBuf) -> Self {
-        Self::with_runtime(app_data, harness_root, node_sidecar)
+        let controller = Self::with_runtime(app_data, harness_root, node_sidecar);
+        *controller.credentials.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            CredentialStore::new(Box::new(MemoryCredentialBackend::default()) as Box<dyn crate::config::CredentialBackend>);
+        controller
     }
 }
 
@@ -838,24 +857,36 @@ pub(crate) fn target_sidecar_name() -> Option<String> {
     Some(if cfg!(windows) { format!("node-{triple}.exe") } else { format!("node-{triple}") })
 }
 
-pub(crate) fn resolve_node_sidecar(resource_dir: &Path, exe_dir: Option<&Path>) -> PathBuf {
-    let Some(name) = target_sidecar_name() else { return PathBuf::new() };
-    let beside_resources = resource_dir.join(&name);
-    if beside_resources.is_file() {
-        return beside_resources;
+fn sidecar_candidates(resource_dir: &Path, exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let bundled = if cfg!(windows) { "node.exe" } else { "node" };
+    let staged = target_sidecar_name();
+    let mut paths = Vec::new();
+    if let Some(dir) = exe_dir {
+        paths.push(dir.join(bundled));
+        if let Some(name) = &staged { paths.push(dir.join(name)); }
     }
-    exe_dir.map(|dir| dir.join(&name)).filter(|path| path.is_file()).unwrap_or_default()
+    paths.push(resource_dir.join(bundled));
+    paths.push(resource_dir.join("binaries").join(bundled));
+    if let Some(name) = &staged {
+        paths.push(resource_dir.join(name));
+        paths.push(resource_dir.join("binaries").join(name));
+    }
+    paths
+}
+
+pub(crate) fn resolve_node_sidecar(resource_dir: &Path, exe_dir: Option<&Path>) -> PathBuf {
+    sidecar_candidates(resource_dir, exe_dir).into_iter().find(|path| path.is_file()).unwrap_or_default()
 }
 
 pub(crate) fn resolve_harness_root(resource_dir: &Path) -> PathBuf {
-    let nested = resource_dir.join("harness");
-    if nested.join("melon-harness-runtime.json").is_file() {
-        nested
-    } else if resource_dir.join("melon-harness-runtime.json").is_file() {
-        resource_dir.to_path_buf()
-    } else {
-        PathBuf::new()
-    }
+    [
+        resource_dir.join("resources/harness"),
+        resource_dir.join("harness"),
+        resource_dir.to_path_buf(),
+    ]
+    .into_iter()
+    .find(|path| path.join("melon-harness-runtime.json").is_file())
+    .unwrap_or_default()
 }
 
 fn bind_loopback() -> Result<u16, ControllerError> {
@@ -926,19 +957,29 @@ fn activate_external(
         return Err(error);
     }
     operation.adopt(OwnedProcesses { harness: Some(Box::new(tree)), managed_durindoor: None }, true)?;
+    let credential_account = persist_api_key(controller, &probe.base_url, api_key.as_deref());
     let connection = ConnectionDocument {
         schema_version: 1,
         mode: crate::config::ConnectionMode::External,
         base_url: probe.base_url.clone(),
         model: model.clone(),
         allow_insecure_http: probe.base_url.starts_with("http://"),
-        credential_account: None,
+        credential_account,
         catalog: probe.models.iter().map(|entry| ModelRecord { id: entry.id.clone() }).collect(),
         managed_runtime_version: None,
     };
     write_connection(&layout.app_data.join("connection.json"), &connection)
         .map_err(|_| ControllerError::ActivationFailed)?;
     Ok(SavedConnection { mode: probe.mode, base_url: probe.base_url, model })
+}
+
+fn persist_api_key(controller: &ConnectionController, base_url: &str, api_key: Option<&str>) -> Option<String> {
+    let secret = api_key.filter(|key| !key.is_empty())?;
+    let account = normalize_endpoint(base_url).ok()?.credential_account();
+    let persistence = controller.credentials.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save(&account, secret);
+    match persistence {
+        Persistence::Native | Persistence::SessionOnly => Some(account),
+    }
 }
 
 #[tauri::command]
@@ -1490,41 +1531,48 @@ mod tests {
             &controller,
             probe_result("http://127.0.0.1:9/v1", "model-a"),
             "model-a".into(),
-            None,
+            Some("user-secret".into()),
         ).expect("activate");
         assert_eq!(saved.model, "model-a");
         assert!(controller.status_snapshot().running);
         let patch = std::fs::read_to_string(data.join("harness/melon.cordis.patch.yml")).unwrap();
         assert!(patch.contains("provider: durindoor"));
         assert!(!patch.contains("sk_durindoor"));
+        assert!(!patch.contains("user-secret"));
         let connection = std::fs::read_to_string(data.join("connection.json")).unwrap();
         assert!(connection.contains("model-a"));
+        assert!(connection.contains("http://127.0.0.1:9/v1"));
+        assert!(!connection.contains("user-secret"));
+        assert_eq!(
+            controller.credentials.lock().unwrap().load("http://127.0.0.1:9/v1").as_deref(),
+            Some("user-secret"),
+        );
         controller.shutdown().unwrap();
         assert!(!controller.status_snapshot().running);
         let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
-    fn resolve_harness_root_accepts_nested_or_flat_descriptor() {
+    fn resolve_harness_root_accepts_bundled_resources_harness() {
         let root = std::env::temp_dir().join(format!("melon-resolve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let nested = root.join("resources/harness");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("melon-harness-runtime.json"), "{}").unwrap();
-        assert_eq!(super::resolve_harness_root(&root.join("resources")), nested);
+        let bundled = root.join("resources/harness");
+        std::fs::create_dir_all(&bundled).unwrap();
+        std::fs::write(bundled.join("melon-harness-runtime.json"), "{}").unwrap();
+        assert_eq!(super::resolve_harness_root(&root), bundled);
         assert!(super::resolve_harness_root(&root.join("missing")).as_os_str().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn resolve_node_sidecar_prefers_existing_target_file() {
-        let Some(name) = super::target_sidecar_name() else { return };
+    fn resolve_node_sidecar_prefers_bundled_node_beside_exe() {
         let root = std::env::temp_dir().join(format!("melon-sidecar-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let sidecar = root.join(&name);
-        std::fs::write(&sidecar, b"node").unwrap();
-        assert_eq!(super::resolve_node_sidecar(&root, None), sidecar);
+        let exe = root.join("exe");
+        std::fs::create_dir_all(&exe).unwrap();
+        let bundled = exe.join(if cfg!(windows) { "node.exe" } else { "node" });
+        std::fs::write(&bundled, b"node").unwrap();
+        assert_eq!(super::resolve_node_sidecar(&root, Some(&exe)), bundled);
         assert!(super::resolve_node_sidecar(&root.join("missing"), None).as_os_str().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

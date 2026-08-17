@@ -3,7 +3,7 @@ use url::{Host, Url};
 const CREDENTIAL_SERVICE: &str = "com.bloodf.melon";
 
 /// Secure credential operations keyed by a deterministic endpoint account.
-pub trait CredentialBackend {
+pub trait CredentialBackend: Send {
     fn set(&self, account: &str, secret: &str) -> Result<(), String>;
     fn get(&self, account: &str) -> Result<String, String>;
 }
@@ -23,6 +23,11 @@ impl CredentialBackend for NativeCredentialBackend {
             .and_then(|entry| entry.get_password())
             .map_err(|error| error.to_string())
     }
+}
+
+impl CredentialBackend for Box<dyn CredentialBackend> {
+    fn set(&self, account: &str, secret: &str) -> Result<(), String> { (**self).set(account, secret) }
+    fn get(&self, account: &str) -> Result<String, String> { (**self).get(account) }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,6 +65,22 @@ impl<B: CredentialBackend> CredentialStore<B> {
 impl CredentialStore<NativeCredentialBackend> {
     pub fn native() -> Self {
         Self::new(NativeCredentialBackend)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct MemoryCredentialBackend {
+    store: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl CredentialBackend for MemoryCredentialBackend {
+    fn set(&self, account: &str, secret: &str) -> Result<(), String> {
+        self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(account.to_owned(), secret.to_owned());
+        Ok(())
+    }
+
+    fn get(&self, account: &str) -> Result<String, String> {
+        self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(account).cloned().ok_or_else(|| "missing".into())
     }
 }
 
