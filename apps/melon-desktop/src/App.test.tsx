@@ -148,6 +148,27 @@ describe('App controller wiring', () => {
     expect((screen.getByLabelText('API key (optional)') as HTMLInputElement).value).toBe('bad-key')
   })
 
+  it('confirms non-loopback HTTP before probing', async () => {
+    const client = {
+      status: vi.fn(async () => ({ keyPersistenceAvailable: true, running: false })),
+      probe: vi.fn(async () => modelProbe),
+      activate: vi.fn(), shutdown: vi.fn(async () => undefined),
+    }
+    render(<App client={client} />)
+    fireEvent.click(screen.getByRole('button', { name: /Connect an existing DurinDoor/i }))
+    fireEvent.change(screen.getByLabelText('DurinDoor URL'), { target: { value: 'http://192.168.1.10:20128/v1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Check connection' }))
+    expect(client.probe).not.toHaveBeenCalled()
+    expect(screen.getByRole('heading', { name: 'Confirm insecure HTTP' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue over HTTP' }))
+    await waitFor(() => expect(client.probe).toHaveBeenCalledWith({
+      mode: 'external',
+      baseUrl: 'http://192.168.1.10:20128/v1',
+      apiKey: '',
+      allowInsecureHttp: true,
+    }))
+  })
+
   it('shows truthful probing state when managed setup starts', async () => {
     const client = {
       status: vi.fn(async () => ({ keyPersistenceAvailable: true, running: false })),

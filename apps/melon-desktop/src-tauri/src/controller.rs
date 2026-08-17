@@ -183,10 +183,13 @@ impl ConnectionController {
         if query_error && state.recoverable_error.is_none() {
             state.recoverable_error = Some(RECOVERABLE_QUERY.into());
         }
+        let app_data = self.layout.lock().unwrap_or_else(std::sync::PoisonError::into_inner).app_data.clone();
+        drop(state);
         ControllerStatus {
             key_persistence_available: self.key_persistence_available,
             running,
-            recoverable_error: state.recoverable_error.clone(),
+            recoverable_error: self.lock().recoverable_error.clone(),
+            connection: read_saved_connection(&app_data),
         }
     }
     pub fn shutdown(&self) -> Result<(), ControllerError> {
@@ -413,6 +416,8 @@ pub struct ControllerStatus {
     pub running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recoverable_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<SavedConnection>,
 }
 
 #[derive(Deserialize)]
@@ -478,6 +483,22 @@ pub struct SavedConnection {
     pub mode: ConnectionMode,
     pub base_url: String,
     pub model: String,
+}
+
+fn read_saved_connection(app_data: &Path) -> Option<SavedConnection> {
+    let text = std::fs::read_to_string(app_data.join("connection.json")).ok()?;
+    let document: ConnectionDocument = serde_json::from_str(&text).ok()?;
+    if document.base_url.is_empty() || document.model.is_empty() {
+        return None;
+    }
+    Some(SavedConnection {
+        mode: match document.mode {
+            crate::config::ConnectionMode::External => ConnectionMode::External,
+            crate::config::ConnectionMode::ManagedLocal => ConnectionMode::ManagedLocal,
+        },
+        base_url: document.base_url,
+        model: document.model,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -976,9 +997,9 @@ fn activate_external(
 fn persist_api_key(controller: &ConnectionController, base_url: &str, api_key: Option<&str>) -> Option<String> {
     let secret = api_key.filter(|key| !key.is_empty())?;
     let account = normalize_endpoint(base_url).ok()?.credential_account();
-    let persistence = controller.credentials.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save(&account, secret);
-    match persistence {
-        Persistence::Native | Persistence::SessionOnly => Some(account),
+    match controller.credentials.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save(&account, secret) {
+        Persistence::Native => Some(account),
+        Persistence::SessionOnly => None,
     }
 }
 

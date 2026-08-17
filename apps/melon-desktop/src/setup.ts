@@ -34,6 +34,7 @@ export type SetupAction =
   | { type: 'begin-probe'; mode: ConnectionMode }
   | { type: 'progress'; progress: { stage: ProgressStage; percent: number; message?: string } }
   | { type: 'external-failed'; input: ExternalInput; message: string }
+  | { type: 'return-external'; input: ExternalInput }
   | { type: 'probe-succeeded'; probe: ProbeResult }
   | { type: 'select-model'; model: string }
   | { type: 'activate' }
@@ -56,6 +57,7 @@ export function reduceSetup(state: SetupState, action: SetupAction): SetupState 
     case 'progress': return { screen: 'managed-progress', ...action.progress }
     case 'probe-succeeded': return { screen: 'model-selection', probe: action.probe }
     case 'external-failed': return { screen: 'external', input: action.input, validationError: action.message }
+    case 'return-external': return { screen: 'external', input: action.input }
     case 'select-model':
       if (state.screen !== 'model-selection' || !state.probe.models.some(model => model.id === action.model)) return state
       return { ...state, selectedModel: action.model }

@@ -9,7 +9,7 @@ import './styles.css'
 interface SetupScreenProps {
   state: SetupState
   dispatch: Dispatch<SetupAction>
-  onProbeExternal?: (input: ExternalInput) => void
+  onProbeExternal?: (input: ExternalInput & { allowInsecureHttp?: boolean }) => void
   onProbeManaged?: () => void
   onActivate?: (probe: ProbeResult, model: string) => void
   onReconfigure?: () => void
@@ -26,7 +26,7 @@ export function SetupScreen({ state, dispatch, onProbeExternal, onProbeManaged, 
       const submit = (event: FormEvent) => { event.preventDefault(); onProbeExternal?.(state.input) }
       return <Frame eyebrow="Melon / External" title="Connect an existing DurinDoor"><form className="form-stack" onSubmit={submit}><label>DurinDoor URL<input type="url" value={state.input.baseUrl} aria-invalid={state.validationError !== undefined} onChange={event => dispatch({ type: 'update-external', input: { ...state.input, baseUrl: event.target.value } })} /></label><label>API key (optional)<input type="password" value={state.input.apiKey} aria-invalid={state.validationError !== undefined} onChange={event => dispatch({ type: 'update-external', input: { ...state.input, apiKey: event.target.value } })} /></label>{state.validationError !== undefined && <p role="alert">{state.validationError}</p>}<button type="submit">Check connection</button></form></Frame>
     }
-    case 'insecure-http': return <Frame eyebrow="Melon / Security" title="Confirm insecure HTTP"><p>Traffic is not encrypted. An API key can be exposed to the network.</p></Frame>
+    case 'insecure-http': return <Frame eyebrow="Melon / Security" title="Confirm insecure HTTP"><p>Traffic is not encrypted. An API key can be exposed to the network.</p><div className="actions"><button type="button" onClick={() => onProbeExternal?.({ ...state.input, allowInsecureHttp: true })}>Continue over HTTP</button><button type="button" onClick={() => dispatch({ type: 'return-external', input: state.input })}>Go back</button></div></Frame>
     case 'probing': return <Frame eyebrow="Melon / Probe" title="Checking DurinDoor"><p>Validating endpoint and loading available models.</p></Frame>
     case 'managed-progress': return <Frame eyebrow="Melon / Local" title="Installing DurinDoor"><progress max={100} value={state.percent} /><p>{state.message ?? state.stage}</p></Frame>
     case 'model-selection': {
@@ -44,6 +44,16 @@ function controllerError(error: unknown) {
   return { code: 'controller-error', message: error instanceof Error ? error.message : 'Controller operation failed', recover: 'retry' as const }
 }
 
+function needsInsecureHttpConfirm(baseUrl: string | undefined): boolean {
+  if (baseUrl === undefined || !baseUrl.startsWith('http://')) return false
+  try {
+    const host = new URL(baseUrl).hostname
+    return host !== '127.0.0.1' && host !== 'localhost' && host !== '::1' && host !== '[::1]'
+  } catch {
+    return true
+  }
+}
+
 export function App({ client = createTauriClient() }: { client?: ControllerClient }) {
   const [state, dispatch] = useReducer(reduceSetup, initialSetupState)
   const currentState = useRef(state)
@@ -59,6 +69,10 @@ export function App({ client = createTauriClient() }: { client?: ControllerClien
     })
   }, [client])
   const probe = async (input: Parameters<ControllerClient['probe']>[0]) => {
+    if (input.mode === 'external' && needsInsecureHttpConfirm(input.baseUrl) && input.allowInsecureHttp !== true) {
+      dispatch({ type: 'confirm-insecure-http', input: { baseUrl: input.baseUrl ?? '', apiKey: input.apiKey ?? '' } })
+      return
+    }
     const operation = ++generation.current
     lastApiKey.current = input.apiKey
     dispatch({ type: 'begin-probe', mode: input.mode })
