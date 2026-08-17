@@ -9,8 +9,11 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   renameSync,
+  rmdirSync,
   rmSync,
+  unlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
@@ -39,6 +42,7 @@ export interface StageNodeSidecarOptions {
   readonly target: string
   readonly archive: string
   readonly checksums: string
+  readonly rename?: (from: string, to: string) => void
 }
 
 export interface StageNodeSidecarResult {
@@ -61,7 +65,8 @@ function extractOfficialNode(archive: string, destination: string, member: strin
   }
   mkdirSync(destination, { recursive: true })
   const listed = spawnSync('tar', [archive.endsWith('.zip') ? '-xf' : '-xzf', archive, '-C', destination, member], {
-    cwd: dirname(archive),
+    cwd: destination,
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
     stdio: 'inherit',
     shell: false,
   })
@@ -71,6 +76,56 @@ function extractOfficialNode(archive: string, destination: string, member: strin
   const status = lstatSync(extracted)
   if (status.isSymbolicLink() || !status.isFile()) throw new Error('Harness sidecar: extracted node is not a regular file.')
   return extracted
+}
+function removeOwnedBackup(binaries: string, backupRoot: string): void {
+  if (dirname(backupRoot) !== binaries || !basename(backupRoot).startsWith('.node-backup-')) {
+    throw new Error(`Harness sidecar: refusing to remove unowned backup path ${backupRoot}.`)
+  }
+  const remove = (path: string): void => {
+    const status = lstatSync(path)
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      unlinkSync(path)
+      return
+    }
+    for (const name of readdirSync(path)) remove(join(path, name))
+    rmdirSync(path)
+  }
+  remove(backupRoot)
+}
+
+function publishSidecar(
+  candidate: string,
+  sidecarPath: string,
+  binaries: string,
+  rename: (from: string, to: string) => void,
+): void {
+  if (!existsSync(sidecarPath)) {
+    rename(candidate, sidecarPath)
+    return
+  }
+  const backupRoot = mkdtempSync(join(binaries, '.node-backup-'))
+  const previous = join(backupRoot, 'previous')
+  try {
+    rename(sidecarPath, previous)
+  } catch (error) {
+    removeOwnedBackup(binaries, backupRoot)
+    throw error
+  }
+  try {
+    rename(candidate, sidecarPath)
+  } catch (publishError) {
+    try {
+      rename(previous, sidecarPath)
+    } catch (restoreError) {
+      throw new Error(
+        `Harness sidecar: candidate publication and prior-sidecar restore failed; prior sidecar retained for recovery at ${previous}.`,
+        { cause: new AggregateError([publishError, restoreError]) },
+      )
+    }
+    removeOwnedBackup(binaries, backupRoot)
+    throw publishError
+  }
+  removeOwnedBackup(binaries, backupRoot)
 }
 
 /**
@@ -96,18 +151,12 @@ export function stageNodeSidecar(options: StageNodeSidecarOptions): StageNodeSid
   const workspace = mkdtempSync(join(binaries, '.node-stage-'))
   const unpack = mkdtempSync(join(tmpdir(), 'melon-node-unpack-'))
   const candidate = join(workspace, `node${spec.suffix}`)
+  const rename = options.rename ?? renameSync
   try {
     const extracted = extractOfficialNode(options.archive, unpack, `${spec.archiveRoot}/${spec.nodePath}`)
     copyFileSync(extracted, candidate)
-    chmodSync(candidate, lstatSync(extracted).mode & 0o777)
-    const previous = existsSync(sidecarPath) ? join(workspace, 'previous') : undefined
-    if (previous !== undefined) renameSync(sidecarPath, previous)
-    try {
-      renameSync(candidate, sidecarPath)
-    } catch (error) {
-      if (previous !== undefined && existsSync(previous)) renameSync(previous, sidecarPath)
-      throw error
-    }
+    chmodSync(candidate, 0o755)
+    publishSidecar(candidate, sidecarPath, binaries, rename)
     return { sidecarPath }
   } finally {
     rmSync(workspace, { recursive: true, force: true })

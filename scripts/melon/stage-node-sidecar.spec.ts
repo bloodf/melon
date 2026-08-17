@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -150,6 +150,63 @@ describe('Node sidecar staging', () => {
     })
 
     expect(readFileSync(result.sidecarPath)).toEqual(node)
-    expect(existsSync(join(root, 'apps/melon-desktop/src-tauri/binaries/.node-stage'))).toBe(false)
+    expect(lstatSync(result.sidecarPath).mode & 0o111).not.toBe(0)
+    expect(readdirSync(join(root, 'apps/melon-desktop/src-tauri/binaries')).some(name => name.startsWith('.node-stage-') || name.startsWith('.node-backup-'))).toBe(false)
+  })
+
+  it('restores the prior sidecar after one candidate rename failure', () => {
+    const node = Buffer.from('#!/usr/bin/env node\nnew-node\n')
+    const fixture = archiveWith(MEMBER, node)
+    const root = temporaryRoot()
+    repository(root, fixture.sha256)
+    const published = join(root, 'apps/melon-desktop/src-tauri/binaries/node-x86_64-unknown-linux-gnu')
+    mkdirSync(dirname(published), { recursive: true })
+    writeFileSync(published, 'keep\n')
+    let renames = 0
+
+    expect(() => stageNodeSidecar({
+      repoRoot: root,
+      target: LINUX,
+      archive: fixture.archive,
+      checksums: fixture.checksums,
+      rename: (from, to) => {
+        renames += 1
+        if (renames === 2) throw new Error('candidate publication failed')
+        renameSync(from, to)
+      },
+    })).toThrow(/candidate publication failed/)
+
+    expect(readFileSync(published, 'utf8')).toBe('keep\n')
+    expect(readdirSync(join(root, 'apps/melon-desktop/src-tauri/binaries')).filter(name => name.startsWith('.node-backup-'))).toEqual([])
+  })
+
+  it('retains the prior sidecar outside workspace cleanup when publication and restore both fail', () => {
+    const node = Buffer.from('#!/usr/bin/env node\nnew-node\n')
+    const fixture = archiveWith(MEMBER, node)
+    const root = temporaryRoot()
+    repository(root, fixture.sha256)
+    const binaries = join(root, 'apps/melon-desktop/src-tauri/binaries')
+    const published = join(binaries, 'node-x86_64-unknown-linux-gnu')
+    mkdirSync(binaries, { recursive: true })
+    writeFileSync(published, 'recover me\n')
+    let renames = 0
+
+    expect(() => stageNodeSidecar({
+      repoRoot: root,
+      target: LINUX,
+      archive: fixture.archive,
+      checksums: fixture.checksums,
+      rename: (from, to) => {
+        renames += 1
+        if (renames >= 2) throw new Error(`rename ${String(renames)} failed`)
+        renameSync(from, to)
+      },
+    })).toThrow(/prior sidecar retained for recovery at .*\.node-backup-/)
+
+    expect(existsSync(published)).toBe(false)
+    const backups = readdirSync(binaries).filter(name => name.startsWith('.node-backup-'))
+    expect(backups).toHaveLength(1)
+    expect(readFileSync(join(binaries, backups[0]!, 'previous'), 'utf8')).toBe('recover me\n')
+    expect(readdirSync(binaries).some(name => name.startsWith('.node-stage-'))).toBe(false)
   })
 })

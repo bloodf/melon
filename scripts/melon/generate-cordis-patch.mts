@@ -28,7 +28,17 @@ function requireModelId(id: string, label: string): string {
  * Row config is replacement, not a deep merge. No credential bytes are emitted.
  */
 export function generateMelonCordisPatch(input: MelonPatchInput): string {
-  if (!/^https?:\/\/\S+\/v1$/.test(input.baseUrl)) {
+  let url: URL
+  try {
+    url = new URL(input.baseUrl)
+  } catch {
+    throw new Error('Melon Cordis patch: baseUrl must be an http(s) origin ending in /v1.')
+  }
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') {
+    throw new Error('Melon Cordis patch: endpoint must not include userinfo, query, or fragment.')
+  }
+  const path = url.pathname.replace(/\/+$/, '')
+  if (!path.endsWith('/v1') || path.split('/').filter(Boolean).at(-1) !== 'v1') {
     throw new Error('Melon Cordis patch: baseUrl must be an http(s) origin ending in /v1.')
   }
   const model = requireModelId(input.model, 'selected model')
