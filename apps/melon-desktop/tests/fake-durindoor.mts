@@ -9,7 +9,8 @@ export interface FakeDurinDoorOptions {
   models: Model[] | 'empty' | 'malformed' | 'oversized'
   delayMs?: number
 }
-export interface FakeDurinDoor { url: string; close(): Promise<void> }
+export interface FakeDurinDoorChat { path: string; authorization?: string; body: unknown }
+export interface FakeDurinDoor { url: string; chats: FakeDurinDoorChat[]; close(): Promise<void> }
 
 function authorized(header: string | undefined, key: string | undefined): boolean {
   return header === `Bearer ${key}`
@@ -17,6 +18,7 @@ function authorized(header: string | undefined, key: string | undefined): boolea
 
 /** Starts a loopback-only deterministic DurinDoor HTTP fixture. */
 export async function startFakeDurinDoor(options: FakeDurinDoorOptions): Promise<FakeDurinDoor> {
+  const chats: FakeDurinDoorChat[] = []
   const server = createServer(async (request, response) => {
     if (options.delayMs !== undefined) await new Promise(resolve => setTimeout(resolve, options.delayMs))
     const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
@@ -49,8 +51,21 @@ export async function startFakeDurinDoor(options: FakeDurinDoorOptions): Promise
     }
     if (path === '/v1/chat/completions' && request.method === 'POST') {
       if (!isAuthorized) { response.writeHead(401).end(); return }
+      const chunks: Buffer[] = []
+      for await (const chunk of request) chunks.push(chunk as Buffer)
+      const raw = Buffer.concat(chunks).toString('utf8')
+      chats.push({
+        path,
+        authorization: request.headers.authorization,
+        body: raw === '' ? undefined : JSON.parse(raw) as unknown,
+      })
       response.writeHead(200, { 'content-type': 'text/event-stream' })
-      response.end('data: {"choices":[{"delta":{"content":"melon"}}]}\n\ndata: [DONE]\n\n')
+      response.end([
+        'data: {"choices":[{"delta":{"content":"melon"}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}',
+        'data: [DONE]',
+        '',
+      ].join('\n\n'))
       return
     }
     response.writeHead(404).end()
@@ -64,9 +79,11 @@ export async function startFakeDurinDoor(options: FakeDurinDoorOptions): Promise
   if (address === null || typeof address === 'string') throw new Error('fake DurinDoor did not bind TCP')
   return {
     url: `http://127.0.0.1:${address.port}`,
+    chats,
     close: () => closeServer(server),
   }
 }
+
 
 function closeServer(server: Server): Promise<void> {
   server.closeIdleConnections()

@@ -32,6 +32,7 @@
     "melon:stage-node-sidecar": "tsx scripts/melon/stage-node-sidecar.mts",
     "melon:test:node-sidecar": "vitest run scripts/melon/stage-node-sidecar.spec.ts",
     "melon:test:cordis-patch": "vitest run scripts/melon/generate-cordis-patch.spec.ts",
+    "melon:test:fake-chat": "vitest run --config apps/melon-desktop/vite.config.ts apps/melon-desktop/tests/fake-chat-through-harness.test.mts apps/melon-desktop/tests/fake-durindoor.test.mts",
     "test:durindoor-payload": "vitest run scripts/melon/build-durindoor-payload.spec.ts",
     "melon:test": "pnpm --filter @bloodf/melon-desktop run test",
     "clean": "tsx scripts/clean.ts",
