@@ -31,6 +31,7 @@
     "melon:test:harness-runtime": "vitest run scripts/melon/stage-harness-runtime.spec.ts",
     "melon:stage-node-sidecar": "tsx scripts/melon/stage-node-sidecar.mts",
     "melon:test:node-sidecar": "vitest run scripts/melon/stage-node-sidecar.spec.ts",
+    "melon:test:cordis-patch": "vitest run scripts/melon/generate-cordis-patch.spec.ts",
     "test:durindoor-payload": "vitest run scripts/melon/build-durindoor-payload.spec.ts",
     "melon:test": "pnpm --filter @bloodf/melon-desktop run test",
     "clean": "tsx scripts/clean.ts",
