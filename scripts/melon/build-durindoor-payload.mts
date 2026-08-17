@@ -857,8 +857,8 @@ export function buildPayload(options: BuildOptions): { archive: string; sha256: 
     const entries: PayloadEntry[] = [
 
       { path: `bin/${options.target.includes('windows') ? 'node.exe' : 'node'}`, data: readFileSync(join(nodeRoot, spec.nodePath)), mode: options.target.includes('windows') ? 0o644 : 0o755 },
-      ...collectFiles(join(cliProject, 'node_modules'), 'app/node_modules', path => path === '.bin' || path.startsWith('.bin/')),
-      ...collectFiles(join(seedProject, 'node_modules'), 'runtime-seed/node_modules', path => path === '.bin' || path.startsWith('.bin/')),
+      ...collectFiles(join(cliProject, 'node_modules'), 'app/node_modules', path => path.split('/').includes('.bin')),
+      ...collectFiles(join(seedProject, 'node_modules'), 'runtime-seed/node_modules', path => path.split('/').includes('.bin')),
       { path: 'licenses/durindoor-LICENSE', data: readFileSync(join(cliProject, 'node_modules/durindoor/LICENSE')), mode: 0o644 },
       { path: 'licenses/node-LICENSE', data: readFileSync(join(nodeRoot, 'LICENSE')), mode: 0o644 },
       { path: 'runtime-seed/package.json', data: readFileSync(join(seedProject, 'package.json')), mode: 0o644 },

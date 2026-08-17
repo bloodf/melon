@@ -16,7 +16,7 @@ pnpm run melon:check
 
 ## Harness runtime
 
-`pnpm run melon:stage-harness-runtime` builds the upstream packages and Web frontend, verifies the current packed-install release path, deploys the `@deepseek-ai/dsh` production closure, validates package metadata and dependencies, then atomically publishes the generated closure under `src-tauri/resources/harness/`. Run `pnpm run melon:test:harness-runtime` for the fixture-based staging contract.
+`pnpm run melon:stage-harness-runtime` builds the upstream packages and Web frontend, verifies the current packed-install release path, deploys the `@deepseek-ai/dsh` production closure, validates package metadata and dependencies, then atomically publishes the generated closure under `src-tauri/resources/harness/`. Its descriptor hash covers exact staged artifact bytes and executable bits, excluding the descriptor file itself; upstream bundles may embed the checkout path, so this is artifact integrity rather than cross-machine reproducibility. If publication and automatic restoration both fail, the error names a retained `.harness-backup-*/runtime` directory beside `harness`; restore that directory before deleting it. Run `pnpm run melon:test:harness-runtime` for the fixture-based staging contract.
 
 ## DurinDoor payload
 

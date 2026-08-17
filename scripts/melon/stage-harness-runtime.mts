@@ -3,7 +3,8 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import {
-  cpSync,
+  chmodSync,
+  copyFileSync,
   existsSync,
   globSync,
   lstatSync,
@@ -31,6 +32,8 @@ interface PackageManifest {
   readonly name?: unknown
   readonly version?: unknown
   readonly bin?: unknown
+  readonly main?: unknown
+  readonly files?: unknown
   readonly dependencies?: unknown
   readonly peerDependencies?: unknown
   readonly peerDependenciesMeta?: unknown
@@ -58,7 +61,7 @@ export interface ValidatedHarnessClosure {
   }
 }
 
-/** Non-secret generated descriptor consumed by the desktop runtime. */
+/** Non-secret descriptor; `closure` covers every staged file except this descriptor itself and identifies exact built bytes, not cross-machine reproducibility. */
 export interface HarnessRuntimeDescriptor {
   readonly schemaVersion: 1
   readonly packageRoot: '.'
@@ -70,10 +73,9 @@ export interface HarnessRuntimeDescriptor {
   readonly closure: ValidatedHarnessClosure['closure']
 }
 
-/** Result paths from one completed staging publication. */
+/** Result from one completed staging publication. */
 export interface StageHarnessResult {
   readonly publicationPath: string
-  readonly candidatePath: string
   readonly descriptor: HarnessRuntimeDescriptor
 }
 
@@ -168,23 +170,77 @@ function packageRoots(packageRoot: string): string[] {
   visitNodeModules(join(packageRoot, 'node_modules'))
   return roots
 }
+interface RequiredDependency {
+  readonly key: string
+  readonly name: string
+  readonly range: string
+}
 
-function requiredDependencies(manifest: PackageManifest): string[] {
-  const dependencies = new Set<string>()
+function requiredDependencies(manifest: PackageManifest): RequiredDependency[] {
+  const dependencies = new Map<string, string>()
   if (manifest.dependencies !== null && typeof manifest.dependencies === 'object' && !Array.isArray(manifest.dependencies)) {
-    for (const name of Object.keys(manifest.dependencies)) dependencies.add(name)
+    for (const [name, range] of Object.entries(manifest.dependencies)) if (typeof range === 'string') dependencies.set(name, range)
   }
   if (manifest.peerDependencies !== null && typeof manifest.peerDependencies === 'object' && !Array.isArray(manifest.peerDependencies)) {
     const meta = manifest.peerDependenciesMeta !== null && typeof manifest.peerDependenciesMeta === 'object' && !Array.isArray(manifest.peerDependenciesMeta)
       ? manifest.peerDependenciesMeta as Record<string, unknown>
       : {}
-    for (const name of Object.keys(manifest.peerDependencies)) {
+    for (const [name, range] of Object.entries(manifest.peerDependencies)) {
       const entry = meta[name]
       if (entry !== null && typeof entry === 'object' && (entry as Record<string, unknown>).optional === true) continue
-      dependencies.add(name)
+      if (typeof range === 'string') dependencies.set(name, range)
     }
   }
-  return [...dependencies].sort()
+  return [...dependencies].sort(([left], [right]) => left.localeCompare(right)).map(([key, specifier]) => {
+    if (!specifier.startsWith('npm:')) return { key, name: key, range: specifier }
+    const alias = specifier.slice(4)
+    const split = alias.lastIndexOf('@')
+    if (split <= 0) throw new Error(`Harness staging: invalid npm alias ${specifier}.`)
+    return { key, name: alias.slice(0, split), range: alias.slice(split + 1) }
+  })
+}
+
+function versionNumbers(version: string): [number, number, number] | undefined {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/.exec(version)
+  return match === null ? undefined : [Number(match[1]), Number(match[2]), Number(match[3])]
+}
+
+function satisfiesComparator(version: string, comparator: string): boolean {
+  if (comparator === '' || comparator === '*' || comparator.startsWith('file:') || comparator.startsWith('link:')) return true
+  const actual = versionNumbers(version)
+  if (actual === undefined) return false
+  const match = /^(\^|~|>=|<=|>|<|=)?(\d+)(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?(?:-[0-9A-Za-z.-]+)?$/.exec(comparator)
+  if (match === null) return comparator.startsWith('workspace:') ? satisfiesRange(version, comparator.slice('workspace:'.length)) : false
+  const operator = match[1] ?? '='
+  const expected: [number, number, number] = [Number(match[2]), Number(match[3] ?? 0), Number(match[4] ?? 0)]
+  if (match[3] === 'x' || match[3] === '*') return actual[0] === expected[0]
+  if (match[4] === 'x' || match[4] === '*') return actual[0] === expected[0] && actual[1] === expected[1]
+  const comparison = actual[0] - expected[0] || actual[1] - expected[1] || actual[2] - expected[2]
+  if (operator === '^') return comparison >= 0 && actual[0] === expected[0]
+  if (operator === '~') return comparison >= 0 && actual[0] === expected[0] && actual[1] === expected[1]
+  if (operator === '>=') return comparison >= 0
+  if (operator === '<=') return comparison <= 0
+  if (operator === '>') return comparison > 0
+  if (operator === '<') return comparison < 0
+  return comparison === 0
+}
+
+function satisfiesRange(version: string, range: string): boolean {
+  if (range === 'workspace:^' || range === 'workspace:~' || range === 'workspace:*') return true
+  return range.split('||').some(disjunction => {
+    const tokens = disjunction.trim().split(/\s+/).filter(Boolean)
+    const parts: string[] = []
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index]!
+      if ((token === '>=' || token === '<=' || token === '>' || token === '<' || token === '=') && tokens[index + 1] !== undefined) {
+        parts.push(`${token}${tokens[index + 1]}`)
+        index += 1
+        continue
+      }
+      parts.push(token)
+    }
+    return parts.every(part => satisfiesComparator(version, part))
+  })
 }
 
 function filesInClosure(root: string): string[] {
@@ -203,29 +259,48 @@ function filesInClosure(root: string): string[] {
   visit(root)
   return files
 }
-
-function materializeLinks(root: string): void {
-  for (;;) {
-    const link = findLink(root)
-    if (link === undefined) return
-    const source = realpathSync(link)
-    const status = lstatSync(source)
-    rmSync(link, { recursive: true, force: true })
-    cpSync(source, link, { recursive: status.isDirectory(), dereference: true })
-  }
-}
-
-function findLink(directory: string): string | undefined {
+function findLinks(directory: string): string[] {
+  const links: string[] = []
   for (const name of readdirSync(directory).sort()) {
     const path = join(directory, name)
     const status = lstatSync(path)
-    if (status.isSymbolicLink()) return path
-    if (status.isDirectory()) {
-      const nested = findLink(path)
-      if (nested !== undefined) return nested
-    }
+    if (status.isSymbolicLink()) links.push(path)
+    else if (status.isDirectory()) links.push(...findLinks(path))
   }
-  return undefined
+  return links
+}
+
+function copyNoFollow(source: string, destination: string, allowedRoot: string, stack = new Set<string>()): void {
+  const status = lstatSync(source)
+  if (status.isSymbolicLink()) {
+    const target = realpathSync(source)
+    if (!isInside(allowedRoot, target)) throw new Error(`Harness staging: symlink target ${target} is outside allowed roots.`)
+    copyNoFollow(target, destination, allowedRoot, stack)
+    return
+  }
+  if (status.isDirectory()) {
+    const real = realpathSync(source)
+    if (stack.has(real)) throw new Error(`Harness staging: link cycle at ${source}.`)
+    stack.add(real)
+    mkdirSync(destination, { recursive: true })
+    for (const name of readdirSync(source).sort()) copyNoFollow(join(source, name), join(destination, name), allowedRoot, stack)
+    stack.delete(real)
+    return
+  }
+  if (!status.isFile()) throw new Error(`Harness staging: unsupported linked entry ${source}.`)
+  mkdirSync(dirname(destination), { recursive: true })
+  copyFileSync(source, destination)
+  chmodSync(destination, status.mode & 0o777)
+}
+
+function materializeLinks(root: string): void {
+  for (const link of findLinks(root)) {
+    if (!existsSync(link)) continue
+    const source = realpathSync(link)
+    if (!isInside(root, source)) throw new Error(`Harness staging: symlink target ${source} is outside allowed roots.`)
+    unlinkSync(link)
+    copyNoFollow(source, link, root)
+  }
 }
 
 function workspacePackages(repoRoot: string): Map<string, string> {
@@ -238,39 +313,109 @@ function workspacePackages(repoRoot: string): Map<string, string> {
   return packages
 }
 
+function globRegex(pattern: string): RegExp {
+  let source = '^'
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]!
+    if (char === '*' && pattern[index + 1] === '*') {
+      if (pattern[index + 2] === '/') { source += '(?:.*/)?'; index += 2 }
+      else { source += '.*'; index += 1 }
+    }
+    else if (char === '*') source += '[^/]*'
+    else if (char === '?') source += '[^/]'
+    else source += char.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')
+  }
+  return new RegExp(`${source}(?:/.*)?$`)
+}
+
+function isPublishable(relativePath: string, mandatory: RegExp, positive: readonly RegExp[], negative: readonly RegExp[], files: readonly string[]): boolean {
+  if (negative.some(pattern => pattern.test(relativePath))) return false
+  if (mandatory.test(relativePath)) return true
+  const explicitlyNamed = files.some(pattern => !pattern.startsWith('!') && pattern.replace(/^\.\//, '') === relativePath)
+  if ((/^\.env(?:\.|$)/.test(basename(relativePath)) || relativePath.endsWith('.tsbuildinfo')) && !explicitlyNamed) return false
+  return positive.some(pattern => pattern.test(relativePath))
+}
+
+function publishedFiles(source: string, manifest: PackageManifest): string[] {
+  if (!Array.isArray(manifest.files) || manifest.files.some(value => typeof value !== 'string')) {
+    throw new Error(`Harness staging: workspace package ${String(manifest.name)} must declare string files entries.`)
+  }
+  const files = manifest.files as string[]
+  const positive = files.filter(pattern => !pattern.startsWith('!')).map(pattern => globRegex(pattern.replace(/^\.\//, '')))
+  const negative = files.filter(pattern => pattern.startsWith('!')).map(pattern => globRegex(pattern.slice(1).replace(/^\.\//, '')))
+  const mandatory = /^(?:package\.json|readme(?:\..*)?|licen[cs]e(?:\..*)?|notice(?:\..*)?)$/i
+  const selected: string[] = []
+  const visit = (directory: string): void => {
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name)
+      const relativePath = relative(source, path).replaceAll('\\', '/')
+      if (
+        (relativePath === 'node_modules' || relativePath.startsWith('node_modules/'))
+        && !files.some(pattern => {
+          if (pattern.startsWith('!')) return false
+          const named = pattern.replace(/^\.\//, '')
+          return named === 'node_modules' || named.startsWith('node_modules/')
+        })
+      ) continue
+      const status = lstatSync(path)
+      if (status.isSymbolicLink()) throw new Error(`Harness staging: workspace publish surface contains symbolic link ${relativePath}.`)
+      if (status.isDirectory()) visit(path)
+      else if (!status.isFile()) throw new Error(`Harness staging: workspace publish surface contains special entry ${relativePath}.`)
+      else if (isPublishable(relativePath, mandatory, positive, negative, files)) selected.push(relativePath)
+    }
+  }
+  visit(source)
+  if (!selected.includes('package.json')) throw new Error(`Harness staging: workspace package ${String(manifest.name)} has no package.json.`)
+  return selected
+}
+
+function copyPublishedWorkspace(source: string, destination: string): void {
+  const manifest = readManifest(join(source, 'package.json'))
+  for (const relativePath of publishedFiles(source, manifest)) {
+    const from = join(source, ...relativePath.split('/'))
+    const to = join(destination, ...relativePath.split('/'))
+    const status = lstatSync(from)
+    mkdirSync(dirname(to), { recursive: true })
+    copyFileSync(from, to)
+    chmodSync(to, status.mode & 0o777)
+  }
+}
+
 function restoreWorkspaceDependencies(candidate: string, repoRoot: string): void {
   const workspaces = workspacePackages(repoRoot)
+  for (const link of findLinks(candidate)) {
+    const source = realpathSync(link)
+    if (!isInside(repoRoot, source)) continue
+    const manifestPath = join(source, 'package.json')
+    if (!existsSync(manifestPath)) continue
+    unlinkSync(link)
+    copyPublishedWorkspace(source, link)
+  }
   for (;;) {
     let restored = false
     for (const installedRoot of packageRoots(candidate)) {
       const manifest = readManifest(join(installedRoot, 'package.json'))
       for (const dependency of requiredDependencies(manifest)) {
-        if (installedPackageManifest(candidate, installedRoot, dependency) !== undefined) continue
-        const source = workspaces.get(dependency)
+        if (installedPackageManifest(candidate, installedRoot, dependency.key) !== undefined) continue
+        const source = workspaces.get(dependency.name)
         if (source === undefined) continue
-        const destination = join(candidate, 'node_modules', ...dependency.split('/'))
-        const sourceNodeModules = join(source, 'node_modules')
-        mkdirSync(dirname(destination), { recursive: true })
-        cpSync(source, destination, {
-          recursive: true,
-          dereference: true,
-          filter: path => path !== sourceNodeModules && !path.startsWith(`${sourceNodeModules}${sep}`),
-        })
+        const destination = join(candidate, 'node_modules', ...dependency.key.split('/'))
+        copyPublishedWorkspace(source, destination)
         restored = true
       }
     }
     if (!restored) return
   }
 }
-
 function closureDigest(root: string, files: readonly string[]): ValidatedHarnessClosure['closure'] {
   const hash = createHash('sha256')
   let totalBytes = 0
   for (const path of files) {
     const name = relative(root, path).replaceAll('\\', '/')
     const bytes = readFileSync(path)
+    const executable = lstatSync(path).mode & 0o111
     totalBytes += bytes.length
-    hash.update(`${name}\0${String(bytes.length)}\0`)
+    hash.update(`${name}\0${String(bytes.length)}\0${String(executable)}\0`)
     hash.update(bytes)
   }
   return { sha256: hash.digest('hex'), fileCount: files.length, totalBytes }
@@ -281,9 +426,31 @@ function closureDigest(root: string, files: readonly string[]): ValidatedHarness
  * @param packageRoot - Absolute pnpm deploy output.
  * @returns Descriptor-safe facts and deterministic closure integrity.
  */
-export function validateHarnessClosure(packageRoot: string): ValidatedHarnessClosure {
+function auditPackageSurfaces(root: string, workspaceNames?: ReadonlySet<string>): void {
+  for (const packageRoot of packageRoots(root)) {
+    const manifestPath = join(packageRoot, 'package.json')
+    const manifest = readManifest(manifestPath)
+    if (typeof manifest.name !== 'string') continue
+    if (workspaceNames !== undefined && !workspaceNames.has(manifest.name)) continue
+    if (!Array.isArray(manifest.files) || manifest.files.some(value => typeof value !== 'string')) continue
+    const allowed = new Set(publishedFiles(packageRoot, manifest))
+    for (const path of filesInClosure(packageRoot)) {
+      const relativePath = relative(packageRoot, path).replaceAll('\\', '/')
+      if (allowed.has(relativePath)) continue
+      if (relativePath.startsWith('node_modules/')) continue
+      if (relativePath === DESCRIPTOR_NAME && packageRoot === root) continue
+      throw new Error(`Harness staging: non-publishable package file ${String(manifest.name)}/${relativePath}.`)
+    }
+  }
+}
+
+export function validateHarnessClosure(
+  packageRoot: string,
+  options: { readonly workspaceNames?: ReadonlySet<string> } = {},
+): ValidatedHarnessClosure {
   const root = realpathSync(packageRoot)
   const files = filesInClosure(root)
+  auditPackageSurfaces(root, options.workspaceNames)
   const manifestPath = join(root, 'package.json')
   const manifest = readManifest(manifestPath)
   const packageName = requireString(manifest.name, 'name', manifestPath)
@@ -296,13 +463,18 @@ export function validateHarnessClosure(packageRoot: string): ValidatedHarnessClo
     const installedManifest = readManifest(installedManifestPath)
     const installedName = requireString(installedManifest.name, 'name', installedManifestPath)
     for (const dependency of requiredDependencies(installedManifest)) {
-      const dependencyManifest = installedPackageManifest(root, installedRoot, dependency)
-      if (dependencyManifest === undefined) {
-        throw new Error(`Harness staging: ${installedName} dependency ${dependency} is missing from the deployed closure.`)
+      const dependencyManifestPath = installedPackageManifest(root, installedRoot, dependency.key)
+      if (dependencyManifestPath === undefined) {
+        throw new Error(`Harness staging: ${installedName} dependency ${dependency.key} is missing from the deployed closure.`)
       }
-      const dependencyIdentity = requireString(readManifest(dependencyManifest).name, 'name', dependencyManifest)
-      if (dependencyIdentity !== dependency) {
-        throw new Error(`Harness staging: ${installedName} dependency ${dependency} resolved to ${dependencyIdentity}.`)
+      const dependencyManifest = readManifest(dependencyManifestPath)
+      const dependencyIdentity = requireString(dependencyManifest.name, 'name', dependencyManifestPath)
+      const dependencyVersion = requireString(dependencyManifest.version, 'version', dependencyManifestPath)
+      if (dependencyIdentity !== dependency.name) {
+        throw new Error(`Harness staging: ${installedName} dependency ${dependency.key} resolved to ${dependencyIdentity}.`)
+      }
+      if (options.workspaceNames?.has(installedName) !== false && !satisfiesRange(dependencyVersion, dependency.range)) {
+        throw new Error(`Harness staging: ${installedName} dependency ${dependency.key} resolved to version ${dependencyVersion}, outside ${dependency.range}.`)
       }
     }
   }
@@ -344,8 +516,18 @@ export function createRuntimeDescriptor(
   }
 }
 
-function childEnvironment(): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(process.env).filter(([name]) => !/(?:KEY|SECRET|TOKEN|PASSWORD)/i.test(name)))
+const BASE_ENV = ['PATH', 'HOME', 'USERPROFILE', 'TMPDIR', 'TEMP', 'TMP', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'CI', 'SHELL', 'NODE_EXTRA_CA_CERTS'] as const
+const REGISTRY_ENV = ['NPM_CONFIG_REGISTRY', 'npm_config_registry', 'NPM_CONFIG_USERCONFIG', 'npm_config_userconfig', 'NPM_TOKEN', 'NODE_AUTH_TOKEN'] as const
+
+function childEnvironment(registryAuth = false): NodeJS.ProcessEnv {
+  const names: readonly string[] = registryAuth ? [...BASE_ENV, ...REGISTRY_ENV] : BASE_ENV
+  return Object.fromEntries(names.flatMap(name => process.env[name] === undefined ? [] : [[name, process.env[name]!]]))
+}
+
+function pnpmInvocation(args: readonly string[], entrypoint: string): Pick<CommandInvocation, 'command' | 'args'> {
+  return process.platform === 'win32'
+    ? { command: process.execPath, args: [entrypoint, ...args] }
+    : { command: entrypoint, args }
 }
 
 function defaultRun(invocation: CommandInvocation): void {
@@ -420,7 +602,7 @@ function publishCandidate(
 /**
  * Build through current upstream release/deploy commands, validate, then publish by rename.
  * @param options - Test-only repository and command runner overrides.
- * @returns Published path, consumed candidate path, and descriptor.
+ * @returns Published path and descriptor.
  */
 export function stageHarnessRuntime(options: StageHarnessOptions = {}): StageHarnessResult {
   const repoRoot = realpathSync(options.repoRoot ?? REPO_ROOT)
@@ -437,8 +619,9 @@ export function stageHarnessRuntime(options: StageHarnessOptions = {}): StageHar
   const publication = join(repoRoot, PUBLICATION_RELATIVE)
   const run = options.run ?? defaultRun
   const rename = options.rename ?? renameSync
-  const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
-  const invoke = (args: readonly string[]): void => run({ command: pnpm, args, cwd: repoRoot, env: childEnvironment() })
+  const entrypoint = process.env.npm_execpath ?? (run === defaultRun ? undefined : 'pnpm.cjs')
+  if (entrypoint === undefined) throw new Error('Harness staging: npm_execpath is unavailable; invoke staging through its pnpm package script.')
+  const invoke = (args: readonly string[], registryAuth = false): void => run({ ...pnpmInvocation(args, entrypoint), cwd: repoRoot, env: childEnvironment(registryAuth) })
 
   try {
     invoke(['run', 'build'])
@@ -446,7 +629,7 @@ export function stageHarnessRuntime(options: StageHarnessOptions = {}): StageHar
     invoke(['run', 'release:pack', '--family', 'vendor', '--out', packedVendor])
     invoke(['--dir', 'native/landlock-run', 'run', 'build:ts'])
     invoke(['--dir', 'native/landlock-run/packages/entry', 'pack', '--pack-destination', packedLandlock])
-    invoke(['run', 'release:verify-packed-install', '--family', 'dsh', '--from', packedDsh, '--from', packedVendor, '--from', packedLandlock])
+    invoke(['run', 'release:verify-packed-install', '--family', 'dsh', '--from', packedDsh, '--from', packedVendor, '--from', packedLandlock], true)
     invoke([
       '--filter', CLI_PACKAGE, 'deploy', '--legacy', '--prod',
       '--config.node-linker=hoisted', '--config.auto-install-peers=false', '--config.link-workspace-packages=true',
@@ -455,11 +638,11 @@ export function stageHarnessRuntime(options: StageHarnessOptions = {}): StageHar
     restoreWorkspaceDependencies(candidate, repoRoot)
     materializeLinks(candidate)
 
-    const closure = validateHarnessClosure(candidate)
+    const closure = validateHarnessClosure(candidate, { workspaceNames: new Set(workspacePackages(repoRoot).keys()) })
     const descriptor = createRuntimeDescriptor(closure, { harnessSourceSha: readHarnessSourceSha(repoRoot) })
     writeFileSync(join(candidate, DESCRIPTOR_NAME), `${JSON.stringify(descriptor, null, 2)}\n`, { mode: 0o644, flag: 'wx' })
     publishCandidate(candidate, publication, resources, rename)
-    return { publicationPath: publication, candidatePath: candidate, descriptor }
+    return { publicationPath: publication, descriptor }
   } finally {
     rmSync(workspace, { recursive: true, force: true })
   }

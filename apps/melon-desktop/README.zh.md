@@ -16,7 +16,7 @@ pnpm run melon:check
 
 ## Harness 运行时
 
-`pnpm run melon:stage-harness-runtime` 构建上游包和 Web 前端，验证当前发布流程的打包安装，部署 `@deepseek-ai/dsh` 生产依赖闭包，检查包元数据和依赖项，然后将生成的闭包原子发布到 `src-tauri/resources/harness/`。运行 `pnpm run melon:test:harness-runtime` 检查基于夹具的暂存约定。
+`pnpm run melon:stage-harness-runtime` 构建上游包和 Web 前端，验证当前发布流程的打包安装，部署 `@deepseek-ai/dsh` 生产依赖闭包，检查包元数据和依赖项，然后将生成的闭包原子发布到 `src-tauri/resources/harness/`。描述符哈希覆盖暂存产物的精确字节和可执行位，但不包含描述符文件本身；上游产物可能嵌入检出路径，因此该哈希用于产物完整性，不保证跨机器复现。若发布和自动恢复均失败，错误会给出 `harness` 旁保留的 `.harness-backup-*/runtime` 目录；删除前先从该目录恢复。运行 `pnpm run melon:test:harness-runtime` 检查基于夹具的暂存约定。
 
 ## DurinDoor 负载
 
