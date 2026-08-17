@@ -1,5 +1,46 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Melon Gauntlet</title><style>:root{color-scheme:dark;font:16px/1.5 Inter,system-ui,sans-serif;background:#0a0d16;color:#f4f5fa}body{max-width:1100px;margin:0 auto;padding:40px 24px}h1{font:800 42px/.95 ui-monospace,monospace;letter-spacing:-.05em}main{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:#111625;border:1px solid #30394f;border-radius:16px;padding:20px}.wide{grid-column:1/-1}.label{color:#d7ff4f;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.empty{color:#aeb7c8}img{display:block;width:100%;border-radius:10px}@media(max-width:700px){main{grid-template-columns:1fr}.wide{grid-column:auto}}</style></head>
-<body><p class="label">Melon / UI Gauntlet</p><h1>Comparison ledger</h1><main><section class="card"><p class="label">Candidate A</p><div id="candidate-a" class="empty">No judged candidate yet.</div></section><section class="card"><p class="label">Candidate B</p><div id="candidate-b" class="empty">No judged candidate yet.</div></section><section class="card wide"><p class="label">Latest critic verdict</p><div id="verdict" class="empty">Gauntlet has not started.</div></section><section class="card"><p class="label">Largest remaining gap</p><div id="gap" class="empty">Awaiting first real Tauri comparison.</div></section><section class="card"><p class="label">Next active round</p><div id="next-round" class="empty">Start real setup surface.</div></section></main></body>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Melon Gauntlet</title>
+  <style>
+    :root{color-scheme:dark;font:16px/1.5 Inter,system-ui,sans-serif;background:#0a0d16;color:#f4f5fa}
+    body{max-width:1100px;margin:0 auto;padding:40px 24px}
+    h1{font:800 42px/.95 ui-monospace,monospace;letter-spacing:-.05em}
+    main{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+    .card{background:#111625;border:1px solid #30394f;border-radius:16px;padding:20px}
+    .wide{grid-column:1/-1}
+    .label{color:#d7ff4f;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+    .empty{color:#aeb7c8}
+    img{display:block;width:100%;border-radius:10px}
+    @media(max-width:700px){main{grid-template-columns:1fr}.wide{grid-column:auto}}
+  </style>
+</head>
+<body>
+  <p class="label">Melon / UI Gauntlet</p>
+  <h1>Comparison ledger</h1>
+  <main>
+    <section class="card">
+      <p class="label">Candidate A</p>
+      <img src="../reference/modern-relay-1440x960.png" alt="Modern Relay reference at 1440 by 960">
+    </section>
+    <section class="card">
+      <p class="label">Candidate B</p>
+      <p>Live setup CSS in <code>apps/melon-desktop/src/styles.css</code> uses the same Relay tokens: page <code>#0a0d16</code>, panel <code>#111625</code>, lime mark <code>#d7ff4f</code> / ink <code>#10130a</code>, clipped-corner brand tile, mono title, two-column choice grid. No Tauri screenshot yet.</p>
+    </section>
+    <section class="card wide">
+      <p class="label">Latest critic verdict</p>
+      <p>Round 1, 2026-08-17. Token and contrast check only — not a viewport A/B win. Computed WCAG 2.2 AA ratios on the live setup palette all pass (text 16.55, eyebrow 15.71, secondary 9.55, attribution 6.21, mark 16.35). Hierarchy matches Relay: rail + lime M, uppercase lime eyebrow, huge mono title, two choice cards. Largest remaining gap is the missing real Tauri screenshot at 1440×960 and 1024×768; mocks and CSS inspection cannot award the Gauntlet.</p>
+    </section>
+    <section class="card">
+      <p class="label">Largest remaining gap</p>
+      <p>Capture the running Tauri setup window at both viewports and run a blind A/B against the checked-in Modern Relay PNGs.</p>
+    </section>
+    <section class="card">
+      <p class="label">Next active round</p>
+      <p>Launch <code>pnpm run melon:dev</code>, screenshot choice + external + error at 1440×960 and 1024×768, then judge those frames — not this ledger page.</p>
+    </section>
+  </main>
+</body>
 </html>

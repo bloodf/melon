@@ -29,6 +29,11 @@ const server = createServer(async (request, response) => {
   }
 })
 
-server.listen(4317, '127.0.0.1', () => {
-  process.stdout.write('Melon Gauntlet http://127.0.0.1:4317/\n')
+const port = Number(process.env.MELON_GAUNTLET_PORT ?? 4317)
+server.on('error', (error) => {
+  process.stderr.write(`Melon Gauntlet failed: ${error instanceof Error ? error.message : String(error)}\n`)
+  process.exit(1)
+})
+server.listen(port, '127.0.0.1', () => {
+  process.stdout.write(`Melon Gauntlet http://127.0.0.1:${port}/\n`)
 })
