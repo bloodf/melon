@@ -86,28 +86,41 @@ struct ControllerState {
     recoverable_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RuntimeLayout {
+    app_data: PathBuf,
+    harness_root: PathBuf,
+    node_sidecar: PathBuf,
+}
+
 #[derive(Debug)]
 pub struct ConnectionController {
     state: Mutex<ControllerState>,
     key_persistence_available: bool,
     stop_grace: Duration,
     operation_wait_budget: Duration,
-    app_data: PathBuf,
-    harness_root: PathBuf,
-    node_sidecar: PathBuf,
+    layout: Mutex<RuntimeLayout>,
 }
 
 impl Default for ConnectionController {
     fn default() -> Self {
+        Self::with_runtime(PathBuf::new(), PathBuf::new(), PathBuf::new())
+    }
+}
+
+impl ConnectionController {
+    pub(crate) fn with_runtime(app_data: PathBuf, harness_root: PathBuf, node_sidecar: PathBuf) -> Self {
         Self {
             state: Mutex::new(ControllerState::default()),
             key_persistence_available: false,
             stop_grace: PROCESS_STOP_GRACE,
             operation_wait_budget: OPERATION_WAIT_BUDGET,
-            app_data: PathBuf::new(),
-            harness_root: PathBuf::new(),
-            node_sidecar: PathBuf::new(),
+            layout: Mutex::new(RuntimeLayout { app_data, harness_root, node_sidecar }),
         }
+    }
+
+    pub(crate) fn bind_runtime(&self, app_data: PathBuf, harness_root: PathBuf, node_sidecar: PathBuf) {
+        *self.layout.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = RuntimeLayout { app_data, harness_root, node_sidecar };
     }
 }
 
@@ -235,28 +248,16 @@ impl ConnectionController {
 
     #[cfg(test)]
     fn for_test(key_persistence_available: bool, stop_grace: Duration) -> Self {
-        Self {
-            state: Mutex::new(ControllerState::default()),
-            key_persistence_available,
-            stop_grace,
-            operation_wait_budget: stop_grace.saturating_mul(4) + Duration::from_millis(250),
-            app_data: PathBuf::new(),
-            harness_root: PathBuf::new(),
-            node_sidecar: PathBuf::new(),
-        }
+        let mut controller = Self::with_runtime(PathBuf::new(), PathBuf::new(), PathBuf::new());
+        controller.key_persistence_available = key_persistence_available;
+        controller.stop_grace = stop_grace;
+        controller.operation_wait_budget = stop_grace.saturating_mul(4) + Duration::from_millis(250);
+        controller
     }
 
     #[cfg(test)]
     fn for_activate(app_data: PathBuf, harness_root: PathBuf, node_sidecar: PathBuf) -> Self {
-        Self {
-            state: Mutex::new(ControllerState::default()),
-            key_persistence_available: false,
-            stop_grace: PROCESS_STOP_GRACE,
-            operation_wait_budget: OPERATION_WAIT_BUDGET,
-            app_data,
-            harness_root,
-            node_sidecar,
-        }
+        Self::with_runtime(app_data, harness_root, node_sidecar)
     }
 }
 
@@ -826,6 +827,37 @@ fn write_cordis_patch(path: &Path, base_url: &str, model: &str, models: &[ModelI
     std::fs::write(path, yaml).map_err(|_| ControllerError::ActivationFailed)
 }
 
+pub(crate) fn target_sidecar_name() -> Option<String> {
+    let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        _ => return None,
+    };
+    Some(if cfg!(windows) { format!("node-{triple}.exe") } else { format!("node-{triple}") })
+}
+
+pub(crate) fn resolve_node_sidecar(resource_dir: &Path, exe_dir: Option<&Path>) -> PathBuf {
+    let Some(name) = target_sidecar_name() else { return PathBuf::new() };
+    let beside_resources = resource_dir.join(&name);
+    if beside_resources.is_file() {
+        return beside_resources;
+    }
+    exe_dir.map(|dir| dir.join(&name)).filter(|path| path.is_file()).unwrap_or_default()
+}
+
+pub(crate) fn resolve_harness_root(resource_dir: &Path) -> PathBuf {
+    let nested = resource_dir.join("harness");
+    if nested.join("melon-harness-runtime.json").is_file() {
+        nested
+    } else if resource_dir.join("melon-harness-runtime.json").is_file() {
+        resource_dir.to_path_buf()
+    } else {
+        PathBuf::new()
+    }
+}
+
 fn bind_loopback() -> Result<u16, ControllerError> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|_| ControllerError::ActivationFailed)?;
     Ok(listener.local_addr().map_err(|_| ControllerError::ActivationFailed)?.port())
@@ -866,15 +898,16 @@ fn activate_external(
 ) -> Result<SavedConnection, ControllerError> {
     let operation = controller.begin_operation()?;
     require_model(&probe, &model)?;
-    if controller.harness_root.as_os_str().is_empty() || controller.node_sidecar.as_os_str().is_empty() {
+    let layout = controller.layout.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if layout.harness_root.as_os_str().is_empty() || layout.node_sidecar.as_os_str().is_empty() {
         return Err(ControllerError::NotImplemented("connection activation is not available yet".into()));
     }
-    let dsh = read_dsh_bin(&controller.harness_root)?;
-    let home = controller.app_data.join("harness");
+    let dsh = read_dsh_bin(&layout.harness_root)?;
+    let home = layout.app_data.join("harness");
     let patch = home.join("melon.cordis.patch.yml");
     write_cordis_patch(&patch, &probe.base_url, &model, &probe.models)?;
     let port = bind_loopback()?;
-    let mut command = Command::new(&controller.node_sidecar);
+    let mut command = Command::new(&layout.node_sidecar);
     command
         .arg(&dsh)
         .args(["--profile", "web", "--patch"])
@@ -903,7 +936,7 @@ fn activate_external(
         catalog: probe.models.iter().map(|entry| ModelRecord { id: entry.id.clone() }).collect(),
         managed_runtime_version: None,
     };
-    write_connection(&controller.app_data.join("connection.json"), &connection)
+    write_connection(&layout.app_data.join("connection.json"), &connection)
         .map_err(|_| ControllerError::ActivationFailed)?;
     Ok(SavedConnection { mode: probe.mode, base_url: probe.base_url, model })
 }
@@ -1469,6 +1502,31 @@ mod tests {
         controller.shutdown().unwrap();
         assert!(!controller.status_snapshot().running);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn resolve_harness_root_accepts_nested_or_flat_descriptor() {
+        let root = std::env::temp_dir().join(format!("melon-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("resources/harness");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("melon-harness-runtime.json"), "{}").unwrap();
+        assert_eq!(super::resolve_harness_root(&root.join("resources")), nested);
+        assert!(super::resolve_harness_root(&root.join("missing")).as_os_str().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_node_sidecar_prefers_existing_target_file() {
+        let Some(name) = super::target_sidecar_name() else { return };
+        let root = std::env::temp_dir().join(format!("melon-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sidecar = root.join(&name);
+        std::fs::write(&sidecar, b"node").unwrap();
+        assert_eq!(super::resolve_node_sidecar(&root, None), sidecar);
+        assert!(super::resolve_node_sidecar(&root.join("missing"), None).as_os_str().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

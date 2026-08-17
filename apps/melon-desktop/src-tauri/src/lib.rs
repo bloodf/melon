@@ -4,11 +4,23 @@ mod runtime;
 mod process_tree;
 mod runtime_seed;
 
-use controller::{ConnectionController, activate, probe, shutdown, status};
+use controller::{ConnectionController, activate, probe, resolve_harness_root, resolve_node_sidecar, shutdown, status};
 
 fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .manage(ConnectionController::default())
+        .setup(|app| {
+            use tauri::Manager;
+            let app_data = app.path().app_data_dir().unwrap_or_default();
+            let resource_dir = app.path().resource_dir().unwrap_or_default();
+            let exe_dir = std::env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+            app.state::<ConnectionController>().bind_runtime(
+                app_data,
+                resolve_harness_root(&resource_dir),
+                resolve_node_sidecar(&resource_dir, exe_dir.as_deref()),
+            );
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![status, probe, activate, shutdown])
 }
 

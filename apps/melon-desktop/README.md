@@ -18,6 +18,8 @@ pnpm run melon:check
 
 `generateMelonCordisPatch` writes a non-secret `--patch` overlay that selects DurinDoor, disables native DeepSeek chat/search, and never embeds API-key bytes. Run `pnpm run melon:test:cordis-patch`.
 
+`activate` launches staged `dsh --profile web` under the Node sidecar after a successful probe. It writes `<app-data>/harness/melon.cordis.patch.yml` with `serde_yaml`, waits for `GET /` 200, then writes `connection.json`. Production paths come from Tauri `app_data_dir` + `resource_dir`; missing sidecar or Harness descriptor keeps `activate` as `NotImplemented`. Focused proof: `cargo test --manifest-path apps/melon-desktop/src-tauri/Cargo.toml activate` and `pnpm run melon:test:fake-chat`.
+
 ## Harness runtime
 
 `pnpm run melon:stage-harness-runtime` builds the upstream packages and Web frontend, verifies the current packed-install release path, deploys the `@deepseek-ai/dsh` production closure, validates package metadata and dependencies, then atomically publishes the generated closure under `src-tauri/resources/harness/`. Its descriptor hash covers exact staged artifact bytes and executable bits, excluding the descriptor file itself; upstream bundles may embed the checkout path, so this is artifact integrity rather than cross-machine reproducibility. If publication and automatic restoration both fail, the error names a retained `.harness-backup-*/runtime` directory beside `harness`; restore that directory before deleting it. Run `pnpm run melon:test:harness-runtime` for the fixture-based staging contract.
