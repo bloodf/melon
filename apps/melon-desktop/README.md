@@ -18,7 +18,7 @@ pnpm run melon:check
 
 `generateMelonCordisPatch` writes a non-secret `--patch` overlay that selects DurinDoor, disables native DeepSeek chat/search, and never embeds API-key bytes. Run `pnpm run melon:test:cordis-patch`.
 
-`activate` launches staged `dsh --profile web` under the Node sidecar after a successful probe. It writes `<app-data>/harness/melon.cordis.patch.yml` with `serde_yaml`, waits for `GET /` 200, then writes `connection.json`. A provided API key is stored in the OS keyring (`com.bloodf.melon`) or session-only memory; only the account id is persisted. Production resolve prefers bundled `node` beside the executable and `<resource_dir>/resources/harness`; missing sidecar or descriptor keeps `activate` as `NotImplemented`. Focused proof: `cargo test --manifest-path apps/melon-desktop/src-tauri/Cargo.toml activate` and `pnpm run melon:test:fake-chat`.
+`activate` launches staged `dsh --profile web` under the Node sidecar after a successful probe. It writes `<app-data>/harness/melon.cordis.patch.yml` with `serde_yaml`, waits for `GET /` 200, then writes `connection.json`. A provided API key is stored in the OS keyring (`com.bloodf.melon`) or session-only memory; only a native account id is persisted. A later activate with no key reloads that stored secret into `MELON_DURINDOOR_API_KEY`. Production resolve prefers bundled `node` beside the executable and `<resource_dir>/resources/harness`; missing sidecar or descriptor keeps `activate` as `NotImplemented`. Focused proof: `cargo test --manifest-path apps/melon-desktop/src-tauri/Cargo.toml activate` and `pnpm run melon:test:fake-chat`.
 
 ## Harness runtime
 

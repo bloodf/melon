@@ -486,9 +486,13 @@ pub struct SavedConnection {
     pub model: String,
 }
 
-fn read_saved_connection(app_data: &Path) -> Option<SavedConnection> {
+fn read_connection_document(app_data: &Path) -> Option<ConnectionDocument> {
     let text = std::fs::read_to_string(app_data.join("connection.json")).ok()?;
-    let document: ConnectionDocument = serde_json::from_str(&text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn read_saved_connection(app_data: &Path) -> Option<SavedConnection> {
+    let document = read_connection_document(app_data)?;
     if document.base_url.is_empty() || document.model.is_empty() {
         return None;
     }
@@ -969,7 +973,7 @@ fn activate_external(
         .current_dir(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(std::env::temp_dir))
         .env("DSH_HOME", &home)
         .env("DSH_TELEMETRY_DISABLED", "1")
-        .env("MELON_DURINDOOR_API_KEY", api_key.as_deref().filter(|key| !key.is_empty()).unwrap_or(PLACEHOLDER_KEY))
+        .env("MELON_DURINDOOR_API_KEY", resolve_child_key(controller, &layout.app_data, api_key.as_deref()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1002,6 +1006,18 @@ fn persist_api_key(controller: &ConnectionController, base_url: &str, api_key: O
         Persistence::Native => Some(account),
         Persistence::SessionOnly => None,
     }
+}
+
+fn resolve_child_key(controller: &ConnectionController, app_data: &Path, api_key: Option<&str>) -> String {
+    if let Some(secret) = api_key.filter(|key| !key.is_empty()) {
+        return secret.to_owned();
+    }
+    if let Some(account) = read_connection_document(app_data).and_then(|document| document.credential_account) {
+        if let Some(secret) = controller.credentials.lock().unwrap_or_else(std::sync::PoisonError::into_inner).load(&account) {
+            return secret;
+        }
+    }
+    PLACEHOLDER_KEY.to_owned()
 }
 
 #[tauri::command]
@@ -1571,6 +1587,32 @@ mod tests {
         );
         controller.shutdown().unwrap();
         assert!(!controller.status_snapshot().running);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn activate_reloads_stored_key_without_repeating_it() {
+        let data = std::env::temp_dir().join(format!("melon-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        let controller = ConnectionController::for_activate(data.clone(), data.join("missing-harness"), data.join("missing-node"));
+        let account = super::persist_api_key(&controller, "http://127.0.0.1:9/v1", Some("user-secret"));
+        assert_eq!(account.as_deref(), Some("http://127.0.0.1:9/v1"));
+        crate::config::write_connection(&data.join("connection.json"), &crate::config::ConnectionDocument {
+            schema_version: 1,
+            mode: crate::config::ConnectionMode::External,
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model: "model-a".into(),
+            allow_insecure_http: true,
+            credential_account: account,
+            catalog: vec![crate::config::ModelRecord { id: "model-a".into() }],
+            managed_runtime_version: None,
+        }).unwrap();
+        assert_eq!(super::resolve_child_key(&controller, &data, None), "user-secret");
+        assert_eq!(super::resolve_child_key(&controller, &data, Some("override")), "override");
+        let saved = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(data.join("connection.json")).unwrap()).unwrap();
+        assert_eq!(saved["credentialAccount"], "http://127.0.0.1:9/v1");
+        assert!(std::fs::read_to_string(data.join("connection.json")).unwrap().contains("user-secret") == false);
         let _ = std::fs::remove_dir_all(&data);
     }
 
