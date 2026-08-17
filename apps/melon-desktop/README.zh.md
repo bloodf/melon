@@ -18,7 +18,7 @@ pnpm run melon:check
 
 `generateMelonCordisPatch` 生成不含密钥的 `--patch` 覆盖层：选择 DurinDoor，禁用原生 DeepSeek 对话与搜索，且不写入 API key。运行 `pnpm run melon:test:cordis-patch`。
 
-`activate` 在探测成功后用 Node sidecar 启动暂存的 `dsh --profile web`。它用 `serde_yaml` 写入 `<app-data>/harness/melon.cordis.patch.yml`，等待 `GET /` 返回 200，再写入 `connection.json`。提供的 API key 写入系统钥匙串（`com.bloodf.melon`）或仅会话内存；磁盘只保存账户 id。生产解析优先使用可执行文件旁的打包 `node` 与 `<resource_dir>/resources/harness`；缺少 sidecar 或描述符时 `activate` 仍为 `NotImplemented`。针对性验证：`cargo test --manifest-path apps/melon-desktop/src-tauri/Cargo.toml activate` 与 `pnpm run melon:test:fake-chat`。
+`activate` 在探测成功后用 Node sidecar 启动暂存的 `dsh --profile web`。它用 `serde_yaml` 写入 `<app-data>/harness/melon.cordis.patch.yml`，等待 `GET /` 返回 200，再写入 `connection.json`。提供的 API key 写入系统钥匙串（`com.bloodf.melon`）或仅会话内存；磁盘只保存原生账户 id。之后未带新 key 的 activate 会把该密钥重新注入 `MELON_DURINDOOR_API_KEY`。生产解析优先使用可执行文件旁的打包 `node` 与 `<resource_dir>/resources/harness`；缺少 sidecar 或描述符时 `activate` 仍为 `NotImplemented`。针对性验证：`cargo test --manifest-path apps/melon-desktop/src-tauri/Cargo.toml activate` 与 `pnpm run melon:test:fake-chat`。
 
 ## Harness 运行时
 
