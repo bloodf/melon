@@ -183,12 +183,13 @@ impl ConnectionController {
         if query_error && state.recoverable_error.is_none() {
             state.recoverable_error = Some(RECOVERABLE_QUERY.into());
         }
+        let recoverable_error = state.recoverable_error.clone();
         let app_data = self.layout.lock().unwrap_or_else(std::sync::PoisonError::into_inner).app_data.clone();
         drop(state);
         ControllerStatus {
             key_persistence_available: self.key_persistence_available,
             running,
-            recoverable_error: self.lock().recoverable_error.clone(),
+            recoverable_error,
             connection: read_saved_connection(&app_data),
         }
     }

@@ -9,15 +9,20 @@ const types = { '.html': 'text/html; charset=utf-8', '.png': 'image/png', '.css'
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? '/', 'http://127.0.0.1')
-  const relative = url.pathname === '/' ? 'gauntlet/index.html' : url.pathname.replace(/^\/+/, '')
-  const file = normalize(join(root, relative))
-  if (!file.startsWith(root)) {
+  const relative = decodeURIComponent(url.pathname === '/' ? 'gauntlet/index.html' : url.pathname.replace(/^\/+/, ''))
+  if (relative.split(/[\\/]/).some(segment => segment === '..')) {
+    response.writeHead(403).end()
+    return
+  }
+  const file = resolve(root, relative)
+  const prefix = root.endsWith('/') ? root : `${root}/`
+  if (file !== root && !file.startsWith(prefix)) {
     response.writeHead(403).end()
     return
   }
   try {
     const body = await readFile(file)
-    response.writeHead(200, { 'content-type': types[extname(file)] ?? 'application/octet-stream' })
+    response.writeHead(200, { 'content-type': types[extname(file)] ?? 'application/octet-stream', 'x-content-type-options': 'nosniff' })
     response.end(body)
   } catch {
     response.writeHead(404).end()

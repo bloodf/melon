@@ -1,0 +1,24 @@
+/* Melon product tokens. Import immediately after design-platform.css. */
+:root {
+  --melon-lime-50: #f7ffe0;
+  --melon-lime-200: #e4ff8a;
+  --melon-lime-400: #d7ff4f;
+  --melon-lime-700: #5a6b12;
+  --melon-ink: #10130a;
+}
+
+body {
+  --dsw-alias-brand-primary: var(--melon-ink);
+  --dsw-alias-brand-text: var(--melon-ink);
+  --dsw-alias-button-info-fill: var(--melon-lime-700);
+  --dsw-alias-button-info-hover: var(--melon-lime-400);
+  --dsw-alias-state-business-primary: var(--melon-lime-700);
+}
+
+body[data-ds-dark-theme] {
+  --dsw-alias-brand-primary: var(--melon-lime-400);
+  --dsw-alias-brand-text: var(--melon-lime-400);
+  --dsw-alias-button-info-fill: var(--melon-lime-400);
+  --dsw-alias-button-info-hover: var(--melon-lime-200);
+  --dsw-alias-state-business-primary: var(--melon-lime-400);
+}
