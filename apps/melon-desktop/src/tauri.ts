@@ -11,7 +11,7 @@ export interface ControllerStatus {
 export interface ControllerClient {
   status(): Promise<ControllerStatus>
   probe(input: ProbeInput): Promise<ProbeResult>
-  activate(probe: unknown, model: string): Promise<SavedConnection>
+  activate(probe: unknown, model: string, apiKey?: string): Promise<SavedConnection>
   shutdown(): Promise<void>
 }
 type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
@@ -51,7 +51,7 @@ export function createTauriClient(invoke: Invoke = invokeTauri): ControllerClien
   return {
     status: async () => statusResponse(await invoke('status')),
     probe: async input => probeResponse(await invoke('probe', { input })),
-    activate: async (probe, model) => savedResponse(await invoke('activate', { probe, model })),
+    activate: async (probe, model, apiKey) => savedResponse(await invoke('activate', { probe, model, ...(apiKey ? { apiKey } : {}) })),
     shutdown: async () => { await invoke('shutdown') },
   }
 }

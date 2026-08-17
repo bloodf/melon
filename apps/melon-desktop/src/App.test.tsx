@@ -103,7 +103,7 @@ describe('App controller wiring', () => {
     fireEvent.click(screen.getByRole('button', { name: 'durindoor/model-a' }))
     fireEvent.click(screen.getByRole('button', { name: 'Launch Melon' }))
     await screen.findByRole('heading', { name: 'Ready to launch' })
-    expect(client.activate).toHaveBeenCalledWith(modelProbe, 'durindoor/model-a')
+    expect(client.activate).toHaveBeenCalledWith(modelProbe, 'durindoor/model-a', 'secret')
   })
 
   it('shuts down only on explicit reconfigure', async () => {

@@ -48,6 +48,7 @@ export function App({ client = createTauriClient() }: { client?: ControllerClien
   const [state, dispatch] = useReducer(reduceSetup, initialSetupState)
   const currentState = useRef(state)
   const generation = useRef(0)
+  const lastApiKey = useRef<string | undefined>(undefined)
   currentState.current = state
   useEffect(() => {
     const operation = generation.current
@@ -59,6 +60,7 @@ export function App({ client = createTauriClient() }: { client?: ControllerClien
   }, [client])
   const probe = async (input: Parameters<ControllerClient['probe']>[0]) => {
     const operation = ++generation.current
+    lastApiKey.current = input.apiKey
     dispatch({ type: 'begin-probe', mode: input.mode })
     try {
       const result = await client.probe(input)
@@ -74,7 +76,7 @@ export function App({ client = createTauriClient() }: { client?: ControllerClien
     const operation = ++generation.current
     dispatch({ type: 'select-model', model }); dispatch({ type: 'activate' })
     try {
-      const connection = await client.activate(result, model)
+      const connection = await client.activate(result, model, lastApiKey.current)
       if (operation === generation.current) dispatch({ type: 'activated', connection })
     } catch (error) {
       if (operation === generation.current) dispatch({ type: 'failed', error: controllerError(error) })

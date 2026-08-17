@@ -14,13 +14,13 @@ it('uses the four controller command names and preserves payloads', async () => 
 
   await client.status()
   await client.probe(input)
-  await client.activate(probe, 'model-a')
+  await client.activate(probe, 'model-a', 'key')
   await client.shutdown()
 
   expect(invoke.mock.calls).toEqual([
     ['status'],
     ['probe', { input }],
-    ['activate', { probe, model: 'model-a' }],
+    ['activate', { probe, model: 'model-a', apiKey: 'key' }],
     ['shutdown'],
   ])
 })

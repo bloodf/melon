@@ -775,22 +775,48 @@ fn map_request_error(error: reqwest::Error) -> ControllerError {
 const PLACEHOLDER_KEY: &str = "sk_durindoor";
 const HARNESS_READY_BUDGET: Duration = Duration::from_secs(20);
 
-fn require_model(probe: &ProbeResult, model: &str) -> Result<(), ControllerError> {
-    if probe.models.iter().any(|entry| entry.id == model) {
-        Ok(())
+fn require_safe_id(id: &str) -> Result<(), ControllerError> {
+    if id.is_empty() || id.chars().any(char::is_control) {
+        Err(ControllerError::InvalidEndpoint)
     } else {
-        Err(ControllerError::EmptyModels)
+        Ok(())
     }
 }
 
+fn require_model(probe: &ProbeResult, model: &str) -> Result<(), ControllerError> {
+    require_safe_id(model)?;
+    if !probe.models.iter().any(|entry| entry.id == model) {
+        return Err(ControllerError::EmptyModels);
+    }
+    for entry in &probe.models {
+        require_safe_id(&entry.id)?;
+    }
+    Ok(())
+}
+
 fn write_cordis_patch(path: &Path, base_url: &str, model: &str, models: &[ModelInfo]) -> Result<(), ControllerError> {
-    let catalog = models
-        .iter()
-        .map(|entry| format!("          - id: {}\n", entry.id))
-        .collect::<String>();
-    let yaml = format!(
-        "- id: llm-pi-ai\n  config:\n    providers:\n      durindoor:\n        displayName: DurinDoor\n        apiKeyEnv: MELON_DURINDOOR_API_KEY\n        api: openai-completions\n        baseURL: {base_url}\n        models:\n{catalog}- id: agent-default-model\n  config:\n    provider: durindoor\n    model: {model}\n- id: llm-deepseek\n  disabled: true\n- id: web-search-deepseek\n  disabled: true\n- id: tool-web\n  config:\n    search: false\n    fetch: false\n"
-    );
+    let catalog: Vec<Value> = models.iter().map(|entry| serde_json::json!({ "id": entry.id })).collect();
+    let rows = serde_json::json!([
+        {
+            "id": "llm-pi-ai",
+            "config": {
+                "providers": {
+                    "durindoor": {
+                        "displayName": "DurinDoor",
+                        "apiKeyEnv": "MELON_DURINDOOR_API_KEY",
+                        "api": "openai-completions",
+                        "baseURL": base_url,
+                        "models": catalog
+                    }
+                }
+            }
+        },
+        { "id": "agent-default-model", "config": { "provider": "durindoor", "model": model } },
+        { "id": "llm-deepseek", "disabled": true },
+        { "id": "web-search-deepseek", "disabled": true },
+        { "id": "tool-web", "config": { "search": false, "fetch": false } }
+    ]);
+    let yaml = serde_yaml::to_string(&rows).map_err(|_| ControllerError::ActivationFailed)?;
     if yaml.contains(PLACEHOLDER_KEY) {
         return Err(ControllerError::ActivationFailed);
     }
@@ -854,13 +880,13 @@ fn activate_external(
         .args(["--profile", "web", "--patch"])
         .arg(&patch)
         .args(["--", "--host", "127.0.0.1", "--port", &port.to_string()])
-        .current_dir(std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir))
+        .current_dir(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(std::env::temp_dir))
         .env("DSH_HOME", &home)
         .env("DSH_TELEMETRY_DISABLED", "1")
         .env("MELON_DURINDOOR_API_KEY", api_key.as_deref().filter(|key| !key.is_empty()).unwrap_or(PLACEHOLDER_KEY))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     let mut tree = ProcessTree::spawn(&mut command).map_err(|_| ControllerError::ActivationFailed)?;
     if let Err(error) = wait_http_ready(port, Instant::now() + HARNESS_READY_BUDGET) {
         let _ = tree.stop(controller.stop_grace);
@@ -887,9 +913,10 @@ pub fn activate(
     controller: tauri::State<'_, ConnectionController>,
     probe: Value,
     model: String,
+    api_key: Option<String>,
 ) -> Result<SavedConnection, ControllerError> {
     let parsed: ProbeResult = serde_json::from_value(probe).map_err(|_| ControllerError::InvalidEndpoint)?;
-    activate_external(&controller, parsed, model, None)
+    activate_external(&controller, parsed, model, api_key)
 }
 
 #[tauri::command]
@@ -1404,6 +1431,16 @@ mod tests {
             None,
         ).unwrap_err();
         assert_eq!(error, ControllerError::EmptyModels);
+        assert!(!controller.status_snapshot().running);
+    }
+
+    #[test]
+    fn activate_rejects_control_characters_in_model_ids() {
+        let controller = ConnectionController::default();
+        let mut probe = probe_result("http://127.0.0.1:9/v1", "model-a");
+        probe.models[0].id = "a\n- id: tool-web".into();
+        let error = super::activate_external(&controller, probe, "a\n- id: tool-web".into(), None).unwrap_err();
+        assert_eq!(error, ControllerError::InvalidEndpoint);
         assert!(!controller.status_snapshot().running);
     }
 
