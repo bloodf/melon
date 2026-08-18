@@ -2,8 +2,7 @@
 
 ## Goal
 
-Keep Melon mergeable from `deepseek-ai/deepseek-harness:master` without
-ever writing Melon's `master` branch or auto-merging. Surface every
+Keep Melon mergeable from `deepseek-ai/deepseek-harness:master` by auto-updating Melon `master` from upstream and refreshing `feat/melon-desktop` from that `master`. Surface every
 upstream change to humans as one pull request, and surface every merge
 failure as one actionable issue.
 
@@ -86,3 +85,14 @@ are not run by this slice itself.
 - Lefthook pre-merge hooks failed for missing `tsx`; completed with `--no-verify`. Workflow now sets `core.hooksPath=/dev/null` and `merge --no-verify`.
 - Melon `master` checkout stayed at `47f943859b`. No auto-merge.
 - Overlap with `feat/melon-desktop`: `AGENTS.md`, `package.json`, `pnpm-lock.yaml`, `THIRD_PARTY_NOTICES.md`, release-family scripts, dirty user-guide index. Additive Melon seams; restage Harness before bumping `runtime-pins.json`.
+
+
+## 2026-08-18 policy change
+
+Maintainer authorized auto-update of `master` from upstream. Workflow now:
+
+1. Merges `upstream/master` into `master` and pushes on a clean merge.
+2. Merges `master` into `feat/melon-desktop` and pushes on a clean merge.
+3. Files an issue and does not push on conflict.
+
+The workflow file must remain on `master` so the schedule survives. Feature work stays off `master`.
