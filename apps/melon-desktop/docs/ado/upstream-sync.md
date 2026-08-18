@@ -96,3 +96,10 @@ Maintainer authorized auto-update of `master` from upstream. Workflow now:
 3. Files an issue and does not push on conflict.
 
 The workflow file must remain on `master` so the schedule survives. Feature work stays off `master`.
+
+
+## 2026-08-18 product branch is main
+
+Maintainer directed that Melon implementation live on `main`, and that
+upstream `master` auto-merge into that branch. `feat/melon-desktop` is
+historical. Melon `master` is no longer the product branch.
