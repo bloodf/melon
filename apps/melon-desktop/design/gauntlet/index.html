@@ -13,7 +13,7 @@
     .wide{grid-column:1/-1}
     .label{color:#d7ff4f;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
     .empty{color:#aeb7c8}
-    img{display:block;width:100%;border-radius:10px}
+    img{display:block;width:100%;border-radius:10px;margin-top:12px}
     @media(max-width:700px){main{grid-template-columns:1fr}.wide{grid-column:auto}}
   </style>
 </head>
@@ -22,24 +22,40 @@
   <h1>Comparison ledger</h1>
   <main>
     <section class="card">
-      <p class="label">Candidate A</p>
+      <p class="label">Candidate B — Modern Relay 1440×960</p>
       <img src="../reference/modern-relay-1440x960.png" alt="Modern Relay reference at 1440 by 960">
     </section>
     <section class="card">
-      <p class="label">Candidate B</p>
-      <p>Live setup CSS in <code>apps/melon-desktop/src/styles.css</code> uses the same Relay tokens: page <code>#0a0d16</code>, panel <code>#111625</code>, lime mark <code>#d7ff4f</code> / ink <code>#10130a</code>, clipped-corner brand tile, mono title, two-column choice grid. No Tauri screenshot yet.</p>
+      <p class="label">Candidate A — live Vite choice 1440×960</p>
+      <img src="./candidates/choice-1440x960.png" alt="Live Melon Vite choice screen at 1440 by 960">
+    </section>
+    <section class="card">
+      <p class="label">Candidate B — Modern Relay 1024×768</p>
+      <img src="../reference/modern-relay-1024x768.png" alt="Modern Relay reference at 1024 by 768">
+    </section>
+    <section class="card">
+      <p class="label">Candidate A — live Vite choice 1024×768</p>
+      <img src="./candidates/choice-1024x768.png" alt="Live Melon Vite choice screen at 1024 by 768">
+    </section>
+    <section class="card">
+      <p class="label">External form 1440×960</p>
+      <img src="./candidates/external-1440x960.png" alt="Live Melon Vite external form at 1440 by 960">
+    </section>
+    <section class="card">
+      <p class="label">Insecure HTTP 1440×960</p>
+      <img src="./candidates/insecure-http-1440x960.png" alt="Live Melon Vite insecure HTTP confirm at 1440 by 960">
     </section>
     <section class="card wide">
       <p class="label">Latest critic verdict</p>
-      <p>Round 1, 2026-08-17. Token and contrast check only — not a viewport A/B win. Computed WCAG 2.2 AA ratios on the live setup palette all pass (text 16.55, eyebrow 15.71, secondary 9.55, attribution 6.21, mark 16.35). Hierarchy matches Relay: rail + lime M, uppercase lime eyebrow, huge mono title, two choice cards. Largest remaining gap is the missing real Tauri screenshot at 1440×960 and 1024×768; mocks and CSS inspection cannot award the Gauntlet.</p>
+      <p>Round 1, 2026-08-17. Live Vite setup at <code>127.0.0.1:1420</code>, not a Tauri window. Choice, external, and insecure-HTTP frames exist at 1440×960 and 1024×768. Tokens match Relay (page <code>#0a0d16</code>, panel <code>#111625</code>, lime mark <code>#d7ff4f</code>). Hierarchy matches: rail + lime M, uppercase lime eyebrow, two choice cards, attribution. <strong>Not a viewport A/B win.</strong> Plan requires the running Tauri app. Vite cannot award the Gauntlet.</p>
     </section>
     <section class="card">
       <p class="label">Largest remaining gap</p>
-      <p>Capture the running Tauri setup window at both viewports and run a blind A/B against the checked-in Modern Relay PNGs.</p>
+      <p>Capture the real Tauri setup window (<code>pnpm run melon:dev</code>) at both viewports and run a blind A/B against the checked-in Modern Relay PNGs. Browser daemon was down this round; Chromium headless hit Vite only.</p>
     </section>
     <section class="card">
       <p class="label">Next active round</p>
-      <p>Launch <code>pnpm run melon:dev</code>, screenshot choice + external + error at 1440×960 and 1024×768, then judge those frames — not this ledger page.</p>
+      <p>Launch Tauri, screenshot choice + external + insecure-HTTP + error at 1440×960 and 1024×768 from the native window, then judge those frames — not this Vite preview.</p>
     </section>
   </main>
 </body>

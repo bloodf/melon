@@ -1,0 +1,51 @@
+# Focused Melon desktop gates. Does not build installers or payloads.
+name: Melon CI
+
+on:
+  pull_request:
+    paths:
+      - "apps/melon-desktop/**"
+      - "scripts/melon/**"
+      - "packages/client/web/src/melon-theme.css"
+      - "packages/client/ui-primitives/src/BrandWordmark.tsx"
+      - "packages/client/ui-primitives/src/FishLogo.tsx"
+      - "packages/client/ui-settings-models/src/onboarding-copy.ts"
+      - ".github/workflows/melon-ci.yml"
+      - ".github/workflows/upstream-sync.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: melon-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Melon frontend tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @bloodf/melon-desktop test
+      - run: pnpm --filter @bloodf/melon-desktop typecheck
+
+  rust:
+    name: Melon controller tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path apps/melon-desktop/src-tauri/Cargo.toml --lib --offline
+        env:
+          CARGO_TERM_COLOR: always
