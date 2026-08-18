@@ -216,6 +216,15 @@ impl ProcessTree {
         self.platform_is_running()
     }
 
+    /// Detaches the owned child's stderr pipe so the caller can drain it on a dedicated thread.
+    ///
+    /// Returns `None` if a previous caller already took the pipe or the child was never spawned
+    /// with a piped stderr. Caller-owned responsibility: drain promptly so the child never blocks
+    /// on a full stderr pipe and exit the drain thread before [`ProcessTree::stop`] returns.
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
     /// Gracefully stops the entire Unix group, then force-stops the same owned tree after `grace`.
     ///
     /// Windows has no general graceful child-process signal, so it waits `grace` for natural direct

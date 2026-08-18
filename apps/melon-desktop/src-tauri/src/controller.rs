@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -527,6 +527,10 @@ pub enum ControllerError {
     ShutdownFailed,
     ShuttingDown,
     CleanupPending,
+    MissingSidecar(PathBuf),
+    MissingDescriptor(PathBuf),
+    SpawnFailed(String),
+    ReadinessTimeout { port: u16, stderr_tail: String },
 }
 
 impl Serialize for ControllerError {
@@ -535,38 +539,66 @@ impl Serialize for ControllerError {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let (code, message) = match self {
-            Self::ActivationFailed => ("activation-failed", "Connection activation failed"),
-            Self::ApiKeyRequired => ("auth-required", "API key required"),
-            Self::Busy => ("busy", "Another connection operation is already running"),
-            Self::AuthProbeFailed => ("auth-unverified", "API key could not be verified"),
-            Self::EmptyModels => ("empty-models", "DurinDoor returned no models"),
-            Self::CleanupPending => ("cleanup-pending", "Started process cleanup is pending"),
-            Self::HealthProbeFailed => ("health-failed", "DurinDoor health check failed"),
-            Self::InsecureHttpConfirmationRequired => {
-                ("insecure-http", "Insecure HTTP requires explicit confirmation")
-            }
-            Self::InvalidEndpoint => ("invalid-endpoint", "Invalid DurinDoor endpoint"),
-            Self::MalformedModels | Self::ModelsResponseTooLarge => {
-                ("malformed-models", "DurinDoor returned an invalid model list")
-            }
-            Self::InstallationNeeded => {
-                ("installation-needed", "DurinDoor installation is required")
-            }
+        use std::borrow::Cow;
+        let (code, message): (&'static str, Cow<'_, str>) = match self {
+            Self::ActivationFailed => ("activation-failed", Cow::Borrowed("Connection activation failed")),
+            Self::ApiKeyRequired => ("auth-required", Cow::Borrowed("API key required")),
+            Self::Busy => ("busy", Cow::Borrowed("Another connection operation is already running")),
+            Self::AuthProbeFailed => ("auth-unverified", Cow::Borrowed("API key could not be verified")),
+            Self::EmptyModels => ("empty-models", Cow::Borrowed("DurinDoor returned no models")),
+            Self::CleanupPending => ("cleanup-pending", Cow::Borrowed("Started process cleanup is pending")),
+            Self::HealthProbeFailed => ("health-failed", Cow::Borrowed("DurinDoor health check failed")),
+            Self::InsecureHttpConfirmationRequired => (
+                "insecure-http",
+                Cow::Borrowed("Insecure HTTP requires explicit confirmation"),
+            ),
+            Self::InvalidEndpoint => ("invalid-endpoint", Cow::Borrowed("Invalid DurinDoor endpoint")),
+            Self::MalformedModels | Self::ModelsResponseTooLarge => (
+                "malformed-models",
+                Cow::Borrowed("DurinDoor returned an invalid model list"),
+            ),
+            Self::InstallationNeeded => (
+                "installation-needed",
+                Cow::Borrowed("DurinDoor installation is required"),
+            ),
             Self::ManagedPortOccupied => (
                 "port-occupied",
-                "Port 20128 is occupied by a service that is not DurinDoor",
+                Cow::Borrowed("Port 20128 is occupied by a service that is not DurinDoor"),
             ),
-            Self::ModelsRequestFailed => ("models-failed", "DurinDoor model request failed"),
-            Self::NotImplemented(message) => ("not-implemented", message.as_str()),
-            Self::ProbeFailed => ("probe-failed", "DurinDoor probe failed"),
-            Self::ProbeTimedOut => ("probe-timed-out", "DurinDoor probe timed out"),
-            Self::ShutdownFailed => ("shutdown-failed", "Owned process shutdown failed"),
-            Self::ShuttingDown => ("shutting-down", "Melon is shutting down"),
+            Self::ModelsRequestFailed => ("models-failed", Cow::Borrowed("DurinDoor model request failed")),
+            Self::NotImplemented(message) => ("not-implemented", Cow::Borrowed(message.as_str())),
+            Self::ProbeFailed => ("probe-failed", Cow::Borrowed("DurinDoor probe failed")),
+            Self::ProbeTimedOut => ("probe-timed-out", Cow::Borrowed("DurinDoor probe timed out")),
+            Self::ShutdownFailed => ("shutdown-failed", Cow::Borrowed("Owned process shutdown failed")),
+            Self::ShuttingDown => ("shutting-down", Cow::Borrowed("Melon is shutting down")),
+            Self::MissingSidecar(path) => (
+                "missing-sidecar",
+                Cow::Borrowed(if path.as_os_str().is_empty() {
+                    "Bundled Node sidecar binary was not found"
+                } else {
+                    "Bundled Node sidecar binary is not an executable file"
+                }),
+            ),
+            Self::MissingDescriptor(path) => (
+                "missing-descriptor",
+                Cow::Borrowed(if path.as_os_str().is_empty() {
+                    "melon-harness-runtime.json descriptor was not found"
+                } else {
+                    "melon-harness-runtime.json descriptor is invalid"
+                }),
+            ),
+            Self::SpawnFailed(detail) => ("spawn-failed", Cow::Owned(detail.clone())),
+            Self::ReadinessTimeout { port, stderr_tail } => (
+                "readiness-timeout",
+                Cow::Owned(format!(
+                    "Harness did not become ready on 127.0.0.1:{port} within {}s; stderr tail: {stderr_tail}",
+                    HARNESS_READY_BUDGET.as_secs(),
+                )),
+            ),
         };
         let mut state = serializer.serialize_struct("ControllerError", 2)?;
         state.serialize_field("code", code)?;
-        state.serialize_field("message", message)?;
+        state.serialize_field("message", &message)?;
         state.end()
     }
 }
@@ -921,16 +953,142 @@ fn bind_loopback() -> Result<u16, ControllerError> {
 }
 
 fn read_dsh_bin(harness_root: &Path) -> Result<PathBuf, ControllerError> {
-    let descriptor = std::fs::read_to_string(harness_root.join("melon-harness-runtime.json"))
-        .map_err(|_| ControllerError::ActivationFailed)?;
-    let value: Value = serde_json::from_str(&descriptor).map_err(|_| ControllerError::ActivationFailed)?;
+    let descriptor_path = harness_root.join("melon-harness-runtime.json");
+    let descriptor = std::fs::read_to_string(&descriptor_path)
+        .map_err(|_| ControllerError::MissingDescriptor(descriptor_path.clone()))?;
+    let value: Value = serde_json::from_str(&descriptor)
+        .map_err(|_| ControllerError::MissingDescriptor(descriptor_path))?;
     let relative = value.get("dshBin").and_then(Value::as_str).ok_or(ControllerError::ActivationFailed)?;
     let bin = harness_root.join(relative);
     if bin.is_file() { Ok(bin) } else { Err(ControllerError::ActivationFailed) }
 }
 
+/// Bounded ring buffer for the harness child's stderr with per-line secret redaction.
+///
+/// ponytail: ceiling is a generic async redactor with a real capture handle; upgrade when the
+/// upstream Harness stderr contract is formalized.
+struct StderrRing {
+    cap: usize,
+    bytes: std::collections::VecDeque<u8>,
+    line: Vec<u8>,
+}
+
+impl StderrRing {
+    fn new(cap: usize) -> Self {
+        Self { cap, bytes: std::collections::VecDeque::with_capacity(cap), line: Vec::new() }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            self.line.push(byte);
+            if byte == b'\n' {
+                self.flush_line();
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.line.is_empty() {
+            self.line.push(b'\n');
+            self.flush_line();
+        }
+    }
+
+    fn tail(&self) -> String {
+        String::from_utf8_lossy(self.bytes.as_slices().0).into_owned()
+    }
+
+    fn flush_line(&mut self) {
+        let mut line = std::mem::take(&mut self.line);
+        redact_stderr_line(&mut line);
+        for byte in line {
+            if self.bytes.len() == self.cap {
+                self.bytes.pop_front();
+            }
+            self.bytes.push_back(byte);
+        }
+    }
+}
+
+const BEARER_PREFIX: &[u8] = b"Bearer ";
+const MELON_KEY_PREFIX: &[u8] = b"MELON_DURINDOOR_API_KEY=";
+
+fn redact_stderr_line(line: &mut Vec<u8>) {
+    *line = redact_secrets(line);
+}
+
+fn starts_at(haystack: &[u8], index: usize, needle: &[u8]) -> bool {
+    haystack.get(index..).is_some_and(|slice| slice.starts_with(needle))
+}
+
+fn skip_token(input: &[u8], start: usize) -> usize {
+    input[start..]
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .map(|offset| start + offset)
+        .unwrap_or(input.len())
+}
+
+fn redact_secrets(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if starts_at(input, index, MELON_KEY_PREFIX) {
+            out.extend_from_slice(MELON_KEY_PREFIX);
+            index = skip_token(input, index + MELON_KEY_PREFIX.len());
+            out.extend_from_slice(b"[redacted]");
+            continue;
+        }
+        if starts_at(input, index, BEARER_PREFIX) {
+            out.extend_from_slice(BEARER_PREFIX);
+            index = skip_token(input, index + BEARER_PREFIX.len());
+            out.extend_from_slice(b"[redacted]");
+            continue;
+        }
+        out.push(input[index]);
+        index += 1;
+    }
+    out
+}
+
+
+
+const STDERR_RING_CAP: usize = 4 * 1024;
+
+fn spawn_stderr_drain(stderr: Option<std::process::ChildStderr>, ring: Arc<Mutex<StderrRing>>) {
+    let Some(stderr) = stderr else { return };
+    std::thread::Builder::new()
+        .name("melon-stderr-drain".into())
+        .spawn(move || drain_stderr(stderr, ring))
+        .ok();
+}
+
+fn drain_stderr(stderr: std::process::ChildStderr, ring: Arc<Mutex<StderrRing>>) {
+    use std::io::Read;
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if let Ok(mut guard) = ring.lock() {
+                    guard.push(&buffer[..read]);
+                }
+            }
+        }
+    }
+    if let Ok(mut guard) = ring.lock() {
+        guard.finish();
+    }
+}
+
+fn read_stderr_tail(ring: &Arc<Mutex<StderrRing>>) -> String {
+    ring.lock().map(|guard| guard.tail()).unwrap_or_default()
+}
+
 fn wait_http_ready(port: u16, deadline: Instant) -> Result<(), ControllerError> {
     let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+
     while Instant::now() < deadline {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
@@ -947,6 +1105,7 @@ fn wait_http_ready(port: u16, deadline: Instant) -> Result<(), ControllerError> 
     }
     Err(ControllerError::ActivationFailed)
 }
+
 fn activate_external(
     controller: &ConnectionController,
     probe: ProbeResult,
@@ -956,8 +1115,11 @@ fn activate_external(
     let operation = controller.begin_operation()?;
     require_model(&probe, &model)?;
     let layout = controller.layout.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    if layout.harness_root.as_os_str().is_empty() || layout.node_sidecar.as_os_str().is_empty() {
+    if layout.harness_root.as_os_str().is_empty() {
         return Err(ControllerError::NotImplemented("connection activation is not available yet".into()));
+    }
+    if layout.node_sidecar.as_os_str().is_empty() {
+        return Err(ControllerError::MissingSidecar(PathBuf::new()));
     }
     let dsh = read_dsh_bin(&layout.harness_root)?;
     let home = layout.app_data.join("harness");
@@ -976,11 +1138,19 @@ fn activate_external(
         .env("MELON_DURINDOOR_API_KEY", resolve_child_key(controller, &layout.app_data, api_key.as_deref()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut tree = ProcessTree::spawn(&mut command).map_err(|_| ControllerError::ActivationFailed)?;
-    if let Err(error) = wait_http_ready(port, Instant::now() + HARNESS_READY_BUDGET) {
+        .stderr(Stdio::piped());
+    let mut tree = ProcessTree::spawn(&mut command).map_err(|e| ControllerError::SpawnFailed(e.to_string()))?;
+    let stderr_handle = tree.take_stderr();
+    let stderr_ring = Arc::new(Mutex::new(StderrRing::new(STDERR_RING_CAP)));
+    spawn_stderr_drain(stderr_handle, Arc::clone(&stderr_ring));
+    let wait_result = wait_http_ready(port, Instant::now() + HARNESS_READY_BUDGET);
+    if let Err(error) = wait_result {
         let _ = tree.stop(controller.stop_grace);
-        return Err(error);
+        let stderr_tail = read_stderr_tail(&stderr_ring);
+        return Err(match error {
+            ControllerError::ActivationFailed => ControllerError::ReadinessTimeout { port, stderr_tail },
+            other => other,
+        });
     }
     operation.adopt(OwnedProcesses { harness: Some(Box::new(tree)), managed_durindoor: None }, true)?;
     let credential_account = persist_api_key(controller, &probe.base_url, api_key.as_deref());
@@ -1045,11 +1215,12 @@ pub async fn shutdown<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(),
 mod tests {
     use super::{
         AuthStatus, ConnectionController, ConnectionOwnership, ControllerError, HealthStatus,
-        MANAGED_LOCAL_BASE_URL, MANAGED_LOCAL_PORT, ProbeInput, ProbeLimits, probe_external,
-        probe_managed_at,
+        MANAGED_LOCAL_BASE_URL, MANAGED_LOCAL_PORT, ProbeInput, ProbeLimits, STDERR_RING_CAP,
+        StderrRing, activate_external, probe_external, probe_managed_at, redact_stderr_line,
     };
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -1640,6 +1811,142 @@ mod tests {
         assert!(super::resolve_node_sidecar(&root.join("missing"), None).as_os_str().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn redact_stderr_line_redacts_melon_api_key_value_pair() {
+        let mut line = b"warn: MELON_DURINDOOR_API_KEY=sk_live_secret retry=1\n".to_vec();
+        redact_stderr_line(&mut line);
+        let redacted = String::from_utf8(line).expect("utf8");
+        assert!(redacted.contains("[redacted]"), "expected redaction marker, got: {redacted}");
+        assert!(!redacted.contains("sk_live_secret"), "key bytes leaked: {redacted}");
+        assert!(redacted.contains("retry=1"), "unrelated context dropped: {redacted}");
+    }
+
+    #[test]
+    fn redact_stderr_line_redacts_bearer_token_in_authorization_header() {
+        let mut line = b"http: GET /v1/models sent Authorization: Bearer abc123 returned 200\n".to_vec();
+        redact_stderr_line(&mut line);
+        let redacted = String::from_utf8(line).expect("utf8");
+        assert!(redacted.contains("Bearer [redacted]"), "expected redacted bearer, got: {redacted}");
+        assert!(!redacted.contains("abc123"), "token bytes leaked: {redacted}");
+        assert!(redacted.contains("returned 200"), "unrelated context dropped: {redacted}");
+    }
+
+    #[test]
+    fn redact_stderr_line_redacts_multiple_bearer_tokens_in_one_line() {
+        let mut line = b"primary: Bearer aaa-secondary: Bearer bbb\n".to_vec();
+        redact_stderr_line(&mut line);
+        let redacted = String::from_utf8(line).expect("utf8");
+        assert!(!redacted.contains("aaa"), "first bearer leaked: {redacted}");
+        assert!(!redacted.contains("bbb"), "second bearer leaked: {redacted}");
+        assert_eq!(redacted.matches("[redacted]").count(), 2, "expected two redactions: {redacted}");
+    }
+
+    #[test]
+    fn stderr_ring_evicts_oldest_bytes_when_over_capacity() {
+        let mut ring = StderrRing::new(8);
+        ring.push(b"0123456789");
+        ring.push(b"XY");
+        let tail = ring.tail();
+        assert!(tail.ends_with("XY"), "expected new bytes retained, got: {tail}");
+        assert!(!tail.starts_with("0123"), "old bytes not evicted: {tail}");
+    }
+
+    #[test]
+    fn stderr_ring_keeps_partial_line_until_newline() {
+        let mut ring = StderrRing::new(64);
+        ring.push(b"first ");
+        assert!(ring.tail().is_empty(), "partial line should not flush");
+        ring.push(b"line\nsecond ");
+        assert_eq!(ring.tail(), "first line\n", "complete line missing");
+        ring.push(b"line\n");
+        assert_eq!(ring.tail(), "first line\nsecond line\n", "second line missing");
+    }
+
+    #[test]
+    fn stderr_ring_redacts_sensitive_tokens_before_eviction() {
+        let mut ring = StderrRing::new(128);
+        ring.push(b"Authorization: Bearer super-secret-xyz retry=1\n");
+        let tail = ring.tail();
+        assert!(!tail.contains("super-secret-xyz"), "secret leaked into ring: {tail}");
+        assert!(tail.contains("[redacted]"), "expected redaction marker: {tail}");
+    }
+
+    #[test]
+    fn activate_returns_missing_sidecar_when_node_sidecar_path_is_empty() {
+        let tmp = std::env::temp_dir().join(format!("melon-fail-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let harness = tmp.join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        let controller = ConnectionController::for_activate(tmp.clone(), harness, PathBuf::new());
+        let probe = probe_result("http://127.0.0.1:1/v1", "model-a");
+        let error = activate_external(&controller, probe, "model-a".into(), None)
+            .expect_err("empty sidecar should fail before any IO");
+        match error {
+            ControllerError::MissingSidecar(path) => assert!(path.as_os_str().is_empty()),
+            other => panic!("expected MissingSidecar, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn activate_returns_missing_descriptor_when_runtime_descriptor_missing() {
+        let tmp = std::env::temp_dir().join(format!("melon-fail-descriptor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let harness = tmp.join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        let sidecar = tmp.join("node");
+        std::fs::write(&sidecar, b"node").unwrap();
+        let controller = ConnectionController::for_activate(tmp.clone(), harness, sidecar);
+        let probe = probe_result("http://127.0.0.1:1/v1", "model-a");
+        let error = activate_external(&controller, probe, "model-a".into(), None)
+            .expect_err("missing descriptor should fail");
+        match error {
+            ControllerError::MissingDescriptor(path) => {
+                assert!(!path.as_os_str().is_empty(), "path should be populated when searched");
+            }
+            other => panic!("expected MissingDescriptor, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn activate_does_not_overwrite_connection_json_when_descriptor_missing() {
+        use crate::config::{write_connection, ConnectionDocument, ConnectionMode, ModelRecord};
+        let tmp = std::env::temp_dir().join(format!("melon-fail-conn-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sentinel = ConnectionDocument {
+            schema_version: 1,
+            mode: ConnectionMode::External,
+            base_url: "http://127.0.0.1:9999/v1".into(),
+            model: "sentinel-model".into(),
+            allow_insecure_http: true,
+            credential_account: None,
+            catalog: vec![ModelRecord { id: "sentinel-model".into() }],
+            managed_runtime_version: None,
+        };
+        write_connection(&tmp.join("connection.json"), &sentinel).expect("write sentinel");
+        let harness = tmp.join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        let sidecar = tmp.join("node");
+        std::fs::write(&sidecar, b"node").unwrap();
+        let controller = ConnectionController::for_activate(tmp.clone(), harness, sidecar);
+        let probe = probe_result("http://127.0.0.1:1/v1", "model-a");
+        let result = activate_external(&controller, probe, "model-a".into(), None);
+        assert!(result.is_err(), "activate must fail when descriptor missing");
+        let raw = std::fs::read_to_string(tmp.join("connection.json")).expect("connection.json still present");
+        assert!(raw.contains("sentinel-model"), "sentinel overwritten on failed activate: {raw}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stderr_drain_capacity_constant_matches_documented_budget() {
+        assert_eq!(STDERR_RING_CAP, 4 * 1024, "stderr ring must keep last 4KiB per plan");
+    }
+
 }
 
 #[cfg(test)]

@@ -64,8 +64,8 @@ export function App({ client = createTauriClient() }: { client?: ControllerClien
     const operation = generation.current
     void client.status().then((status) => {
       if (operation === generation.current && currentState.current.screen === 'choice' && status.connection !== undefined) dispatch({ type: 'activated', connection: status.connection })
-    }).catch((error) => {
-      if (operation === generation.current && currentState.current.screen === 'choice') dispatch({ type: 'failed', error: controllerError(error) })
+    }).catch(() => {
+      // Browser preview and a missing sidecar have no IPC. Stay on choice.
     })
   }, [client])
   const probe = async (input: Parameters<ControllerClient['probe']>[0]) => {

@@ -86,6 +86,16 @@ describe('App controller wiring', () => {
     expect(client.shutdown).not.toHaveBeenCalled()
   })
 
+  it('stays on choice when controller status is unavailable', async () => {
+    const client = {
+      status: vi.fn(async () => { throw new Error("Cannot read properties of undefined (reading 'invoke')") }),
+      probe: vi.fn(), activate: vi.fn(), shutdown: vi.fn(async () => undefined),
+    }
+    render(<App client={client} />)
+    await waitFor(() => expect(client.status).toHaveBeenCalledOnce())
+    expect(screen.getByRole('heading', { name: 'Choose how Melon reaches DurinDoor' })).toBeTruthy()
+  })
+
   it('probes external input and activates the selected model', async () => {
     const client = {
       status: vi.fn(async () => ({ keyPersistenceAvailable: true, running: false })),
