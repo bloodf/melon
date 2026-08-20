@@ -2,7 +2,7 @@
 // The input order is authoritative; lineage only makes each child adjacent to its parent.
 // Orphaned lineage degrades to root level; cycles fail soft and emit as roots.
 
-import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ProfileId, SessionId, SessionSummary } from '@deepseek-ai/dsh-api-remotes/client'
 import type { SessionProjectionMap } from '@deepseek-ai/dsh-session-projection/types'
 import type { PendingInteractionStatus } from './pending.ts'
 
@@ -16,6 +16,7 @@ export interface TitledSessionSummary extends SessionSummary {
 /** One flattened session-list row with lineage depth and live pending interaction. */
 export interface SessionListEntry {
   sessionId: SessionId
+  profileId: ProfileId
   title?: string
   updatedAt: number
   running: boolean

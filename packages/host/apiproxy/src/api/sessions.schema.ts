@@ -6,7 +6,7 @@
  */
 
 import { z } from 'zod'
-import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types'
+import type { ProfileId, SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types'
 import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { RequestPayload, ResponseValue } from './rpc-map.ts'
 import type { Wire } from './rpc.schema.ts'
@@ -25,6 +25,9 @@ import {
 
 /** SessionId: one brand cast after schema validation (the only cast point in this domain). */
 export const sessionIdSchema = z.string().min(1) as unknown as z.ZodType<SessionId>
+
+/** ProfileId: one brand cast after non-empty string validation. */
+export const profileIdSchema = z.string().min(1) as unknown as z.ZodType<ProfileId>
 
 /** MessageId: one brand cast after non-empty string validation. */
 export const messageIdSchema = z.string().min(1) as unknown as z.ZodType<MessageId>
@@ -51,6 +54,7 @@ export const sessionEventSchema = z.object({
 /** SessionSummary row of session.list (`projections` reuses the history block's shape and schema). */
 export const sessionSummarySchema = z.object({
   sessionId: sessionIdSchema,
+  profileId: profileIdSchema,
   updatedAt: z.number(),
   running: z.boolean(),
   blank: z.boolean(),
@@ -103,6 +107,7 @@ export const sessionCreateRequestSchema = z.object({
   workspaceId: workspaceIdSchema.optional(),
   cwd: z.string().optional(),
   sessionId: sessionIdSchema.optional(),
+  profileId: profileIdSchema.optional(),
   agentPreset: z.string().optional(),
 }).refine(
   payload => payload.workspaceId === undefined || payload.cwd === undefined,
@@ -112,6 +117,7 @@ export const sessionCreateRequestSchema = z.object({
 /** session.create response value. */
 export const sessionCreateValueSchema = z.object({
   sessionId: sessionIdSchema,
+  profileId: profileIdSchema,
   agentPreset: z.string().optional(),
 }) satisfies z.ZodType<Wire<ResponseValue<'session.create'>>>
 

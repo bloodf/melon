@@ -17,7 +17,8 @@ import { contentHasImage, createUserMessage, freezeMessage, ReasoningEffortId } 
 import { errorChain } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageSource } from '@deepseek-ai/dsh-llm'
 import { isAppendSurfaceEvent, isJsonValue } from '@deepseek-ai/dsh-session'
-import type { JsonValue, Session, SessionEvent, SessionEventMap, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
+import type { JsonValue, Session, SessionEvent, SessionEventMap, ProfileId, SessionHeader, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { SessionQueryError, type SessionSearchCursor } from '@deepseek-ai/dsh-session-query'
 import { SubagentError } from '@deepseek-ai/dsh-subagent'
@@ -478,6 +479,7 @@ function sessionListUpdatedAt(header: SessionHeader, metadata: SessionListMetada
 
 /** Shared Session-header projection for list baselines and creation frames. */
 function sessionListFields(header: SessionHeader, events: readonly SessionEvent[] = []): {
+  profileId: ProfileId
   parentSessionId?: SessionId
   origin?: 'subagent'
   cwd?: string
@@ -488,6 +490,7 @@ function sessionListFields(header: SessionHeader, events: readonly SessionEvent[
   // showing the creation-time value would contradict what the model saw.
   const agentPreset = resolveSessionPreset({ header, events })
   return {
+    profileId: header.profileId ?? DEFAULT_PROFILE_ID,
     ...header.parentSession === undefined ? {} : { parentSessionId: header.parentSession },
     ...header.origin === undefined ? {} : { origin: header.origin },
     ...header.cwd === undefined ? {} : { cwd: header.cwd },
@@ -1565,6 +1568,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     cwd: string,
     checkPersistedIdentity: boolean,
     presetId?: string,
+    profileId?: SessionHeader['profileId'],
   ): Promise<Agent> {
     let creation = sessionCreations.get(sessionId)
     if (creation === undefined) {
@@ -1617,6 +1621,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           agentOptions: agentOptions(),
           meta: {
             cwd,
+            ...profileId === undefined ? {} : { profileId },
             ...composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset },
           },
           setup: composition.setup,
@@ -2096,7 +2101,13 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         const cwd = workspace?.path ?? request.payload.cwd ?? defaults.cwd
         const requestedPreset = request.payload.agentPreset
         try {
-          await ensureSession(sessionId, cwd, request.payload.sessionId !== undefined, requestedPreset)
+          await ensureSession(
+            sessionId,
+            cwd,
+            request.payload.sessionId !== undefined,
+            requestedPreset,
+            request.payload.profileId,
+          )
         } catch (error: unknown) {
           if (error instanceof AgentPresetConflict) {
             return err(request, {
@@ -2152,7 +2163,12 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         // allowed and the row `session.list` serves for the same session.
         const created = ctx.agents.get(sessionId)
         const createdPreset = created === undefined ? undefined : resolveSessionPreset(created.session)
-        return ok(request, { sessionId, ...createdPreset === undefined ? {} : { agentPreset: createdPreset } })
+        if (created === undefined) throw new Error(`created session "${sessionId}" is not attached`)
+        return ok(request, {
+          sessionId,
+          profileId: created.session.header.profileId,
+          ...createdPreset === undefined ? {} : { agentPreset: createdPreset },
+        })
       },
 
       async history(request) {

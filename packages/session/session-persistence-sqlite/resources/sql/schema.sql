@@ -7,6 +7,7 @@ CREATE TABLE sessions (
   id               TEXT PRIMARY KEY,
   version          INTEGER NOT NULL,
   created_at       INTEGER NOT NULL,
+  profile_id       TEXT NOT NULL,
   cwd              TEXT,
   parent_session   TEXT,
   seed_length      INTEGER,

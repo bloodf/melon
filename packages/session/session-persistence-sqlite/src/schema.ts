@@ -9,13 +9,14 @@ import { performance } from 'node:perf_hooks'
 import type { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  ProfileId,
   SessionId,
   type SessionHeader,
 } from '@deepseek-ai/dsh-session'
 import { sql } from './sql.ts'
 
 /** Current physical-record schema with packed and compressed event rows. */
-export const SCHEMA_VERSION = 17
+export const SCHEMA_VERSION = 18
 /** Application id reserved for DeepSeek Harness SQLite session databases. */
 export const SESSION_PERSISTENCE_SQLITE_APPLICATION_ID = 0x44534850
 
@@ -24,6 +25,7 @@ export interface SessionRow {
   readonly id: string
   readonly version: number
   readonly created_at: number
+  readonly profile_id: string
   readonly cwd: string | null
   readonly parent_session: string | null
   readonly seed_length: number | null
@@ -206,7 +208,7 @@ function initializeDatabase(db: DatabaseSync): void {
   db.exec(sql('schema'))
   db.prepare(sql('insert-persistence-state')).run(randomUUID())
   db.exec(sql('set-application-id'))
-  db.exec(sql('set-user-version-17'))
+  db.exec(sql('set-user-version-18'))
 }
 
 let canonicalSchema: readonly SchemaObjectRow[] | undefined
@@ -295,6 +297,7 @@ export function decodeSessionRow(value: unknown): SessionRow {
     id,
     version,
     created_at: nonnegativeSafeIntegerField(row, 'created_at'),
+    profile_id: nonemptyStringField(row, 'profile_id'),
     cwd,
     parent_session: parent,
     seed_length: nullableNonnegativeSafeIntegerField(row, 'seed_length'),
@@ -349,6 +352,7 @@ export function rowToMeta(row: SessionRow): SessionHeader {
     version: row.version,
     id: SessionId(row.id),
     createdAt: row.created_at,
+    profileId: ProfileId(row.profile_id),
     ...row.cwd === null ? {} : { cwd: row.cwd },
     ...row.parent_session === null ? {} : { parentSession: SessionId(row.parent_session) },
     ...row.seed_length === null ? {} : { seedLength: row.seed_length },

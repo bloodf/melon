@@ -528,7 +528,7 @@ describe('SessionPersistenceSqlite schema ownership', () => {
 
     const foreignPath = await freshDbPath('dsh-sqlite-foreign-')
     const foreign = new DatabaseSync(foreignPath)
-    foreign.exec(testSql('set-user-version-17'))
+    foreign.exec(testSql('set-user-version-18'))
     foreign.exec(testSql('set-application-id-12345'))
     foreign.close()
     await expect(openDatabase(DatabaseSync, foreignPath, 'wal', DEFAULT_BUSY_TIMEOUT_MS)).rejects.toThrow(/has application id 12345/)
@@ -575,6 +575,7 @@ describe('SessionPersistenceSqlite schema ownership', () => {
       id: 'stored-header',
       version: 0,
       created_at: 1,
+      profile_id: 'default',
       cwd: '/project',
       parent_session: 'parent',
       seed_length: 4,
@@ -602,6 +603,7 @@ describe('SessionPersistenceSqlite schema ownership', () => {
       id: 'stored-header',
       version: 0,
       created_at: 1,
+      profile_id: 'default',
       cwd: '/project',
       parent_session: null,
       seed_length: null,

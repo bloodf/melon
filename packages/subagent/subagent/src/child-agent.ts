@@ -107,6 +107,7 @@ export function childSessionMeta(
   const parentHeader = parent.session.header
   const agentPreset = parent.ctx.get('agentPresets')?.composedPreset(parent.ctx)
   return {
+    ...parentHeader.profileId === undefined ? {} : { profileId: parentHeader.profileId },
     ...parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {},
     ...agentPreset === undefined ? {} : { agentPreset },
     parentSession: parentHeader.id,

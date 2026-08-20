@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
-import {
+import { DEFAULT_PROFILE_ID,
   SESSION_FORMAT_VERSION, SessionId as sessionId, type SessionEvent, type SessionId,
 } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
@@ -114,7 +114,7 @@ describe('web e2e: persisted subagent conversation and human continuation', () =
     const oneShotDurationMs = 192 * 24 * 60 * 60 * 1_000
     const oneShotAt = Date.now() - oneShotDurationMs
     await scaffold.ctx.sessionPersistence.create({
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: oneShotId,
       createdAt: oneShotAt,
       cwd: scaffold.workspaceCwd,
@@ -158,7 +158,7 @@ describe('web e2e: persisted subagent conversation and human continuation', () =
     grandchildId = sessionId('recorded-grandchild')
     const authoredAt = Date.now()
     await scaffold.ctx.sessionPersistence.create({
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: grandchildId,
       createdAt: authoredAt,
       cwd: scaffold.workspaceCwd,

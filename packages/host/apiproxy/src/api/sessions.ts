@@ -7,7 +7,7 @@
 import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { AttachmentIdType, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
-import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types'
+import type { ProfileId, SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types'
 // The pure-type outlet: api/ is browser-importable, and the package root's
 // cordis Context merge (via dsh-agent) must not enter client aggregates.
 import type { SessionProjectionMap } from '@deepseek-ai/dsh-session-projection/types'
@@ -176,6 +176,8 @@ export type QueueAction =
 /** One Session list entry. */
 export interface SessionSummary {
   sessionId: SessionId
+  /** Company profile that owns this session. */
+  profileId: ProfileId
   /**
    * The later of creation and the latest human-authored prompt. Attached
    * Sessions fold their live log; cold Sessions use a projection-cache hint or
@@ -258,8 +260,14 @@ export interface SessionsApi {
    * id fails with `agent-preset-not-found`, and a preset whose composition
    * cannot be mounted fails with `agent-preset-invalid`.
    */
-  create(request: RpcRequest<{ workspaceId?: WorkspaceId; cwd?: string; sessionId?: SessionId; agentPreset?: string }>):
-  Promise<RpcResponse<{ sessionId: SessionId; agentPreset?: string }>>
+  create(request: RpcRequest<{
+    workspaceId?: WorkspaceId
+    cwd?: string
+    sessionId?: SessionId
+    profileId?: ProfileId
+    agentPreset?: string
+  }>):
+  Promise<RpcResponse<{ sessionId: SessionId; profileId: ProfileId; agentPreset?: string }>>
 
   /**
    * Reads a window of history events; page boundaries align to append-origin message

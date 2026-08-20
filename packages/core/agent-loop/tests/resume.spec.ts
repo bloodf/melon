@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
-import SessionStore, { SESSION_FORMAT_VERSION, Session, SessionId, SessionPreparation } from '@deepseek-ai/dsh-session'
+import SessionStore, { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, Session, SessionId, SessionPreparation } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -93,7 +93,7 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     const sessionId = SessionId('pre-identity-resume')
     const first = await persistentHarness(new MockAdapter([]))
     await first.ctx.sessionPersistence.create({
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: sessionId,
       createdAt: 1,
     })

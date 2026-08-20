@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, CallId, createMessage, createToolResultMessage, MessageId, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import SessionStore, {
+import SessionStore, { DEFAULT_PROFILE_ID,
   adoptSessionEvent,
   SESSION_FORMAT_VERSION,
   Session,
@@ -938,7 +938,7 @@ describe('Session', () => {
     } as unknown as SessionEvent
 
     expect(() => Session.fromRestore(SessionId('deep-restore'), [event], {
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: SessionId('deep-restore'),
       createdAt: 1,
     })).not.toThrow()
@@ -976,7 +976,7 @@ describe('Session', () => {
 
   it('detaches and freezes an explicitly supplied session header', () => {
     const input = {
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: SessionId('header-owned'),
       createdAt: 123,
       cwd: '/accepted',
@@ -988,7 +988,7 @@ describe('Session', () => {
     input.cwd = '/caller-mutated'
 
     expect(session.header).toEqual({
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: 'header-owned',
       createdAt: 123,
       cwd: '/accepted',
@@ -1021,13 +1021,13 @@ describe('Session', () => {
       )).toThrow(/not a plain JSON record/)
     }
     expect(() => Session.create(SessionId('header-invalid'), undefined, {
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: SessionId('header-invalid'),
       createdAt: 123,
       parentSession: 1n,
     } as unknown as SessionHeader)).toThrow(/not losslessly JSON-serializable/)
     expect(() => Session.create(SessionId('header-invalid'), undefined, {
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: SessionId('other'),
       createdAt: 123,
     })).toThrow(/does not match session id/)
@@ -1035,7 +1035,7 @@ describe('Session', () => {
 
   it('rejects invalid scalar fields in an explicitly supplied header', () => {
     const base = {
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: SessionId('header-shape'),
       createdAt: 123,
     }
@@ -1044,6 +1044,7 @@ describe('Session', () => {
       { header: null, error: /not a plain JSON record/ },
       { header: { ...base, version: 1 }, error: /header version/ },
       { header: { ...base, createdAt: '123' }, error: /createdAt must be a non-negative safe integer/ },
+      { header: { ...base, profileId: '' }, error: /profileId must be a non-empty string/ },
       { header: { ...base, cwd: 1 }, error: /header cwd must be a string/ },
       { header: { ...base, cwd: 'relative' }, error: /header cwd must be an absolute path/ },
       { header: { ...base, parentSession: 1 }, error: /header parentSession must be a string/ },
@@ -1258,7 +1259,7 @@ describe('SessionStore', () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
     const session = ctx.sessions.create(SessionId('plain'))
-    expect(session.header).toMatchObject({ version: SESSION_FORMAT_VERSION, id: 'plain' })
+    expect(session.header).toMatchObject({ version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id: 'plain' })
     expect(Number.isSafeInteger(session.header.createdAt)).toBe(true)
     expect(session.header.cwd).toBeUndefined()
     expect(session.header.parentSession).toBeUndefined()
@@ -1271,7 +1272,7 @@ describe('SessionStore', () => {
       meta: { cwd: '/work/project', parentSession: SessionId('parent') },
     })
     expect(session.header).toMatchObject({
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: 'child',
       cwd: '/work/project',
       parentSession: 'parent',
@@ -1331,7 +1332,7 @@ describe('SessionStore', () => {
 
   it('a bare Session() constructed without the store still exposes a current-version header', () => {
     const session = Session.create(SessionId('bare'))
-    expect(session.header).toMatchObject({ version: SESSION_FORMAT_VERSION, id: 'bare' })
+    expect(session.header).toMatchObject({ version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id: 'bare' })
     expect(typeof session.header.createdAt).toBe('number')
   })
 

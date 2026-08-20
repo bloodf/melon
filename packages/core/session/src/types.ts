@@ -18,6 +18,21 @@ import type { JsonValue } from './json.ts'
 // `ctx.sessions` (a Host-only SessionStore) into every consumer's program.
 export type { JsonValue } from './json.ts'
 
+/** Identifies one company profile across session and wire boundaries. */
+export type ProfileId = Branded<'ProfileId'>
+
+/** Default profile used when callers do not select one. */
+export const DEFAULT_PROFILE_ID = 'default' as ProfileId
+
+/**
+ * Brand a string as a {@link ProfileId}.
+ * @param id - raw profile id string.
+ * @returns same string, branded without runtime cost.
+ */
+export function ProfileId(id: string): ProfileId {
+  return id as ProfileId
+}
+
 /** Identifies one session in the store (and its persistence artifacts). */
 export type SessionId = Branded<'SessionId'>
 
@@ -69,6 +84,8 @@ export interface SessionHeader {
   readonly id: SessionId
   /** Non-negative safe-integer Unix epoch milliseconds when the session was created. */
   readonly createdAt: number
+  /** Company profile that owns this session. */
+  readonly profileId?: ProfileId
   /** Absolute working directory the session was created in (if any). */
   readonly cwd?: string
   /** The session this one was forked from (seed lineage), if any. */
@@ -111,6 +128,7 @@ export interface CreateSessionOptions {
    * because a resumed seed contains the full stored log, not only its inherited prefix.
    */
   readonly meta?: {
+    readonly profileId?: ProfileId
     readonly cwd?: string
     readonly parentSession?: SessionId
     readonly createdAt?: number

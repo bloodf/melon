@@ -436,7 +436,7 @@ function childRow(
 
 /** Immutable header fields that distinguish one session lifecycle from another under the same id. */
 const LIFECYCLE_WITNESS_KEYS = [
-  'version', 'id', 'createdAt', 'cwd', 'parentSession', 'seedLength', 'delegationDepth',
+  'version', 'id', 'createdAt', 'profileId', 'cwd', 'parentSession', 'seedLength', 'delegationDepth',
 ] as const
 
 /** Whether an inspected log still belongs to the enumerated lifecycle. */

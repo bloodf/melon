@@ -13,6 +13,7 @@ export function assertSessionHeadersCompatible(a: SessionHeader, b: SessionHeade
     a.version !== b.version
     || a.id !== b.id
     || a.createdAt !== b.createdAt
+    || a.profileId !== b.profileId
     || a.cwd !== b.cwd
     || a.parentSession !== b.parentSession
     || a.seedLength !== b.seedLength

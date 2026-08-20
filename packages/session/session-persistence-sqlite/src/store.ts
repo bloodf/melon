@@ -10,6 +10,7 @@ import { lstat, mkdir, open } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import type { DatabaseSync, StatementSync } from 'node:sqlite'
 import {
+  DEFAULT_PROFILE_ID,
   type SessionEvent,
   type SessionHeader,
   type SessionId,
@@ -372,6 +373,7 @@ export class SqliteStore implements PersistenceBackend<number> {
       meta.id,
       meta.version,
       meta.createdAt,
+      meta.profileId ?? DEFAULT_PROFILE_ID,
       meta.cwd ?? null,
       meta.parentSession ?? null,
       meta.seedLength ?? null,

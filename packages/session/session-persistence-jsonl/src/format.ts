@@ -9,8 +9,8 @@
  */
 
 import { join } from 'node:path'
-import { decodeStorageRecord, packChunkRuns, SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
-import type { SessionEvent, SessionHeader, SessionId, StorageRecord } from '@deepseek-ai/dsh-session'
+import { decodeStorageRecord, DEFAULT_PROFILE_ID, packChunkRuns, ProfileId, SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
+import type { ProfileId as ProfileIdType, SessionEvent, SessionHeader, SessionId, StorageRecord } from '@deepseek-ai/dsh-session'
 import { SessionFormatUnsupportedError, sessionFormatVersionRefusal } from '@deepseek-ai/dsh-session-persistence'
 
 /** Physical encoding selected for JSONL session artifacts. */
@@ -35,6 +35,7 @@ export interface HeaderLine {
   version: number
   id: SessionId
   createdAt: number
+  profileId: ProfileIdType
   cwd?: string
   parentSession?: SessionId
   seedLength?: number
@@ -54,6 +55,7 @@ export function toHeaderLine(header: SessionHeader): HeaderLine {
     version: header.version,
     id: header.id,
     createdAt: header.createdAt,
+    profileId: header.profileId ?? DEFAULT_PROFILE_ID,
     ...header.cwd !== undefined ? { cwd: header.cwd } : {},
     ...header.parentSession !== undefined ? { parentSession: header.parentSession } : {},
     ...header.seedLength !== undefined ? { seedLength: header.seedLength } : {},
@@ -76,6 +78,7 @@ export function fromHeaderLine(line: HeaderLine): SessionHeader {
     version: line.version,
     id: line.id,
     createdAt: line.createdAt,
+    profileId: ProfileId(line.profileId),
     ...line.cwd !== undefined ? { cwd: line.cwd } : {},
     ...line.parentSession !== undefined ? { parentSession: line.parentSession } : {},
     ...line.seedLength !== undefined ? { seedLength: line.seedLength } : {},
@@ -93,6 +96,8 @@ function isHeaderLine(value: unknown): value is HeaderLine {
     && typeof (value as { version?: unknown }).version === 'number'
     && typeof (value as { id?: unknown }).id === 'string'
     && typeof (value as { createdAt?: unknown }).createdAt === 'number'
+    && typeof (value as { profileId?: unknown }).profileId === 'string'
+    && (value as { profileId: string }).profileId.length > 0
     && Number.isSafeInteger((value as { createdAt: number }).createdAt)
     && (value as { createdAt: number }).createdAt >= 0
     && !Object.is((value as { createdAt: number }).createdAt, -0)

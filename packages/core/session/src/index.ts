@@ -12,7 +12,7 @@ import { deepFreeze } from '@deepseek-ai/dsh-llm'
 import { scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
 import type { Message } from '@deepseek-ai/dsh-llm'
-import { SESSION_FORMAT_VERSION, SessionId } from './types.ts'
+import { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, SessionId } from './types.ts'
 import type { TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
 import type { CreateSessionOptions, EpochHeader, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SurfaceIntent, SurfaceEventType } from './types.ts'
 import { snapshotJsonValue } from './json.ts'
@@ -109,6 +109,9 @@ function validateSessionHeader(id: SessionId, input: unknown): SessionHeader {
     || record.createdAt < 0) {
     throw new Error('session header createdAt must be a non-negative safe integer')
   }
+  if (typeof record.profileId !== 'string' || record.profileId.length === 0) {
+    throw new Error('session header profileId must be a non-empty string')
+  }
   if (record.cwd !== undefined) {
     if (typeof record.cwd !== 'string') throw new Error('session header cwd must be a string')
     if (!isAbsolute(record.cwd)) {
@@ -149,7 +152,7 @@ function validateRestoredSessionHeader(id: SessionId, input: unknown): SessionHe
 /** Detach, validate, and freeze the creation metadata published by a session. */
 function snapshotSessionHeader(id: SessionId, source?: SessionHeader): SessionHeader {
   const input: unknown = source === undefined
-    ? { version: SESSION_FORMAT_VERSION, id, createdAt: Date.now() }
+    ? { version: SESSION_FORMAT_VERSION, id, createdAt: Date.now(), profileId: DEFAULT_PROFILE_ID }
     : source
   const snapshot = snapshotJsonValue(input)
   if (snapshot === undefined) throw new Error('session header is not losslessly JSON-serializable')
@@ -878,6 +881,7 @@ export class SessionStore extends Service {
       version: SESSION_FORMAT_VERSION,
       id: sessionId,
       createdAt: meta?.createdAt ?? Date.now(),
+      profileId: meta?.profileId ?? DEFAULT_PROFILE_ID,
       ...meta?.cwd === undefined ? {} : { cwd: meta.cwd },
       ...meta?.parentSession === undefined ? {} : { parentSession: meta.parentSession },
       ...meta?.seedLength === undefined ? {} : { seedLength: meta.seedLength },
@@ -1087,6 +1091,7 @@ export class SessionStore extends Service {
     return this.create(childSessionId, {
       seed,
       meta: {
+        profileId: liveSource.header.profileId ?? DEFAULT_PROFILE_ID,
         ...liveSource.header.cwd !== undefined ? { cwd: liveSource.header.cwd } : {},
         parentSession: liveSource.id,
         seedLength: seed.length,

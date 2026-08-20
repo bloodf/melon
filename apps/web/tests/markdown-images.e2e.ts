@@ -8,7 +8,7 @@ import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import { createMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
-import {
+import { DEFAULT_PROFILE_ID,
   SESSION_FORMAT_VERSION,
   Session,
   SessionId,
@@ -120,7 +120,7 @@ function markdownImageFixture(remoteUrl: string): string {
 
   const header = {
     type: 'session',
-    version: SESSION_FORMAT_VERSION,
+    version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
     id: '{{sessionId}}',
     createdAt: 0,
     cwd: '{{cwd}}',

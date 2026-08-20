@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, CallId , createMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
-import SessionStore, {
+import SessionStore, { DEFAULT_PROFILE_ID,
   SESSION_FORMAT_VERSION,
   SessionId,
 } from '@deepseek-ai/dsh-session'
@@ -22,7 +22,7 @@ import { TestSessionQueryEngine } from './test-service.ts'
 const id = SessionId('session')
 
 function header(value: string, extra: Partial<SessionHeader> = {}): SessionHeader {
-  return { version: SESSION_FORMAT_VERSION, id: SessionId(value), createdAt: 10, ...extra }
+  return { version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id: SessionId(value), createdAt: 10, ...extra }
 }
 
 function expectCode(code: SessionQueryErrorCode): Error {

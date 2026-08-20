@@ -16,7 +16,7 @@
  */
 import type { Context, Fiber } from '@deepseek-ai/cordis'
 import type {
-  IApiClient, RpcError, RpcResult, SessionId, SubagentAddress, JobView, WorkspaceId,
+  IApiClient, ProfileId, RpcError, RpcResult, SessionId, SubagentAddress, JobView, WorkspaceId,
 } from '@deepseek-ai/dsh-api-remotes/client'
 // Value import from the inline-safe wire layer (not the connection plugin):
 // plugin-to-plugin value imports are a bundle purity error.
@@ -41,6 +41,8 @@ import type { Session } from './session.ts'
 /** Session list row projected from the host list RPC plus live stream increments. */
 export interface SessionSummary {
   id: SessionId
+  /** Company profile that owns this session. */
+  profileId: ProfileId
   /** Latest durable log-backed title, absent until the host projects one. */
   title?: string
   /** Human-facing label: durable title, project basename, then session id. */
@@ -667,6 +669,7 @@ export class SessionRuntime implements ISessions {
       ids.push(entry.sessionId)
       byId[entry.sessionId] = {
         id: entry.sessionId,
+        profileId: entry.profileId,
         displayTitle: displayTitleOf(entry.title, entry.cwd, entry.sessionId),
         running: entry.running,
         ...(entry.completed ? { completed: true } : {}),

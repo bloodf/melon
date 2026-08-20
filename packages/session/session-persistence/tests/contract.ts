@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { SESSION_FORMAT_VERSION, Session, SessionId, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from '@deepseek-ai/dsh-session'
+import { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, Session, SessionId, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader, SurfaceEventType, SurfaceIntent } from '@deepseek-ai/dsh-session'
 import { CallId, MessageId, createMessage, freezeMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionPersistence } from '../src/index.ts'
@@ -23,7 +23,7 @@ export interface ContractBackend {
 /** Build a minimal {@link SessionHeader} for a session id. */
 export function meta(id: string, cwd?: string): SessionHeader {
   return {
-    version: SESSION_FORMAT_VERSION,
+    version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
     id: SessionId(id),
     createdAt: 1000,
     ...cwd !== undefined ? { cwd } : {},
@@ -92,7 +92,7 @@ export function runPersistenceContract(name: string, make: () => Promise<Contrac
         await persistence.append(m.id, log)
 
         const loaded = await persistence.load(m.id)
-        expect(loaded.meta).toMatchObject({ version: SESSION_FORMAT_VERSION, id: m.id, cwd: '/work' })
+        expect(loaded.meta).toMatchObject({ version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id: m.id, cwd: '/work' })
         expect(loaded.events).toEqual(log)
       } finally {
         await dispose()

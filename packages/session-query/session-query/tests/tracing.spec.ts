@@ -1,7 +1,7 @@
 import { createUserMessage, createMessage } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import SessionStore, { SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
 import SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import { type SessionQueryErrorCode } from '@deepseek-ai/dsh-session-query'
@@ -15,7 +15,7 @@ function mutableHeader(value: SessionHeader): MutableSessionHeader {
 }
 
 function header(id: string, createdAt = 1, extra: Partial<SessionHeader> = {}): SessionHeader {
-  return { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt, ...extra }
+  return { version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id: SessionId(id), createdAt, ...extra }
 }
 
 function appendEvent(seq: number, sources?: number[]): SessionEvent {

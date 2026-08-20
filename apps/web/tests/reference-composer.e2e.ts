@@ -8,7 +8,7 @@ import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import {
+import { DEFAULT_PROFILE_ID,
   SESSION_FORMAT_VERSION,
   Session,
   SessionId,
@@ -53,7 +53,7 @@ function sourceSessionFixture(): string {
   return [
     JSON.stringify({
       type: 'session',
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: '{{sessionId}}',
       createdAt: 0,
       cwd: '{{cwd}}',
@@ -100,7 +100,7 @@ function targetSessionFixture(): string {
   return [
     JSON.stringify({
       type: 'session',
-      version: SESSION_FORMAT_VERSION,
+      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
       id: '{{sessionId}}',
       createdAt: 0,
       cwd: '{{cwd}}',

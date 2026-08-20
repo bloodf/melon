@@ -4,7 +4,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, CallId, HarnessError , createMessage } from '@deepseek-ai/dsh-llm'
 import { MAX_TIMER_DELAY_MS, TimeoutReason } from '@deepseek-ai/dsh-timeout'
 import * as TimeoutPolicy from '@deepseek-ai/dsh-tool-call-timeout-policy'
-import SessionStore, {
+import SessionStore, { DEFAULT_PROFILE_ID,
   SESSION_FORMAT_VERSION,
   SessionId,
   type Session,
@@ -39,7 +39,7 @@ afterEach(async () => {
 
 function header(id: string, cwd: string | undefined, createdAt = 1, parentSession?: SessionIdValue): SessionHeader {
   return {
-    version: SESSION_FORMAT_VERSION,
+    version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
     id: SessionId(id),
     createdAt,
     ...cwd === undefined ? {} : { cwd },
