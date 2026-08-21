@@ -576,7 +576,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     db.prepare(`
       INSERT INTO persisted_sessions
         (id, version, created_at, profile_id, cwd, parent_session, seed_length, delegation_depth, agent_preset, revision, generation)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       ...headerBindings(entry.header),
       revision,
@@ -606,7 +606,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     db.prepare(`
       INSERT INTO temp.live_sessions
         (id, version, created_at, profile_id, cwd, parent_session, seed_length, delegation_depth, agent_preset, fingerprint, persisted, generation)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       ...headerBindings(entry.header),
       entry.fingerprint,

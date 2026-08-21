@@ -2162,11 +2162,13 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         // echoing the header would contradict both the adoption this call just
         // allowed and the row `session.list` serves for the same session.
         const created = ctx.agents.get(sessionId)
-        const createdPreset = created === undefined ? undefined : resolveSessionPreset(created.session)
         if (created === undefined) throw new Error(`created session "${sessionId}" is not attached`)
+        const createdPreset = resolveSessionPreset(created.session)
+        const createdProfileId = created.session.header.profileId
+        if (createdProfileId === undefined) throw new Error(`created session "${sessionId}" has no profile identity`)
         return ok(request, {
           sessionId,
-          profileId: created.session.header.profileId,
+          profileId: createdProfileId,
           ...createdPreset === undefined ? {} : { agentPreset: createdPreset },
         })
       },
