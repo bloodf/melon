@@ -489,6 +489,36 @@ describe('ToolRuntime', () => {
     expect(result.error?.message).toBe('tools/post-execute cannot replace the value of a failed result')
   })
 
+  it('dispatches the definition admitted before an HMR replacement', async () => {
+    const ctx = await setup()
+    let release!: () => void
+    const waiting = new Promise<void>((resolve) => { release = resolve })
+    const dispose = ctx.tools.register({
+      ...echoTool,
+      async execute() { return 'old' },
+    })
+    ctx.on('tools/pre-execute', async (_exec, next) => {
+      await waiting
+      return next()
+    })
+
+    const first = ctx.tools.execute({
+      signal: testToolSignal, callId: CallId('hmr-old'), name: 'echo', arguments: {},
+    })
+    await Promise.resolve()
+    dispose()
+    ctx.tools.register({
+      ...echoTool,
+      async execute() { return 'new' },
+    })
+    release()
+
+    await expect(first).resolves.toMatchObject({ isError: false, value: 'old' })
+    await expect(ctx.tools.execute({
+      signal: testToolSignal, callId: CallId('hmr-new'), name: 'echo', arguments: {},
+    })).resolves.toMatchObject({ isError: false, value: 'new' })
+  })
+
   it('fails value replacement when the owning tool disappears before post-policy resolves', async () => {
     const ctx = await setup()
     const dispose = ctx.tools.register(echoTool)
