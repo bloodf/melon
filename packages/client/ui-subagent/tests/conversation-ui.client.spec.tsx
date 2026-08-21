@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
@@ -52,7 +53,7 @@ function props(
     byId: summaries ?? {
       [CHILD]: {
         id: CHILD,
-        title: '正在扫描项目文件',
+        profileId: DEFAULT_PROFILE_ID, title: '正在扫描项目文件',
         displayTitle: 'worker',
         running: true,
         blank: false,
@@ -77,11 +78,11 @@ function props(
   } as unknown as SubagentCatalogActionProps
 }
 
-function summary(id: SessionId, updatedAt: number): SessionSummary {
+function summary(id: SessionId, profileId: DEFAULT_PROFILE_ID, updatedAt: number): SessionSummary {
   return {
     id,
-    displayTitle: id,
-    running: false,
+    profileId: DEFAULT_PROFILE_ID, displayTitle: id,
+    profileId: DEFAULT_PROFILE_ID, running: false,
     blank: false,
     updatedAt,
   }

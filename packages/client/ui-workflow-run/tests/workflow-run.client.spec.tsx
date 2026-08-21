@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -263,10 +264,10 @@ const listState = (overrides: Partial<SessionListState> = {}): SessionListState 
   ids: [PARENT_ID, CHILD_ID],
   byId: {
     [PARENT_ID]: {
-      id: PARENT_ID, displayTitle: 'parent', running: true, blank: false, updatedAt: 0,
+      id: PARENT_ID, profileId: DEFAULT_PROFILE_ID, displayTitle: 'parent', running: true, blank: false, updatedAt: 0,
     },
     [CHILD_ID]: {
-      id: CHILD_ID, displayTitle: 'child', parentId: PARENT_ID, origin: 'subagent',
+      id: CHILD_ID, profileId: DEFAULT_PROFILE_ID, displayTitle: 'child', parentId: PARENT_ID, origin: 'subagent',
       running: true, blank: false, updatedAt: 0,
     },
   },
@@ -624,7 +625,7 @@ describe('WorkflowRunPanel', () => {
       byId: {
         ...listState().byId,
         [SECOND_ID]: {
-          id: SECOND_ID, displayTitle: 'second', parentId: PARENT_ID, origin: 'subagent',
+          id: SECOND_ID, profileId: DEFAULT_PROFILE_ID, displayTitle: 'second', parentId: PARENT_ID, origin: 'subagent',
           running: true, blank: false, updatedAt: 0,
         },
       },

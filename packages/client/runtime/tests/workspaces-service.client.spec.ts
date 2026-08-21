@@ -204,7 +204,7 @@ describe('WorkspaceRuntime', () => {
     expect(workspaces.list.getSnapshot()).toMatchObject({ baselinesReady: false, recentWorkspaceId: undefined })
 
     api.onList = () => Promise.resolve(ok({
-      items: [{ sessionId: sid('s-active'), updatedAt: Date.parse('2026-02-01'), running: false, blank: false }] as never[],
+      items: [{ sessionId: sid('s-active'), profileId: DEFAULT_PROFILE_ID, updatedAt: Date.parse('2026-02-01'), running: false, blank: false }] as never[],
     }))
     await sessions.refresh()
     await Promise.resolve()
@@ -229,17 +229,17 @@ describe('WorkspaceRuntime', () => {
         // Stray blank at alpha's path but NOT accounted under alpha (a CLI
         // session birthed at the host cwd), sorted before the member blank:
         // the scan must skip it and keep looking for a member hit.
-        { sessionId: sid('s-stray-alpha'), updatedAt: 1, running: false, blank: true, cwd: '/w/alpha' },
+        { sessionId: sid('s-stray-alpha'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: true, cwd: '/w/alpha' },
         // Blank session parked in alpha (cwd == workspace path canon AND
         // accounted under alpha): the reuse hit.
-        { sessionId: sid('s-blank'), updatedAt: 2, running: false, blank: true, cwd: '/w/alpha' },
+        { sessionId: sid('s-blank'), profileId: DEFAULT_PROFILE_ID, updatedAt: 2, running: false, blank: true, cwd: '/w/alpha' },
         // Non-blank sibling in beta must never be reused.
-        { sessionId: sid('s-active'), updatedAt: 3, running: false, blank: false, cwd: '/w/beta' },
+        { sessionId: sid('s-active'), profileId: DEFAULT_PROFILE_ID, updatedAt: 3, running: false, blank: false, cwd: '/w/beta' },
         // Stray blank at gamma's path but NOT accounted under gamma (a CLI
         // session birthed at the host cwd): cwd alone must not hijack it —
         // reuse would open a session gamma cannot show, so New Session mints
         // a fresh accounted one instead.
-        { sessionId: sid('s-stray'), updatedAt: 4, running: false, blank: true, cwd: '/w/gamma' },
+        { sessionId: sid('s-stray'), profileId: DEFAULT_PROFILE_ID, updatedAt: 4, running: false, blank: true, cwd: '/w/gamma' },
       ] as never[],
     }))
     await Promise.all([workspaces.refresh(), sessions.refresh()])
@@ -253,7 +253,7 @@ describe('WorkspaceRuntime', () => {
     expect(sessions.binding(sid('s-blank'))).toBeDefined()
 
     // Miss: beta has only a non-blank session → host create with workspaceId.
-    api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh') }))
+    api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh') , profileId: DEFAULT_PROFILE_ID }))
     await expect(workspaces.connectWorkspace(wid('beta'))).resolves.toBe('s-fresh')
     expect(api.callsOf('session.create')).toEqual([{ workspaceId: 'beta' }])
     // Same guarantee on the create arm (draft hand-off writes the machine pre-open).
@@ -261,7 +261,7 @@ describe('WorkspaceRuntime', () => {
 
     // Miss: the stray blank matches gamma's path but is not a gamma member →
     // never reused, a fresh accounted session is created instead.
-    api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh-3') }))
+    api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh-3') , profileId: DEFAULT_PROFILE_ID }))
     await expect(workspaces.connectWorkspace(wid('gamma'))).resolves.toBe('s-fresh-3')
     expect(api.callsOf('session.create')).toEqual([{ workspaceId: 'beta' }, { workspaceId: 'gamma' }])
 
@@ -271,7 +271,7 @@ describe('WorkspaceRuntime', () => {
     // An archived blank is never reused: no surface can show it, so New
     // Session mints a fresh one for alpha instead.
     await workspaces.archiveSession(sid('s-blank'))
-    api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh-2') }))
+    api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh-2') , profileId: DEFAULT_PROFILE_ID }))
     await expect(workspaces.connectWorkspace(wid('alpha'))).resolves.toBe('s-fresh-2')
   })
 
@@ -282,7 +282,7 @@ describe('WorkspaceRuntime', () => {
     const workspaces = new WorkspaceRuntime(ctx, api, sessions)
     api.onWorkspaceList = () => Promise.resolve(ok({ items: [workspace('alpha', [sid('s-blank')])] as never[] }))
     api.onList = () => Promise.resolve(ok({
-      items: [{ sessionId: sid('s-blank'), updatedAt: 2, running: false, blank: true, cwd: '/w/alpha' }] as never[],
+      items: [{ sessionId: sid('s-blank'), profileId: DEFAULT_PROFILE_ID, updatedAt: 2, running: false, blank: true, cwd: '/w/alpha' }] as never[],
     }))
     await Promise.all([workspaces.refresh(), sessions.refresh()])
     await Promise.resolve()
@@ -411,8 +411,8 @@ describe('WorkspaceRuntime', () => {
       ] as never[],
     }))
     api.onList = () => Promise.resolve(ok({ items: [
-      { sessionId: sid('current'), updatedAt: 1, running: false, blank: false },
-      { sessionId: sid('recent'), updatedAt: 2, running: false, blank: false },
+      { sessionId: sid('current'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: false },
+      { sessionId: sid('recent'), profileId: DEFAULT_PROFILE_ID, updatedAt: 2, running: false, blank: false },
     ] as never[] }))
     await Promise.all([workspaces.refresh(), sessions.refresh()])
     await Promise.resolve()
@@ -449,8 +449,8 @@ describe('WorkspaceRuntime', () => {
     const workspaces = new WorkspaceRuntime(ctx, api, sessions)
     api.onList = () => Promise.resolve(ok({
       items: [
-        { sessionId: sid('s-open'), updatedAt: 2, running: false, blank: false },
-        { sessionId: sid('s-idle'), updatedAt: 1, running: false, blank: false },
+        { sessionId: sid('s-open'), profileId: DEFAULT_PROFILE_ID, updatedAt: 2, running: false, blank: false },
+        { sessionId: sid('s-idle'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: false },
       ],
     }) as never)
     await sessions.refresh()
@@ -494,7 +494,7 @@ describe('WorkspaceRuntime', () => {
     const sessions = new SessionRuntime(ctx, api, fakeRemote())
     const workspaces = new WorkspaceRuntime(ctx, api, sessions)
     api.onList = () => Promise.resolve(ok({
-      items: [{ sessionId: sid('s-open'), updatedAt: 1, running: false, blank: false }],
+      items: [{ sessionId: sid('s-open'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: false }],
     }) as never)
     await sessions.refresh()
     sessions.open(sid('s-open'))
@@ -539,7 +539,7 @@ describe('startInitialSelection', () => {
     b.api.onWorkspaceList = () => Promise.resolve(ok({
       items: [workspace('recent', [], '2026-01-02T00:00:00.000Z')] as never[],
     }))
-    b.api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-new') }))
+    b.api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-new') , profileId: DEFAULT_PROFILE_ID }))
     await b.workspaces.refresh()
     await b.sessions.refresh()
     // Store notifications and the connect round trip are microtask-batched.
@@ -552,7 +552,7 @@ describe('startInitialSelection', () => {
   it('stays idle when a session is already current or no recent Workspace exists', async () => {
     const withCurrent = bench()
     withCurrent.api.onList = () => Promise.resolve(ok({
-      items: [{ sessionId: sid('s1'), updatedAt: 1, running: false, blank: false }] as never[],
+      items: [{ sessionId: sid('s1'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: false }] as never[],
     }))
     await withCurrent.sessions.refresh()
     withCurrent.sessions.open(sid('s1'))
@@ -587,7 +587,7 @@ describe('startInitialSelection', () => {
     expect(b.sessions.list.getSnapshot().current).toBeUndefined()
 
     // Recovery: the next workspace-list change re-runs the reconcile.
-    b.api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-retry') }))
+    b.api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-retry') , profileId: DEFAULT_PROFILE_ID }))
     await b.workspaces.refresh()
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(b.api.callsOf('session.create')).toHaveLength(2)

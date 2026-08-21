@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
-import SessionStore, { DEFAULT_PROFILE_ID,
+import SessionStore, {
   SESSION_FORMAT_VERSION,
   Session,
   SessionId,
@@ -98,7 +98,7 @@ export function messageFixture(
 ): MessageFixture {
   const id = SessionId(rawId)
   const header: SessionHeader = {
-    version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
+    version: SESSION_FORMAT_VERSION,
     id,
     createdAt: options.createdAt ?? 1_700_000_000_000,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),

@@ -73,7 +73,7 @@ describe('runtime client apply', () => {
     // Frame sinks reach the object layer: a host session-added lands in the list store.
     bench.sinks?.onHostEnvelope?.({
       rpcId: 'r1' as never,
-      payload: { type: 'host/session-added', blank: true, sessionId: 's-new' } as never,
+      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, blank: true, sessionId: 's-new' } as never,
     })
     await Promise.resolve()
     expect((sessions as { list: { getSnapshot(): { ids: string[] } } }).list.getSnapshot().ids).toContain('s-new')
@@ -124,7 +124,7 @@ describe('runtime client apply', () => {
     const sessions = bench.ctx.get('sessions') as SessionRuntime
     bench.sinks?.onHostEnvelope?.({
       rpcId: 'r-registry' as never,
-      payload: { type: 'host/session-added', blank: true, sessionId: 's-registry' } as never,
+      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, blank: true, sessionId: 's-registry' } as never,
     })
     await flushMicrotasks()
     expect(sessions.binding('s-registry' as never)).toBeDefined()

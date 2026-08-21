@@ -8,6 +8,7 @@
 // and a file sub-row click opens the host path. Running parents
 // (runningCalls) nest their so-far dispatches the same way.
 
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { Context } from '@deepseek-ai/cordis'
 import { stubSettingsScope } from '@deepseek-ai/dsh-client-test-runtime'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -111,7 +112,7 @@ async function bench(snapshot: ConversationSnapshot) {
   const session = createSnapshotStore<ConversationSnapshot>(snapshot)
   const list = createSnapshotStore<SessionListState>({
     ids: [SID],
-    byId: { [SID]: { id: SID, title: 'S', displayTitle: 'S', running: false, blank: false, updatedAt: 1 } },
+    byId: { [SID]: { id: SID, profileId: DEFAULT_PROFILE_ID, title: 'S', displayTitle: 'S', running: false, blank: false, updatedAt: 1 } },
     current: SID,
     phase: 'ready', subagentsByParent: {}, jobsBySession: {}, currentAddress: undefined,
   })

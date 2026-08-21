@@ -160,7 +160,7 @@ describe('manager frame routing', () => {
     const api = new FakeApiClient()
     const manager = new SessionManager(api, fakeRemote())
     api.onList = () => Promise.resolve(ok({
-      items: [{ sessionId: sid('s1'), updatedAt: 1, running: false, blank: false }],
+      items: [{ sessionId: sid('s1'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: false }],
     }) as never)
     await manager.refreshList()
     manager.handleMuxEnvelope({
@@ -184,7 +184,7 @@ describe('manager frame routing', () => {
     const manager = new SessionManager(api, fakeRemote())
     api.onList = () => Promise.resolve(ok({
       items: [{
-        sessionId: sid('s1'), updatedAt: 1, running: false, blank: false,
+        sessionId: sid('s1'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: false,
         projections: {
           asOfSeq: 2,
           values: { 'test/marks': { marks: ['baseline'] } },
@@ -213,7 +213,7 @@ describe('manager frame routing', () => {
     const api = new FakeApiClient()
     const manager = new SessionManager(api, fakeRemote())
     api.onList = () => Promise.resolve(ok({
-      items: [{ sessionId: sid('s1'), updatedAt: 1, running: false, blank: false }],
+      items: [{ sessionId: sid('s1'), profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: false }],
     }) as never)
     await manager.refreshList()
     manager.handleMuxEnvelope({

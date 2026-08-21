@@ -8,7 +8,7 @@ import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from 'vitest'
 import { CallId, createAssistantMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
+import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-title'
 import {
   launchWebScaffold, seedSession, watchConsole, webSnapshotMode, type WebScaffold,
@@ -93,7 +93,7 @@ function producedFixture(): string {
 
   return [
     JSON.stringify({
-      type: 'session', version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id: '{{sessionId}}',
+      type: 'session', version: SESSION_FORMAT_VERSION, id: '{{sessionId}}',
       createdAt: 0, cwd: '{{cwd}}',
     }),
     ...session.events.map(event => JSON.stringify({

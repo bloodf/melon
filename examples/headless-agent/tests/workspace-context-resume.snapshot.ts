@@ -11,7 +11,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { normalizeSessionLog, scrubRequestHeaders, type NormalizeContext } from '@deepseek-ai/dsh-acp-snapshot'
 import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import SessionStore, { DEFAULT_PROFILE_ID,
+import SessionStore, {
   SESSION_FORMAT_VERSION,
   SessionId,
   type SessionEvent,
@@ -49,7 +49,7 @@ async function seedVisibleBaseline(
   await ctx.plugin(SessionStore)
   await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
   const meta: SessionHeader = {
-    version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
+    version: SESSION_FORMAT_VERSION,
     id: sessionId,
     createdAt: 1,
     cwd,

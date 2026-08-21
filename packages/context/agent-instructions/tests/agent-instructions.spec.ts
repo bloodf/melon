@@ -6,7 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import * as workspaceContext from '@deepseek-ai/dsh-agent-instructions'
 import LlmRuntime, { createUserMessage, CallId, type Message, type StreamChunk } from '@deepseek-ai/dsh-llm'
-import SessionStore, { DEFAULT_PROFILE_ID, Session, SessionId, SESSION_FORMAT_VERSION, type SessionEvent, type UserMessage } from '@deepseek-ai/dsh-session'
+import SessionStore, { Session, SessionId, SESSION_FORMAT_VERSION, type SessionEvent, type UserMessage } from '@deepseek-ai/dsh-session'
 import AgentRegistry, { agentEvents, Inbox, type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { FileSystem, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
@@ -182,13 +182,7 @@ async function mountFileToolsAndWorkspaceContext(ctx: Context, config: workspace
 
 function stubAgent(cwd?: string, seed: SessionEvent[] = []): Agent {
   const id = SessionId('s1')
-  const session = Session.create(id, seed, cwd === undefined ? undefined : {
-    version: SESSION_FORMAT_VERSION,
-    profileId: DEFAULT_PROFILE_ID,
-    id,
-    createdAt: 0,
-    cwd,
-  })
+  const session = Session.create(id, seed, cwd === undefined ? undefined : { version: SESSION_FORMAT_VERSION, id, createdAt: 0, cwd })
   return {
     ctx: new Context(),
     id: SessionId('a1'),

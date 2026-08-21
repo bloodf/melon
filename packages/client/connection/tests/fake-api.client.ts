@@ -1,6 +1,7 @@
 // Test-local programmable IApiClient fake (NOT the fixture: fixture is a demo
 // data source on a real clock; behavior tests need per-case responses and
 // deferred-controlled timing). Streams are hand pumps: pushMux/pushHost.
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import type {
   HostFrame, IApiClient, ModelSelection, MuxFrame,
   RpcRequest, RpcResponse, SessionId, SessionModels, SessionSearchItem, SkillEntry, WorkspaceId,
@@ -45,9 +46,9 @@ export class FakeApiClient implements IApiClient {
   onList: (payload: unknown) => Promise<RpcResponse<{ items: never[] }>> = () => Promise.resolve(ok({ items: [] }))
   onSearch: (payload: unknown) => Promise<RpcResponse<{ items: SessionSearchItem[]; hasMore: boolean }>> =
     () => Promise.resolve(ok({ items: [], hasMore: false }))
-  onCreate: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId }>> = () => Promise.resolve(ok({ sessionId: 'fk-new' as SessionId }))
+  onCreate: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId; profileId: typeof DEFAULT_PROFILE_ID }>> = () => Promise.resolve(ok({ sessionId: 'fk-new' as SessionId, profileId: DEFAULT_PROFILE_ID }))
   onRename: (payload: unknown) => Promise<RpcResponse<{ title: string; seq: number }>> = () => Promise.resolve(ok({ title: 'fk-renamed', seq: 0 }))
-  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId }))
+  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId; profileId: typeof DEFAULT_PROFILE_ID }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId, profileId: DEFAULT_PROFILE_ID }))
   onHistory: (payload: { sessionId: SessionId; beforeSeq?: number; maxMessages?: number })
   => Promise<RpcResponse<{ events: never[]; hasMore: boolean; modelSelection: ModelSelection }>> =
     () => Promise.resolve(ok({

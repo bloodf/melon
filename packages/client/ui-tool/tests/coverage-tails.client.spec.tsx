@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 // Tool presentation branch tails not reached by the main acceptance specs.
 
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
@@ -26,7 +27,7 @@ function listStore() {
   return createSnapshotStore<SessionListState>({
     ids: [SID],
     byId: {
-      [SID]: { id: SID, title: 'r', displayTitle: 'r', running: false, blank: false, updatedAt: 0 },
+      [SID]: { id: SID, profileId: DEFAULT_PROFILE_ID, title: 'r', displayTitle: 'r', running: false, blank: false, updatedAt: 0 },
     },
     current: undefined,
     phase: 'ready',

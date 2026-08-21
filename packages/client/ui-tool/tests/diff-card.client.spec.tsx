@@ -4,6 +4,7 @@
 // — the chat tool row's expanded body (GenericToolCard / FileMutationRow) and
 // the details panel's Output section.
 
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render } from '@testing-library/react'
 import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
@@ -156,7 +157,7 @@ describe('chat row diff body', () => {
 describe('FileMutationRow diff card', () => {
   const list = () => createSnapshotStore<SessionListState>({
     ids: [SID],
-    byId: { [SID]: { id: SID, displayTitle: 'r', running: false, blank: false, updatedAt: 0, cwd: '/w/app' } },
+    byId: { [SID]: { id: SID, profileId: DEFAULT_PROFILE_ID, displayTitle: 'r', running: false, blank: false, updatedAt: 0, cwd: '/w/app' } },
     current: SID,
     phase: 'ready',
     subagentsByParent: {}, jobsBySession: {},
@@ -314,7 +315,7 @@ describe('DetailsPanel diff Output section', () => {
       ? { ids: [], byId: {}, current: undefined, phase: 'ready', subagentsByParent: {}, jobsBySession: {}, currentAddress: undefined }
       : {
         ids: [SID],
-        byId: { [SID]: { id: SID, displayTitle: 'r', running: false, blank: false, updatedAt: 0, cwd } },
+        byId: { [SID]: { id: SID, profileId: DEFAULT_PROFILE_ID, displayTitle: 'r', running: false, blank: false, updatedAt: 0, cwd } },
         current: SID,
         phase: 'ready',
         subagentsByParent: {}, jobsBySession: {},

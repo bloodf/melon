@@ -1,7 +1,7 @@
 import { createUserMessage, createMessage } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
-import SessionStore, { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader, SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
 import SessionPersistence, { SessionPersistenceCorruptionError, SessionPersistenceRevision } from '@deepseek-ai/dsh-session-persistence'
 import SessionQueryEngine, {
@@ -13,7 +13,7 @@ import { SessionTitleProviderId } from '@deepseek-ai/dsh-session-title'
 import { TestSessionQueryEngine } from './test-service.ts'
 
 function header(id: string, createdAt = 1, extra: Partial<SessionHeader> = {}): SessionHeader {
-  return { version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id: SessionId(id), createdAt, ...extra }
+  return { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt, ...extra }
 }
 
 function eventLog(text = 'hello'): SessionEvent[] {

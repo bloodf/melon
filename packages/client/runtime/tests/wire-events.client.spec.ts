@@ -91,7 +91,7 @@ describe('wire event bridge', () => {
 
     bench.sinks?.onHostEnvelope?.({
       rpcId: 'r2' as never,
-      payload: { type: 'host/session-status', sessionId: 's1' as never, running: true },
+      payload: { type: 'host/session-status', sessionId: 's1' as never, profileId: DEFAULT_PROFILE_ID, running: true },
     })
     expect(seen).toEqual([['commands/change']])
   })

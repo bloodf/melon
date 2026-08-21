@@ -2,6 +2,7 @@
 // ConversationRoot skeleton behavior: the ONE resident composer across the
 // hero (blank session) and active phases — same textarea DOM node, machine-
 // owned draft, and the hero workspace picker (switching = retargetWorkspace).
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
@@ -103,9 +104,9 @@ function mount(
   } = {},
 ) {
   const root = sid('root')
-  const rootRow = { id: root, displayTitle: 'Root', running: false, blank: false, updatedAt: 1 }
+  const rootRow = { id: root, profileId: DEFAULT_PROFILE_ID, displayTitle: 'Root', running: false, blank: false, updatedAt: 1 }
   const childRow = {
-    id: SID, displayTitle: 'Child', parentId: root, cwd: '/projects/one',
+    id: SID, profileId: DEFAULT_PROFILE_ID, displayTitle: 'Child', parentId: root, cwd: '/projects/one',
     running: false, blank: options.summaryBlank ?? false, updatedAt: 2,
     ...(options.summaryOrigin === undefined ? {} : { origin: options.summaryOrigin }),
   }

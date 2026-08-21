@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, CallId  } from '@deepseek-ai/dsh-llm'
-import SessionStore, { DEFAULT_PROFILE_ID,
+import SessionStore, {
   SESSION_FORMAT_VERSION,
   SessionId,
   type Session,
@@ -45,7 +45,7 @@ describe('tool-session-query with the real SQLite provider', () => {
 
     const persisted = SessionId('persisted')
     await ctx.sessionPersistence.create({
-      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
+      version: SESSION_FORMAT_VERSION,
       id: persisted,
       createdAt: 1,
       cwd: '/work',
@@ -115,7 +115,7 @@ describe('tool-session-query with the real SQLite provider', () => {
     const base = Date.parse('2026-07-24T00:00:00.000Z')
     const persisted = SessionId('fractional-persisted')
     await ctx.sessionPersistence.create({
-      version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
+      version: SESSION_FORMAT_VERSION,
       id: persisted,
       createdAt: base,
       cwd: '/work',

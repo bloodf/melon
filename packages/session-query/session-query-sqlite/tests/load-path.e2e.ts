@@ -8,7 +8,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
-import { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
+import { SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import SessionStore from '@deepseek-ai/dsh-session'
 import SqliteSessionPersistence from '@deepseek-ai/dsh-session-persistence-sqlite'
 import SqliteSessionQueryEngine, * as queryModule from '@deepseek-ai/dsh-session-query-sqlite'
@@ -44,7 +44,7 @@ describe('dsh-session-query-sqlite real Loader path', () => {
     const query = await ctx.plugin(unwrapped, { path: searchPath })
 
     const id = SessionId('loader-path')
-    await ctx.sessionPersistence.create({ version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID, id, createdAt: 10 })
+    await ctx.sessionPersistence.create({ version: SESSION_FORMAT_VERSION, id, createdAt: 10 })
     await ctx.sessionPersistence.append(id, [{
       type: 'user/message',
       seq: 0,

@@ -16,7 +16,7 @@ import { join } from 'node:path'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
-import { DEFAULT_PROFILE_ID,
+import {
   SESSION_FORMAT_VERSION, SessionId as sessionId, type SessionEvent, type SessionId,
 } from '@deepseek-ai/dsh-session'
 import { snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
@@ -92,7 +92,7 @@ async function seedSubagent(scaffold: WebScaffold, parentId: SessionId): Promise
   const childId = sessionId('agent-preset-selection-child')
   const createdAt = 1784974100100
   await scaffold.ctx.sessionPersistence.create({
-    version: SESSION_FORMAT_VERSION, profileId: DEFAULT_PROFILE_ID,
+    version: SESSION_FORMAT_VERSION,
     id: childId,
     createdAt,
     cwd: scaffold.workspaceCwd,

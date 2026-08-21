@@ -1,4 +1,5 @@
 /** Test-owned sessions face: the SlotRegistry host contract over declarative fixtures. */
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import type { Context } from '@deepseek-ai/cordis'
 import type { AttachmentIdType } from '@deepseek-ai/dsh-attachment'
 import { createScope, scopeOf, SessionProvideChannel } from '@deepseek-ai/dsh-client-runtime/client'
@@ -230,8 +231,9 @@ export class TestSessions implements ISessions {
     if (this.records.has(id)) throw new Error(`test session "${id}" already added`)
     const summary: SessionSummary = {
       id,
+      profileId: DEFAULT_PROFILE_ID,
       displayTitle: fixture.id,
-      running: false,
+      profileId: DEFAULT_PROFILE_ID, running: false,
       blank: false,
       updatedAt: this.records.size + 1,
       ...fixture.summary,
