@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { Context, Service, type Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import type { ProfileId, Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type {
@@ -772,7 +773,7 @@ function headerBindings(header: SessionHeader): (string | number | null)[] {
     header.id,
     header.version,
     header.createdAt,
-    header.profileId ?? 'default',
+    header.profileId ?? DEFAULT_PROFILE_ID,
     header.cwd ?? null,
     header.parentSession ?? null,
     header.seedLength ?? null,

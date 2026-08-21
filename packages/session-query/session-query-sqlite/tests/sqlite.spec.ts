@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { chmod, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import SessionStore, { SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { DEFAULT_PROFILE_ID, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader, SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
 import SessionPersistence, { SessionPersistenceRevision } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence'
@@ -37,7 +37,7 @@ async function temporaryPath(name = 'search.db'): Promise<string> {
 }
 
 function header(id: string, createdAt = 1, extra: Partial<SessionHeader> = {}): SessionHeader {
-  return { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt, ...extra }
+  return { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt, profileId: DEFAULT_PROFILE_ID, ...extra }
 }
 
 function messageEvents(text: string, time = 1): SessionEvent[] {

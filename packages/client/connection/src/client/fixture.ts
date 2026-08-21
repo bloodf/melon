@@ -19,13 +19,15 @@ import type {
   TokenUsage,
   ToolResultMessage,
   UserMessage,
-} from '@deepseek-ai/dsh-llm'
-import type { AttachmentIdType, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+} from '@deepseek-ai/dsh-llm/types'
 import type {
+  ProfileId,
   SessionEvent,
   SessionId,
   TodoItem,
 } from '@deepseek-ai/dsh-session/types'
+import type { AttachmentIdType, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+const DEFAULT_PROFILE_ID = 'default' as ProfileId
 // Type-only: the brand constructor is host-side; the fixture casts at its
 // wire-fabrication boundary (the schema layer's one-cast-point posture).
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
@@ -1525,9 +1527,9 @@ export function createFixtureFaces(options: FixtureOptions = {}): FixtureWorld {
 function createFixtureWorld(options: FixtureOptions): FixtureWorld {
   // The resident fixture sessions all carry history, so none of them is blank.
   const sessions: SessionSummary[] = options.empty ? [] : [
-    { sessionId: sid('fx-alpha'), updatedAt: Date.now(), running: true, blank: false, cwd: '/tmp/fixture' },
-    { sessionId: sid('fx-beta'), updatedAt: Date.now() - 60_000, running: false, blank: false, parentSessionId: sid('fx-alpha'), cwd: '/tmp/fixture' },
-    { sessionId: sid('fx-gamma'), updatedAt: Date.now() - 120_000, running: false, blank: false, cwd: '/tmp/fixture' },
+    { sessionId: sid('fx-alpha'), profileId: DEFAULT_PROFILE_ID, updatedAt: Date.now(), running: true, blank: false, cwd: '/tmp/fixture' },
+    { sessionId: sid('fx-beta'), profileId: DEFAULT_PROFILE_ID, updatedAt: Date.now() - 60_000, running: false, blank: false, parentSessionId: sid('fx-alpha'), cwd: '/tmp/fixture' },
+    { sessionId: sid('fx-gamma'), profileId: DEFAULT_PROFILE_ID, updatedAt: Date.now() - 120_000, running: false, blank: false, cwd: '/tmp/fixture' },
   ]
   const logs = new Map<SessionId, SessionEvent[]>([[sid('fx-alpha'), buildAlphaLog()]])
   const modelSelections = new Map<SessionId, ModelSelection>(sessions.map(session => [
@@ -2328,7 +2330,7 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
         const attachFailure = (
           sessionId: SessionId,
           workspaceId: WorkspaceId,
-        ): Promise<RpcResponse<{ sessionId: SessionId }>> => err(request, {
+        ): Promise<RpcResponse<{ sessionId: SessionId; profileId: ProfileId; agentPreset?: string }>> => err(request, {
           code: 'workspace-attach-failed' as const,
           message: `fixture rejected Workspace attachment for ${sessionId}`,
           details: { sessionId, workspaceId },
@@ -2347,18 +2349,18 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
               if (options.failWorkspaceAttach) return attachFailure(requestedId, workspace.workspaceId)
               attachWorkspace(requestedId)
             }
-            return ok(request, { sessionId: requestedId })
+            return ok(request, { sessionId: requestedId, profileId: existing.profileId })
           }
         }
         const created: SessionSummary = {
-          sessionId: requestedId ?? sid(`fx-${nextSession++}`), updatedAt: Date.now(), running: false, blank: true, cwd,
+          sessionId: requestedId ?? sid(`fx-${nextSession++}`), profileId: DEFAULT_PROFILE_ID, updatedAt: Date.now(), running: false, blank: true, cwd,
         }
         sessions.push(created)
         modelSelections.set(created.sessionId, { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
         attachedSessions += 1
         const emitSession = (): void => {
           // Mirrors the host: the frame fires at creation, so blank is constantly true.
-          emitHost({ type: 'host/session-added', sessionId: created.sessionId, blank: true, cwd })
+          emitHost({ type: 'host/session-added', sessionId: created.sessionId, profileId: created.profileId, blank: true, cwd })
         }
         if (workspace !== undefined && options.failWorkspaceAttach) {
           emitSession()
@@ -2372,7 +2374,7 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
           if (workspace !== undefined) attachWorkspace(created.sessionId)
         }
         if (options.dropSessionCreateResponse) throw new Error('fixture: dropped session.create response after publication')
-        return ok(request, { sessionId: created.sessionId })
+        return ok(request, { sessionId: created.sessionId, profileId: created.profileId })
       },
       rename: (request) => {
         const missing = requireSession(request)
@@ -2426,14 +2428,14 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
         let cut = boundary.seq + 1
         while (cut < log.length && log[cut]?.type !== 'turn/start') cut++
         const child: SessionSummary = {
-          sessionId: sid(`fx-${nextSession++}`), updatedAt: Date.now(), running: false, blank: false,
+          sessionId: sid(`fx-${nextSession++}`), profileId: source.profileId, updatedAt: Date.now(), running: false, blank: false,
           parentSessionId: sessionId,
           ...source.cwd === undefined ? {} : { cwd: source.cwd },
         }
         logs.set(child.sessionId, log.slice(0, cut))
         sessions.push(child)
         emitHost({
-          type: 'host/session-added', sessionId: child.sessionId, blank: false,
+          type: 'host/session-added', sessionId: child.sessionId, profileId: child.profileId, blank: false,
           parentSessionId: sessionId,
           ...source.cwd === undefined ? {} : { cwd: source.cwd },
         })

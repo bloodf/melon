@@ -9,7 +9,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {
-  RpcResult, SessionId, SubagentAddress,
+  ProfileId, RpcResult, SessionId, SubagentAddress,
 } from '@deepseek-ai/dsh-api-remotes/client'
 import type { HostObservable, SessionMaybeProvideInfo } from '@deepseek-ai/dsh-client-ui-slots'
 import type { AgentContext } from '../agents/scope.ts'
@@ -39,6 +39,8 @@ export interface ISessions {
    * @param id - session id (must exist in the list; unknown ids fail loud).
    */
   open(id: SessionId): void
+  /** Change visible profile without stopping background sessions. */
+  setProfile(profileId: ProfileId): void
   /**
    * Open a healthy catalog child through its exact direct-parent address.
    * @param address - catalog-derived parent and child ids.

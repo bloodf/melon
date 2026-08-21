@@ -1,6 +1,7 @@
 /** Test-owned sessions face: the SlotRegistry host contract over declarative fixtures. */
 import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import type { Context } from '@deepseek-ai/cordis'
+import type { ProfileId } from '@deepseek-ai/dsh-api-remotes/client'
 import type { AttachmentIdType } from '@deepseek-ai/dsh-attachment'
 import { createScope, scopeOf, SessionProvideChannel } from '@deepseek-ai/dsh-client-runtime/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
@@ -185,7 +186,7 @@ export class TestSessions implements ISessions {
 
   /** Calls observed on the service-level face, newest last. */
   readonly calls: {
-    method: 'open' | 'openSubagent' | 'setSubagentCatalogOpen' | 'refreshSubagents'
+    method: 'open' | 'openSubagent' | 'setProfile' | 'setSubagentCatalogOpen' | 'refreshSubagents'
       | 'clear' | 'search' | 'fork'
     args: unknown[]
   }[] = []
@@ -233,7 +234,7 @@ export class TestSessions implements ISessions {
       id,
       profileId: DEFAULT_PROFILE_ID,
       displayTitle: fixture.id,
-      profileId: DEFAULT_PROFILE_ID, running: false,
+      running: false,
       blank: false,
       updatedAt: this.records.size + 1,
       ...fixture.summary,
@@ -415,6 +416,10 @@ export class TestSessions implements ISessions {
     })
   }
 
+
+  setProfile(profileId: ProfileId): void {
+    this.calls.push({ method: 'setProfile', args: [profileId] })
+  }
   /** Open an existing fixture through its catalog address. */
   openSubagent(address: SubagentAddress): void {
     this.calls.push({ method: 'openSubagent', args: [address] })

@@ -149,6 +149,7 @@ export class SessionManager {
   private readonly jobsBySession = new Map<SessionId, readonly JobView[]>()
 
   private selected: SessionId | undefined
+  private selectedProfileId = 'default' as ProfileId
 
   private listSnapshotCache: SessionListSnapshot
   /** Entry-identity cache (reference stability): list rebuilds reuse the previous entry
@@ -175,6 +176,15 @@ export class SessionManager {
     if (restoredAddress !== undefined) this.addresses.set(restoredAddress.childSessionId, restoredAddress)
     this.listSnapshotCache = this.buildListSnapshot()
   }
+
+  /** Change visible profile without stopping or disposing background sessions. */
+  setProfile(profileId: ProfileId): void {
+    if (this.selectedProfileId === profileId) return
+    this.selectedProfileId = profileId
+    this.notifier.markDirty()
+  }
+
+  profileId(): ProfileId { return this.selectedProfileId }
 
   // ---- Selection ----
 
@@ -560,6 +570,7 @@ export class SessionManager {
         if (publishedSessionId !== undefined) {
           this.recordMutation({ kind: 'upsert', summary: {
             sessionId: publishedSessionId,
+            profileId: opts.profileId ?? 'default' as ProfileId,
             updatedAt: Date.now(),
             running: false,
             blank: true,
@@ -624,7 +635,8 @@ export class SessionManager {
    */
   noteAgentPreset(sessionId: SessionId, agentPreset: string): void {
     this.recordMutation({ kind: 'upsert', summary: {
-      sessionId, updatedAt: Date.now(), running: false, blank: true, agentPreset,
+      sessionId, profileId: this.summaries.find(s => s.sessionId === sessionId)?.profileId ?? 'default' as ProfileId,
+      updatedAt: Date.now(), running: false, blank: true, agentPreset,
     } })
   }
 
@@ -1024,9 +1036,8 @@ export class SessionManager {
   }
 
   private buildListSnapshot(): SessionListSnapshot {
-    const merged: TitledSessionSummary[] = this.summaries.map((summary) => {
-      // List rows read the generic 'title' projection key (host-computed unit
-      // value; there is no dedicated title frame).
+    const visible = this.summaries.filter(summary => summary.profileId === this.selectedProfileId)
+    const merged: TitledSessionSummary[] = visible.map((summary) => {
       const projectionStore = this.projectionStores.get(summary.sessionId)
       const title = projectionStore?.get('title')
       const projectionValues = projectionStore?.values()

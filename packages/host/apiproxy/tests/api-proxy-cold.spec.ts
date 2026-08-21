@@ -17,6 +17,7 @@ import { createUserMessage, MessageId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import type { SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import {
   PersistenceCoordinator,
   SessionPersistenceRevision,
@@ -35,7 +36,7 @@ function request<P>(payload: P): RpcRequest<P> {
 }
 
 function header(id: string, createdAt: number, extra: Partial<SessionHeader> = {}): SessionHeader {
-  return { version: 0, id: sid(id), createdAt, cwd: '/proj', ...extra }
+  return { version: 0, id: sid(id), createdAt, cwd: '/proj', profileId: DEFAULT_PROFILE_ID, ...extra }
 }
 
 describe('sessions.list cold merge', () => {

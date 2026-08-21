@@ -163,7 +163,7 @@ describe('unary round trip', () => {
     expect(seen?.payload).toEqual({ cursor: 'c1' })
     expect(seen?.rpcId).toBeTruthy()
     expect(response.rpcId).toBe(seen?.rpcId)
-    expect(response.result).toEqual({ ok: true, value: { items: [{ sessionId: 's1', updatedAt: 7, running: false, blank: false }] } })
+    expect(response.result).toEqual({ ok: true, value: { items: [{ sessionId: 's1', profileId: DEFAULT_PROFILE_ID, updatedAt: 7, running: false, blank: false }] } })
   })
 
   it('round-trips a trimmed session search query and its bounded result metadata', async () => {

@@ -553,7 +553,7 @@ describe('SessionPersistenceSqlite schema ownership', () => {
     const loose = new DatabaseSync(loosePath)
     loose.exec(testSql('create-loose-schema'))
     loose.close()
-    await expect(openDatabase(DatabaseSync, loosePath, 'wal', DEFAULT_BUSY_TIMEOUT_MS)).rejects.toThrow(/required schema objects/)
+    await expect(openDatabase(DatabaseSync, loosePath, 'wal', DEFAULT_BUSY_TIMEOUT_MS)).rejects.toThrow(/incompatible with this build/)
   })
 
   it('rejects schema ownership changes observed at mutation time', async () => {

@@ -81,7 +81,7 @@ export class FakeApiClient implements IApiClient {
   onCreate: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId; profileId: typeof DEFAULT_PROFILE_ID }>> = () => Promise.resolve(ok({ sessionId: 'fk-new' as SessionId, profileId: DEFAULT_PROFILE_ID }))
   readonly defaultModel: ModelSelection = { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
   onRename: (payload: unknown) => Promise<RpcResponse<{ title: string; seq: number }>> = () => Promise.resolve(ok({ title: 'fk-renamed', seq: 0 }))
-  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId; profileId: typeof DEFAULT_PROFILE_ID }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId, profileId: DEFAULT_PROFILE_ID }))
+  onFork: (payload: unknown) => Promise<RpcResponse<{ sessionId: SessionId }>> = () => Promise.resolve(ok({ sessionId: 'fk-fork' as SessionId }))
   onHistory: (payload: { sessionId: SessionId; beforeSeq?: number; maxMessages?: number })
   => Promise<RpcResponse<{ events: never[]; hasMore: boolean }>> =
     () => Promise.resolve(ok({ events: [], hasMore: false }))

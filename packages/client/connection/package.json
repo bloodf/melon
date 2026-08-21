@@ -32,6 +32,7 @@
   "dsh": {
     "client": {
       "inject": [],
+      "external": ["@deepseek-ai/dsh-scope"],
       "platform": "web",
       "immediately": true
     }

@@ -78,11 +78,11 @@ function props(
   } as unknown as SubagentCatalogActionProps
 }
 
-function summary(id: SessionId, profileId: DEFAULT_PROFILE_ID, updatedAt: number): SessionSummary {
+function summary(id: SessionId, updatedAt: number): SessionSummary {
   return {
     id,
     profileId: DEFAULT_PROFILE_ID, displayTitle: id,
-    profileId: DEFAULT_PROFILE_ID, running: false,
+    running: false,
     blank: false,
     updatedAt,
   }

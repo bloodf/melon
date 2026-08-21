@@ -11,8 +11,8 @@ import { createWorkspaceViewStore } from '../src/client/stores.ts'
 
 const sid = (id: string) => id as SessionId
 const wid = (id: string) => id as WorkspaceId
-const summary = (id: string, profileId: DEFAULT_PROFILE_ID, updatedAt: number, cwd?: string): SessionSummary => ({
-  id: sid(id), profileId: DEFAULT_PROFILE_ID, displayTitle: id, profileId: DEFAULT_PROFILE_ID, running: false, blank: false,
+const summary = (id: string, updatedAt: number, cwd?: string): SessionSummary => ({
+  id: sid(id), profileId: DEFAULT_PROFILE_ID, displayTitle: id, running: false, blank: false,
   updatedAt, ...(cwd === undefined ? {} : { cwd }),
 })
 const list = (...items: SessionSummary[]): SessionListState => ({
@@ -304,7 +304,7 @@ describe('deriveSearchResults', () => {
       items: [
         {
           id: titleHit.id,
-          profileId: DEFAULT_PROFILE_ID, title: 'Needle title',
+          title: 'Needle title',
           workspace: 'Alpha',
           running: false,
           runningSubagentCount: 0,
@@ -314,7 +314,7 @@ describe('deriveSearchResults', () => {
         },
         {
           id: workspaceHit.id,
-          profileId: DEFAULT_PROFILE_ID, title: 'Ordinary title',
+          title: 'Ordinary title',
           workspace: 'Needle Workspace',
           running: false,
           runningSubagentCount: 0,
@@ -322,7 +322,7 @@ describe('deriveSearchResults', () => {
         },
         {
           id: contentHit.id,
-          profileId: DEFAULT_PROFILE_ID, title: 'content-hit',
+          title: 'content-hit',
           workspace: 'c',
           running: false,
           runningSubagentCount: 0,

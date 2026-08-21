@@ -1,3 +1,4 @@
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import type { SessionId, WorkspaceId, WorkspaceView } from '@deepseek-ai/dsh-api-remotes/client'
@@ -255,7 +256,7 @@ describe('WorkspaceRuntime', () => {
     // Miss: beta has only a non-blank session → host create with workspaceId.
     api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh') , profileId: DEFAULT_PROFILE_ID }))
     await expect(workspaces.connectWorkspace(wid('beta'))).resolves.toBe('s-fresh')
-    expect(api.callsOf('session.create')).toEqual([{ workspaceId: 'beta' }])
+    expect(api.callsOf('session.create')).toEqual([{ workspaceId: 'beta', profileId: DEFAULT_PROFILE_ID }])
     // Same guarantee on the create arm (draft hand-off writes the machine pre-open).
     expect(sessions.binding(sid('s-fresh'))).toBeDefined()
 
@@ -263,7 +264,7 @@ describe('WorkspaceRuntime', () => {
     // never reused, a fresh accounted session is created instead.
     api.onCreate = () => Promise.resolve(ok({ sessionId: sid('s-fresh-3') , profileId: DEFAULT_PROFILE_ID }))
     await expect(workspaces.connectWorkspace(wid('gamma'))).resolves.toBe('s-fresh-3')
-    expect(api.callsOf('session.create')).toEqual([{ workspaceId: 'beta' }, { workspaceId: 'gamma' }])
+    expect(api.callsOf('session.create')).toEqual([{ workspaceId: 'beta', profileId: DEFAULT_PROFILE_ID }, { workspaceId: 'gamma', profileId: DEFAULT_PROFILE_ID }])
 
     // Unknown workspace fails loud instead of silently creating in nowhere.
     await expect(workspaces.connectWorkspace(wid('ghost'))).rejects.toThrow(/unknown workspace ghost/)
@@ -544,7 +545,7 @@ describe('startInitialSelection', () => {
     await b.sessions.refresh()
     // Store notifications and the connect round trip are microtask-batched.
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(b.api.callsOf('session.create')).toEqual([{ workspaceId: 'recent' }])
+    expect(b.api.callsOf('session.create')).toEqual([{ workspaceId: 'recent', profileId: DEFAULT_PROFILE_ID }])
     expect(b.sessions.list.getSnapshot().current).toBe('s-new')
     stop()
   })

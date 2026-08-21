@@ -4,7 +4,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { appendFile, mkdtemp, mkdir, rm, readFile, writeFile, readdir, stat, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { DEFAULT_PROFILE_ID, SessionId } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import {
@@ -950,7 +950,7 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
 
   it('a seq gap after the last turn/end bounds the preserved tail (torn fragment tolerated)', () => {
     const log = [
-      JSON.stringify({ type: 'session', version: 0, id: 'g', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'g', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
       JSON.stringify({ type: 'step/start', seq: 2, time: 2, data: { turn: 1, step: 1 } }), // gap: missing seq 1
     ].join('\n') + '\n'
@@ -962,7 +962,7 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
 
   it('rejects a seq gap BEFORE a later committed turn/end (committed data damaged)', () => {
     const log = [
-      JSON.stringify({ type: 'session', version: 0, id: 'g2', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'g2', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
       JSON.stringify({ type: 'step/start', seq: 2, time: 2, data: { turn: 1, step: 1 } }), // gap: missing seq 1
       JSON.stringify({ type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } }),
@@ -974,7 +974,7 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
 
   it('rejects a corrupt line BEFORE a later committed turn/end (committed data damaged)', () => {
     const log = [
-      JSON.stringify({ type: 'session', version: 0, id: 'c', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'c', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       '{not json', // corrupt, sits in the committed region (a turn/end follows)
       JSON.stringify({ type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } }),
     ].join('\n') + '\n'
@@ -982,7 +982,7 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
   })
 
   it('a header-only log (no event lines at all) preserves nothing — committedBytes is the header', () => {
-    const log = JSON.stringify({ type: 'session', version: 0, id: 'h0', createdAt: 1, delegationDepth: 0 }) + '\n'
+    const log = JSON.stringify({ type: 'session', version: 0, id: 'h0', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }) + '\n'
     const scanned = scanLog(Buffer.from(log))
     expect(scanned.events).toEqual([])
     // committedBytes falls back to the header line's end (no preserved events).
@@ -991,7 +991,7 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
 
   it('a corrupt line after the last turn/end bounds the preserved tail', () => {
     const log = [
-      JSON.stringify({ type: 'session', version: 0, id: 'c2', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'c2', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
       '{not json', // corrupt crash fragment, no turn/end committed
     ].join('\n') + '\n'
@@ -1002,7 +1002,7 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
 
   it('tolerates a seq gap AFTER a turn/end (uncommitted tail)', () => {
     const log = [
-      JSON.stringify({ type: 'session', version: 0, id: 't', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 't', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
       JSON.stringify({ type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } }),
       JSON.stringify({ type: 'step/start', seq: 9, time: 3, data: { turn: 2, step: 1 } }), // gap in uncommitted tail
@@ -1099,7 +1099,7 @@ describe('JsonlSessionPersistence: default packed chunk rows', () => {
     // file, hand-planted so this packed-config backend adopts it on load).
     await mkdir(sessionDir(root, '/work', m.id), { recursive: true })
     await writeFile(rawLogPath(root, '/work', m.id), [
-      JSON.stringify({ type: 'session', version: 0, id: 'mixed', createdAt: 1000, cwd: '/work', delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'mixed', createdAt: 1000, cwd: '/work', delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       ...log.map(e => JSON.stringify(e)),
     ].join('\n') + '\n')
     // Adopt the stored log (cursor = stored length), then append a second turn
@@ -1123,7 +1123,7 @@ describe('JsonlSessionPersistence: default packed chunk rows', () => {
 
   it('scanLog: a packed row advances the seq cursor by its whole run', () => {
     const logText = [
-      JSON.stringify({ type: 'session', version: 0, id: 'rows', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'rows', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
       JSON.stringify({ type: 'text-chunks', seq0: 1, time0: 2, data: { turn: 1, step: 1, index: 0, dt: [1, 1], texts: ['a', 'b', 'c'] } }),
       JSON.stringify({ type: 'turn/end', seq: 4, time: 5, data: { turn: 1, reason: { kind: 'completed' } } }),
@@ -1135,7 +1135,7 @@ describe('JsonlSessionPersistence: default packed chunk rows', () => {
 
   it('scanLog: a malformed packed row in the committed region rejects like corrupt JSON', () => {
     const logText = [
-      JSON.stringify({ type: 'session', version: 0, id: 'bad-row', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'bad-row', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       // dt arity mismatch — row validation throws, so the line is a committed hole.
       JSON.stringify({ type: 'text-chunks', seq0: 0, time0: 1, data: { turn: 1, step: 1, index: 0, dt: [], texts: ['a', 'b'] } }),
       JSON.stringify({ type: 'turn/end', seq: 2, time: 3, data: { turn: 1, reason: { kind: 'completed' } } }),
@@ -1145,7 +1145,7 @@ describe('JsonlSessionPersistence: default packed chunk rows', () => {
 
   it('scanLog: a packed row with a mid-run seq gap after the last turn/end drops the whole row', () => {
     const logText = [
-      JSON.stringify({ type: 'session', version: 0, id: 'row-gap', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'session', version: 0, id: 'row-gap', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID }),
       JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
       // seq0 skips 1 — the run's first member is already a gap; no turn/end follows.
       JSON.stringify({ type: 'text-chunks', seq0: 2, time0: 2, data: { turn: 1, step: 1, index: 0, dt: [1, 1], texts: ['a', 'b', 'c'] } }),
@@ -1290,7 +1290,7 @@ describe('JsonlSessionPersistence: edge cases', () => {
     // `readFirstLine` accumulates chunks before `list()` parses it.
     const id = SessionId('big')
     await mkdir(sessionDir(root, undefined, id), { recursive: true })
-    const bigHeader = JSON.stringify({ type: 'session', version: 0, id: 'big', createdAt: 1, delegationDepth: 0, pad: 'x'.repeat(9000) })
+    const bigHeader = JSON.stringify({ type: 'session', version: 0, id: 'big', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID, pad: 'x'.repeat(9000) })
     await writeFile(rawLogPath(root, undefined, id), bigHeader + '\n')
     const ids = (await ctx.sessionPersistence.list()).map(x => x.id)
     expect(ids).toContain('big')
@@ -1332,7 +1332,7 @@ describe('JsonlSessionPersistence: edge cases', () => {
     const dir = join(projectDir(root, undefined), 'invalid-id')
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, 'session.jsonl'), JSON.stringify({
-      type: 'session', version: 0, id: '', createdAt: 1, delegationDepth: 0,
+      type: 'session', version: 0, id: '', createdAt: 1, delegationDepth: 0, profileId: DEFAULT_PROFILE_ID,
     }) + '\n')
 
     await expect(ctx.sessionPersistence.list()).rejects.toThrow(/header id cannot name a storage path/)

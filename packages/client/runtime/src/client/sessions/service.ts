@@ -236,6 +236,11 @@ export class SessionRuntime implements ISessions {
    * reports the same number.
    */
   readonly searchResultLimit = SESSION_SEARCH_RESULT_LIMIT
+  /** Change visible profile while retaining every resident background session. */
+  setProfile(profileId: ProfileId): void {
+    this.manager.setProfile(profileId)
+    this.projectList()
+  }
   /** List snapshot store (list RPC + host stream increments; re-pulled on reconnect) — the useSessions standard feed, current included. */
   readonly list: SnapshotStore<SessionListState>
   /** The object-layer instance cluster and frame dispatch entry. */
@@ -485,7 +490,7 @@ export class SessionRuntime implements ISessions {
    * @throws {SessionCreateError} with the requested id.
    */
   async create(opts: { workspaceId?: WorkspaceId; cwd?: string; sessionId?: SessionId } = {}): Promise<SessionId> {
-    const result = await this.manager.create(opts)
+    const result = await this.manager.create({ ...opts, profileId: this.manager.profileId() })
     if (!result.ok) throw new SessionCreateError(result.error, opts.sessionId)
     this.projectList()
     return result.value.sessionId
@@ -702,6 +707,7 @@ export class SessionRuntime implements ISessions {
         if (summary === undefined) {
           byId[childId] = {
             id: childId,
+            profileId: byId[address.parentSessionId]?.profileId ?? 'default' as ProfileId,
             displayTitle,
             parentId: address.parentSessionId,
             origin: 'subagent',

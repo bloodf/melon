@@ -7,6 +7,7 @@
  * seeding, session/projection frame routing pre- and post-instantiation, the
  * list rows' title projection).
  */
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { describe, expect, it } from 'vitest'
 import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
 import { ProjectionValueStore } from '../src/client/sessions/projection-store.ts'

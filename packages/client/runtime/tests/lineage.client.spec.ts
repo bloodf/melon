@@ -8,8 +8,8 @@ import { describe, expect, it, vi } from 'vitest'
 import type { SessionId, SessionSummary } from '@deepseek-ai/dsh-api-remotes/client'
 import { flattenLineage } from '../src/client/sessions/lineage.ts'
 
-const s = (id: string, profileId: DEFAULT_PROFILE_ID, updatedAt: number, parent?: string): SessionSummary => ({
-  sessionId: id as SessionId, updatedAt, running: false, blank: false,
+const s = (id: string, updatedAt: number, parent?: string): SessionSummary => ({
+  sessionId: id as SessionId, profileId: DEFAULT_PROFILE_ID, updatedAt, running: false, blank: false,
   ...(parent !== undefined ? { parentSessionId: parent as SessionId } : {}),
 })
 

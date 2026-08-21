@@ -52,7 +52,7 @@ describe('instances', () => {
   it('retains every live answerable request and compacts resolutions before instantiation', () => {
     const api = new FakeApiClient()
     const manager = new SessionManager(api, fakeRemote())
-    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, profileId: DEFAULT_PROFILE_ID, blank: false } })
+    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, blank: false } })
     for (let i = 0; i < 40; i++) {
       manager.handleMuxEnvelope({ rpcId: `q${i}` as never, payload: { type: 'question/requested', sessionId: S1, questions: [] } })
     }
@@ -316,7 +316,7 @@ describe('host frame routing', () => {
     expect(manager.getListSnapshot().items).toHaveLength(1)
 
     const session = manager.get(S1)
-    manager.handleHostEnvelope({ rpcId: 'h3' as never, payload: { type: 'host/session-status', sessionId: S1, profileId: DEFAULT_PROFILE_ID, running: true } })
+    manager.handleHostEnvelope({ rpcId: 'h3' as never, payload: { type: 'host/session-status', sessionId: S1, running: true } })
     expect(session.getSnapshot().running).toBe(true)
     expect(manager.getListSnapshot().items[0]?.running).toBe(true)
 
@@ -383,7 +383,7 @@ describe('subagent catalogs', () => {
     const listCalls = api.callsOf('subagent.list').length
     manager.handleHostEnvelope({
       rpcId: 'child-complete' as never,
-      payload: { type: 'host/session-status', sessionId: S2, profileId: DEFAULT_PROFILE_ID, running: false },
+      payload: { type: 'host/session-status', sessionId: S2, running: false },
     })
     expect(manager.getListSnapshot().subagentsByParent[S1]?.entries[0]).toMatchObject({
       kind: 'child', id: S2, activity: 'inactive',
@@ -417,13 +417,13 @@ describe('subagent catalogs', () => {
       manager.handleHostEnvelope({
         rpcId: 'child-added' as never,
         payload: {
-          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S2, profileId: DEFAULT_PROFILE_ID, parentSessionId: S1, blank: false,
+          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S2, parentSessionId: S1, blank: false,
         },
       })
       manager.handleHostEnvelope({
         rpcId: 'child-added-again' as never,
         payload: {
-          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: 'fk-m3' as SessionId, profileId: DEFAULT_PROFILE_ID, parentSessionId: S1, blank: false,
+          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: 'fk-m3' as SessionId, parentSessionId: S1, blank: false,
         },
       })
       await vi.advanceTimersByTimeAsync(50)
@@ -433,7 +433,7 @@ describe('subagent catalogs', () => {
       manager.handleHostEnvelope({
         rpcId: 'child-added-closed' as never,
         payload: {
-          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: 'fk-m4' as SessionId, profileId: DEFAULT_PROFILE_ID, parentSessionId: S1, blank: false,
+          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: 'fk-m4' as SessionId, parentSessionId: S1, blank: false,
         },
       })
       await vi.advanceTimersByTimeAsync(50)
@@ -466,14 +466,14 @@ describe('subagent catalogs', () => {
       rpcId: 'nested-subagent' as never,
       payload: {
         type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: 'fk-grandchild' as SessionId,
-        profileId: DEFAULT_PROFILE_ID, parentSessionId: S1, origin: 'subagent', blank: false,
+        parentSessionId: S1, origin: 'subagent', blank: false,
       },
     })
     manager.handleHostEnvelope({
       rpcId: 'ordinary-fork' as never,
       payload: {
         type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: 'fk-fork' as SessionId,
-        profileId: DEFAULT_PROFILE_ID, parentSessionId: S2, blank: false,
+        parentSessionId: S2, blank: false,
       },
     })
 
@@ -495,7 +495,7 @@ describe('subagent catalogs', () => {
       rpcId: 'nested-subagent' as never,
       payload: {
         type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: 'fk-grandchild' as SessionId,
-        profileId: DEFAULT_PROFILE_ID, parentSessionId: S1, origin: 'subagent', blank: false,
+        parentSessionId: S1, origin: 'subagent', blank: false,
       },
     })
     response.resolve(ok({
@@ -534,11 +534,11 @@ describe('subagent catalogs', () => {
 
     manager.handleHostEnvelope({
       rpcId: 'child-stopped' as never,
-      payload: { type: 'host/session-status', sessionId: S1, profileId: DEFAULT_PROFILE_ID, running: false },
+      payload: { type: 'host/session-status', sessionId: S1, running: false },
     })
     manager.handleHostEnvelope({
       rpcId: 'child-started' as never,
-      payload: { type: 'host/session-status', sessionId: S2, profileId: DEFAULT_PROFILE_ID, running: true },
+      payload: { type: 'host/session-status', sessionId: S2, running: true },
     })
     response.resolve(ok({
       entries: [
@@ -617,7 +617,7 @@ describe('subagent catalogs', () => {
       manager.handleHostEnvelope({
         rpcId: 'child-added' as never,
         payload: {
-          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S2, profileId: DEFAULT_PROFILE_ID, parentSessionId: root, blank: false,
+          type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S2, parentSessionId: root, blank: false,
         },
       })
       await vi.advanceTimersByTimeAsync(50)
@@ -802,14 +802,14 @@ describe('remaining branches', () => {
 
     manager.handleHostEnvelope({
       rpcId: 'published-later' as never,
-      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, blank: true, sessionId: S1, profileId: DEFAULT_PROFILE_ID, cwd: '/w/one' },
+      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, blank: true, sessionId: S1, cwd: '/w/one' },
     })
     expect(manager.getListSnapshot().items).toEqual([
       expect.objectContaining({ sessionId: S1, profileId: DEFAULT_PROFILE_ID, cwd: '/w/one' }),
     ])
     manager.handleHostEnvelope({
       rpcId: 'duplicate-frame' as never,
-      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, blank: true, sessionId: S1, profileId: DEFAULT_PROFILE_ID, cwd: '/w/one' },
+      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, blank: true, sessionId: S1, cwd: '/w/one' },
     })
     expect(manager.getListSnapshot().items).toHaveLength(1)
   })
@@ -839,7 +839,7 @@ describe('remaining branches', () => {
     manager.handleMuxEnvelope({ rpcId: 'q1' as never, payload: { type: 'question/requested', sessionId: S1, questions: [] } })
     expect(session.getSnapshot().pending).toMatchObject([{ kind: 'question' }])
     // status flip for an unknown session only touches summaries (no crash).
-    manager.handleHostEnvelope({ rpcId: 'h9' as never, payload: { type: 'host/session-status', sessionId: S2, profileId: DEFAULT_PROFILE_ID, running: true } })
+    manager.handleHostEnvelope({ rpcId: 'h9' as never, payload: { type: 'host/session-status', sessionId: S2, running: true } })
     manager.handleHostEnvelope({ rpcId: 'ha' as never, payload: { type: 'host/agent-error', sessionId: S2, message: '无实例' } })
   })
 
@@ -849,7 +849,7 @@ describe('remaining branches', () => {
     const manager = new SessionManager(api, fakeRemote())
     await manager.refreshList()
     const before = manager.getListSnapshot()
-    manager.handleHostEnvelope({ rpcId: 'h' as never, payload: { type: 'host/session-status', sessionId: S2, profileId: DEFAULT_PROFILE_ID, running: true } })
+    manager.handleHostEnvelope({ rpcId: 'h' as never, payload: { type: 'host/session-status', sessionId: S2, running: true } })
     const after = manager.getListSnapshot()
     expect(after.items).not.toBe(before.items)
     const beforeS1 = before.items.find(e => e.sessionId === S1)
@@ -868,7 +868,7 @@ describe('remaining branches', () => {
       rpcId: 'h2' as never,
       payload: {
         type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, blank: true, sessionId: S2,
-        profileId: DEFAULT_PROFILE_ID, parentSessionId: S1, origin: 'subagent',
+        parentSessionId: S1, origin: 'subagent',
       },
     })
     const items = manager.getListSnapshot().items
@@ -918,7 +918,7 @@ describe('connected generation', () => {
 describe('pending-interaction list status', () => {
   it('tracks approval requests through replay and resolution without instantiation', () => {
     const manager = new SessionManager(new FakeApiClient(), fakeRemote())
-    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, profileId: DEFAULT_PROFILE_ID, blank: false } })
+    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, blank: false } })
     expect(manager.getListSnapshot().items[0]?.pendingInteraction).toBeUndefined()
     manager.handleMuxEnvelope({ rpcId: 'ra' as never, payload: { type: 'approval/requested', sessionId: S1, approvalId: 'ap1' as never, toolName: 'rm' } })
     expect(manager.getListSnapshot().items[0]?.pendingInteraction).toBe('approval')
@@ -931,7 +931,7 @@ describe('pending-interaction list status', () => {
 
   it('classifies ordinary questions and renderable plan reviews, then clears by question rpcId', () => {
     const manager = new SessionManager(new FakeApiClient(), fakeRemote())
-    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, profileId: DEFAULT_PROFILE_ID, blank: false } })
+    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, blank: false } })
     manager.handleMuxEnvelope({
       rpcId: 'q1' as never,
       payload: { type: 'question/requested', sessionId: S1, questions: [{ id: 'name', question: 'Name?' }] },
@@ -964,7 +964,7 @@ describe('pending-interaction list status', () => {
     ['missing approve option', { detail: '# Plan', options: [{ label: 'Refuse' }] }],
   ])('keeps an unrenderable %s plan intent on the ordinary question flow', (_name, over) => {
     const manager = new SessionManager(new FakeApiClient(), fakeRemote())
-    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, profileId: DEFAULT_PROFILE_ID, blank: false } })
+    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, blank: false } })
     manager.handleMuxEnvelope({
       rpcId: 'q-plan' as never,
       payload: {
@@ -981,7 +981,7 @@ describe('pending-interaction list status', () => {
 
   it('the first question outranks sibling approvals and resolving it reveals the remaining wait', () => {
     const manager = new SessionManager(new FakeApiClient(), fakeRemote())
-    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, profileId: DEFAULT_PROFILE_ID, blank: false } })
+    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, blank: false } })
     manager.handleMuxEnvelope({ rpcId: 'r1' as never, payload: { type: 'approval/requested', sessionId: S1, approvalId: 'a1' as never, toolName: 'rm' } })
     manager.handleMuxEnvelope({
       rpcId: 'q1' as never,
@@ -1000,7 +1000,7 @@ describe('pending-interaction list status', () => {
 
   it('drops stale status at generation death before replay re-adds live interactions', () => {
     const manager = new SessionManager(new FakeApiClient(), fakeRemote())
-    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, profileId: DEFAULT_PROFILE_ID, blank: false } })
+    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, blank: false } })
     manager.handleMuxEnvelope({ rpcId: 'ra' as never, payload: { type: 'approval/requested', sessionId: S1, approvalId: 'ap1' as never, toolName: 'rm' } })
     expect(manager.getListSnapshot().items[0]?.pendingInteraction).toBe('approval')
     // Generation death clears (resolved-while-disconnected questions send no frame)…
@@ -1015,7 +1015,7 @@ describe('pending-interaction list status', () => {
 
   it('generation death drops buffered answerable frames (a dead generation cannot be answered)', () => {
     const manager = new SessionManager(new FakeApiClient(), fakeRemote())
-    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, profileId: DEFAULT_PROFILE_ID, blank: false } })
+    manager.handleHostEnvelope({ rpcId: 'h1' as never, payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: S1, blank: false } })
     // Buffered pre-instantiation: an approval pair and a queued row.
     manager.handleMuxEnvelope({ rpcId: 'ra' as never, payload: { type: 'approval/requested', sessionId: S1, approvalId: 'ap1' as never, toolName: 'rm' } })
     manager.handleMuxEnvelope({ rpcId: 'q1' as never, payload: { type: 'question/requested', sessionId: S1, questions: [] } })
@@ -1029,13 +1029,13 @@ describe('pending-interaction list status', () => {
 })
 
 describe('completed reminder', () => {
-  const status = (rpcId: string, sessionId: SessionId, profileId: DEFAULT_PROFILE_ID, running: boolean) => ({
+  const status = (rpcId: string, sessionId: SessionId, running: boolean) => ({
     rpcId: rpcId as never,
     payload: { type: 'host/session-status' as const, sessionId, running },
   })
   const added = (rpcId: string, sessionId: SessionId) => ({
     rpcId: rpcId as never,
-    payload: { type: 'host/session-added' as const, sessionId, blank: false },
+    payload: { type: 'host/session-added' as const, profileId: DEFAULT_PROFILE_ID, sessionId, blank: false },
   })
   const entry = (manager: SessionManager, sessionId: SessionId) =>
     manager.getListSnapshot().items.find(item => item.sessionId === sessionId)

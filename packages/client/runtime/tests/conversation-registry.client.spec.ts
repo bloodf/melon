@@ -143,7 +143,7 @@ describe('Conversation registries', () => {
     const api = new FakeApiClient()
     const sessionId = 'resident' as SessionId
     api.onList = () => Promise.resolve(ok({
-      items: [{ sessionId, updatedAt: 1, running: false, blank: true }],
+      items: [{ sessionId, profileId: 'default', updatedAt: 1, running: false, blank: true }],
     }) as never)
     const sessions = new SessionRuntime(ctx, api, fakeRemote())
     await sessions.refresh()

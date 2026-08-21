@@ -37,6 +37,7 @@ import { approvalRequestIdSchema, approvalResponsePayloadSchema } from '../src/a
 import { askUserQuestionAnswerSchema, questionResponsePayloadSchema } from '../src/api/questions.schema.ts'
 import { goalEditRequestSchema } from '../src/api/goals.schema.ts'
 import { subagentPromptRequestSchema } from '../src/api/subagents.schema.ts'
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 
 describe('RpcId', () => {
   it('brands a raw string at zero runtime cost', () => {
@@ -138,8 +139,8 @@ describe('sessions domain schemas', () => {
   it('validates ids, summaries, and the event passthrough envelope', () => {
     expect(sessionIdSchema.parse('s1')).toBe('s1')
     expect(() => sessionIdSchema.parse('')).toThrow()
-    expect(sessionSummarySchema.parse({ sessionId: 's1', updatedAt: 1, running: false, blank: true })).toMatchObject({ sessionId: 's1', blank: true })
-    expect(sessionSummarySchema.parse({ sessionId: 's1', updatedAt: 1, running: true, blank: false, parentSessionId: 'p', cwd: '/x' }).cwd).toBe('/x')
+    expect(sessionSummarySchema.parse({ sessionId: 's1', profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: false, blank: true })).toMatchObject({ sessionId: 's1', blank: true })
+    expect(sessionSummarySchema.parse({ sessionId: 's1', profileId: DEFAULT_PROFILE_ID, updatedAt: 1, running: true, blank: false, parentSessionId: 'p', cwd: '/x' }).cwd).toBe('/x')
     // blank is mandatory: a summary without it fails the parse.
     expect(() => sessionSummarySchema.parse({ sessionId: 's1', updatedAt: 1, running: false })).toThrow()
     const event = sessionEventSchema.parse({
@@ -195,7 +196,7 @@ describe('sessions domain schemas', () => {
     // The refine's both-sides branch: workspaceId alone passes, workspaceId+cwd rejects.
     expect(sessionCreateRequestSchema.parse({ workspaceId: 'w1', sessionId: 's1' }).sessionId).toBe('s1')
     expect(() => sessionCreateRequestSchema.parse({ workspaceId: 'w1', cwd: '/w' })).toThrow(/not both/)
-    expect(sessionCreateValueSchema.parse({ sessionId: 's1' }).sessionId).toBe('s1')
+    expect(sessionCreateValueSchema.parse({ sessionId: 's1', profileId: DEFAULT_PROFILE_ID }).sessionId).toBe('s1')
     expect(sessionHistoryRequestSchema.parse({ sessionId: 's1', beforeSeq: 3, maxMessages: 5 }).beforeSeq).toBe(3)
     expect(() => sessionHistoryRequestSchema.parse({ sessionId: 's1', maxMessages: 0 })).toThrow()
     expect(sessionHistoryValueSchema.parse({
@@ -515,8 +516,8 @@ describe('events frame schemas', () => {
 
   it('accepts every host frame branch', () => {
     const frames = [
-      { type: 'host/session-added', sessionId: 's', blank: true, parentSessionId: 'p' },
-      { type: 'host/session-added', sessionId: 's', blank: true },
+      { type: 'host/session-added', sessionId: 's', profileId: DEFAULT_PROFILE_ID, blank: true, parentSessionId: 'p' },
+      { type: 'host/session-added', sessionId: 's', profileId: DEFAULT_PROFILE_ID, blank: true },
       { type: 'host/session-removed', sessionId: 's' },
       { type: 'host/session-status', sessionId: 's', running: true },
       { type: 'host/agent-error', sessionId: 's', message: 'boom' },

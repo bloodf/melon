@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, createEvent, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-test-runtime'
@@ -22,8 +23,12 @@ const t: WorkspaceBrowserProps['t'] = makeTranslate(zh, commonZh)
 
 const sid = (id: string) => id as SessionId
 const wid = (id: string) => id as WorkspaceId
-const summary = (id: string, updatedAt: number, overrides: Partial<SessionSummary> = {}): SessionSummary => ({
-  id: sid(id), displayTitle: id, running: false, blank: false, updatedAt, ...overrides,
+const summary = (
+  id: string,
+  updatedAt: number,
+  { profileId = DEFAULT_PROFILE_ID, ...overrides }: Partial<SessionSummary> = {},
+): SessionSummary => ({
+  id: sid(id), profileId, displayTitle: id, running: false, blank: false, updatedAt, ...overrides,
 })
 const sessionState = (items: readonly SessionSummary[], overrides: Partial<SessionListState> = {}): SessionListState => ({
   ids: items.map(item => item.id),

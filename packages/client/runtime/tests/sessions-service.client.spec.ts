@@ -6,6 +6,7 @@
  * deferral — the stage follows list.current), binding identity, breadcrumb
  * projection, create.
  */
+import { DEFAULT_PROFILE_ID } from '@deepseek-ai/dsh-session'
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
@@ -60,8 +61,8 @@ describe('list store projection', () => {
       payload: { type: 'session/projection', sessionId: sid('s1'), key: 'title', value: 'Durable title', seq: 2 } as never,
     })
     await feedList(b, [
-      { id: 's1', profileId: DEFAULT_PROFILE_ID, cwd: '/home/u/proj-a/' },
-      { id: 's2', profileId: DEFAULT_PROFILE_ID, parentId: 's1', origin: 'subagent', running: true },
+      { id: 's1', cwd: '/home/u/proj-a/' },
+      { id: 's2', parentId: 's1', origin: 'subagent', running: true },
     ])
     const state = b.svc.list.getSnapshot()
     expect(state.ids).toEqual(['s1', 's2'])
@@ -74,7 +75,7 @@ describe('list store projection', () => {
 
   it('reprojects a blank session whose composition switched and nothing else moved', async () => {
     const b = bench()
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, blank: true, agentPreset: 'standard' }])
+    await feedList(b, [{ id: 's1', blank: true, agentPreset: 'standard' }])
     expect(b.svc.list.getSnapshot().byId[sid('s1')]?.agentPreset).toBe('standard')
 
     // A confirmed switch moves the preset alone: the row keeps its updatedAt,
@@ -155,9 +156,9 @@ describe('scope tree', () => {
 
   it('keeps the scope when the session merely stops running (frozen ≠ removed)', async () => {
     const b = bench()
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, running: true }])
+    await feedList(b, [{ id: 's1', running: true }])
     const scoped = b.svc.scope(sid('s1'))
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, running: false }])
+    await feedList(b, [{ id: 's1', running: false }])
     expect(b.svc.scope(sid('s1'))).toBe(scoped)
   })
 
@@ -405,8 +406,8 @@ describe('catalog-addressed navigation', () => {
     }
     await feedList(b, [
       { id: 'root' },
-      { id: 'child', profileId: DEFAULT_PROFILE_ID, cwd: '/summary-child', parentId: 'root', origin: 'subagent' },
-      { id: 'grandchild', profileId: DEFAULT_PROFILE_ID, cwd: '/summary-grandchild', parentId: 'child', origin: 'subagent' },
+      { id: 'child', cwd: '/summary-child', parentId: 'root', origin: 'subagent' },
+      { id: 'grandchild', cwd: '/summary-grandchild', parentId: 'child', origin: 'subagent' },
     ])
     await b.svc.refreshSubagents(sid('root'))
     await b.svc.refreshSubagents(sid('child'))
@@ -469,7 +470,7 @@ describe('create', () => {
     const b = bench()
     b.api.onCreate = () => Promise.resolve(ok({ sessionId: sid('fresh') , profileId: DEFAULT_PROFILE_ID }))
     await expect(b.svc.create({ cwd: '/w', sessionId: sid('fresh') })).resolves.toBe('fresh')
-    expect(b.api.callsOf('session.create')).toEqual([{ cwd: '/w', sessionId: 'fresh' }])
+    expect(b.api.callsOf('session.create')).toEqual([{ cwd: '/w', sessionId: 'fresh', profileId: DEFAULT_PROFILE_ID }])
     b.api.onCreate = () => Promise.resolve({
       rpcId: 'e' as never,
       result: { ok: false as const, error: { code: 'internal' as const, message: '爆了', details: {} } },
@@ -532,8 +533,8 @@ describe('fork', () => {
       rpcId: 'source-title' as never,
       payload: { type: 'session/projection', sessionId: sid('source'), key: 'title', value: sourceTitle, seq: 2 } as never,
     })
-    await feedList(b, [{ id: 'source', profileId: DEFAULT_PROFILE_ID, cwd: '/work' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') , profileId: DEFAULT_PROFILE_ID }))
+    await feedList(b, [{ id: 'source', cwd: '/work' }])
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
     b.api.onRename = (payload) => {
       const { title } = payload as { title: string }
       return Promise.resolve(ok({ title, seq: 3 }))
@@ -555,8 +556,8 @@ describe('fork', () => {
 
   it('floors a fractional anchor to the real event seq the wire accepts', async () => {
     const b = bench()
-    await feedList(b, [{ id: 'source', profileId: DEFAULT_PROFILE_ID, cwd: '/work' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') , profileId: DEFAULT_PROFILE_ID }))
+    await feedList(b, [{ id: 'source', cwd: '/work' }])
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
 
     // The frozen node of an interrupted turn carries turnEnd.seq - 0.9.
     await expect(b.svc.fork({ sessionId: sid('source'), atSeq: 41.1 })).resolves.toBe('child')
@@ -566,12 +567,12 @@ describe('fork', () => {
 
   it('does not rename without the title policy or a durable source title', async () => {
     const b = bench()
-    await feedList(b, [{ id: 'source', profileId: DEFAULT_PROFILE_ID, cwd: '/work' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') , profileId: DEFAULT_PROFILE_ID }))
+    await feedList(b, [{ id: 'source', cwd: '/work' }])
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
     await expect(b.svc.fork({ sessionId: sid('source'), increaseTitle: true })).resolves.toBe('child')
     expect(b.api.callsOf('session.rename')).toEqual([])
 
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child-2') , profileId: DEFAULT_PROFILE_ID }))
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child-2') }))
     await expect(b.svc.fork({ sessionId: sid('source') })).resolves.toBe('child-2')
     expect(b.api.callsOf('session.rename')).toEqual([])
   })
@@ -583,7 +584,7 @@ describe('fork', () => {
       payload: { type: 'session/projection', sessionId: sid('source'), key: 'title', value: 'Roadmap', seq: 2 } as never,
     })
     await feedList(b, [{ id: 'source' }])
-    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') , profileId: DEFAULT_PROFILE_ID }))
+    b.api.onFork = () => Promise.resolve(ok({ sessionId: sid('child') }))
     b.api.onRename = () => Promise.resolve(err({
       code: 'title-invalid', message: 'rejected', details: { sessionId: sid('child') },
     }))
@@ -601,7 +602,7 @@ describe('scope lifecycle rides the list mirror (entity parity: no client-side p
     expect(b.svc.scope(sid('s-new'))).toBeUndefined() // not in view: no scope, no exceptions
     b.svc.handleHostEnvelope({
       rpcId: 'add' as never,
-      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: sid('s-new'), profileId: DEFAULT_PROFILE_ID, blank: true, cwd: '/w/a' } as never,
+      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: sid('s-new'), blank: true, cwd: '/w/a' } as never,
     })
     await Promise.resolve()
     const scoped = b.svc.scope(sid('s-new'))
@@ -619,11 +620,11 @@ describe('scope lifecycle rides the list mirror (entity parity: no client-side p
 describe('blank mirror', () => {
   it('flips blank=false from the running:true status frame (cross-client conversion)', async () => {
     const b = bench()
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, blank: true }])
+    await feedList(b, [{ id: 's1', blank: true }])
     expect(b.svc.list.getSnapshot().byId[sid('s1')]).toMatchObject({ blank: true })
     b.svc.handleHostEnvelope({
       rpcId: 'st' as never,
-      payload: { type: 'host/session-status', sessionId: sid('s1'), profileId: DEFAULT_PROFILE_ID, running: true },
+      payload: { type: 'host/session-status', sessionId: sid('s1'), running: true },
     })
     await Promise.resolve()
     expect(b.svc.list.getSnapshot().byId[sid('s1')]).toMatchObject({ blank: false, running: true })
@@ -633,7 +634,7 @@ describe('blank mirror', () => {
 
   it('flips blank=false on prompt ACCEPTANCE, not on the attempt', async () => {
     const b = bench()
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, blank: true, cwd: '/w/a' }])
+    await feedList(b, [{ id: 's1', blank: true, cwd: '/w/a' }])
     const session = b.svc.binding(sid('s1'))!.session
     expect(session.getSnapshot().blank).toBe(true)
     const gate = deferred<Awaited<ReturnType<FakeApiClient['onPrompt']>>>()
@@ -651,7 +652,7 @@ describe('blank mirror', () => {
 
   it('keeps a rejected first prompt blank: hidden and still reusable', async () => {
     const b = bench()
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, blank: true, cwd: '/w/a' }])
+    await feedList(b, [{ id: 's1', blank: true, cwd: '/w/a' }])
     const session = b.svc.binding(sid('s1'))!.session
     b.api.onPrompt = () => Promise.resolve({
       rpcId: 'busy' as never,
@@ -671,24 +672,24 @@ describe('blank mirror', () => {
     await feedList(b, [])
     b.svc.handleHostEnvelope({
       rpcId: 'add' as never,
-      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: sid('s-new'), profileId: DEFAULT_PROFILE_ID, blank: true, cwd: '/w/a' } as never,
+      payload: { type: 'host/session-added', profileId: DEFAULT_PROFILE_ID, sessionId: sid('s-new'), blank: true, cwd: '/w/a' } as never,
     })
     await Promise.resolve()
     expect(b.svc.list.getSnapshot().byId[sid('s-new')]).toMatchObject({ blank: true })
     // Reconnect re-pull: the summary's blank=false wins (authoritative alignment).
-    await feedList(b, [{ id: 's-new', profileId: DEFAULT_PROFILE_ID, blank: false, cwd: '/w/a' }])
+    await feedList(b, [{ id: 's-new', blank: false, cwd: '/w/a' }])
     expect(b.svc.list.getSnapshot().byId[sid('s-new')]).toMatchObject({ blank: false })
   })
 
   it('never re-blanks: a stale blank=true summary cannot hide an engaged session', async () => {
     const b = bench()
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, blank: true }])
+    await feedList(b, [{ id: 's1', blank: true }])
     const session = b.svc.binding(sid('s1'))!.session
     await session.prompt([{ type: 'text', text: 'hi' }], 'queue')
     await Promise.resolve()
     expect(b.svc.list.getSnapshot().byId[sid('s1')]).toMatchObject({ blank: false })
     // The next list pull still claims blank (host hasn't logged the message yet).
-    await feedList(b, [{ id: 's1', profileId: DEFAULT_PROFILE_ID, blank: true }])
+    await feedList(b, [{ id: 's1', blank: true }])
     expect(b.svc.binding(sid('s1'))?.session.getSnapshot().blank).toBe(false)
   })
 })
@@ -696,7 +697,7 @@ describe('blank mirror', () => {
 describe('coverage tails (branch duals)', () => {
   it('displayTitleOf falls back to the id for empty and separator-only cwd', async () => {
     const b = bench()
-    await feedList(b, [{ id: 'no-base', profileId: DEFAULT_PROFILE_ID, cwd: '///' }, { id: 'empty-cwd', profileId: DEFAULT_PROFILE_ID, cwd: '' }])
+    await feedList(b, [{ id: 'no-base', cwd: '///' }, { id: 'empty-cwd', cwd: '' }])
     const { byId } = b.svc.list.getSnapshot()
     expect(byId[sid('no-base')]?.displayTitle).toBe('no-base')
     expect(byId[sid('empty-cwd')]?.displayTitle).toBe('empty-cwd')
