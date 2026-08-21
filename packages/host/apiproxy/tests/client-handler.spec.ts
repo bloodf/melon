@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import { DEFAULT_PROFILE_ID, type SessionId } from '@deepseek-ai/dsh-session'
 import type { ApiProxy, GoalRef, HostFrame, MuxFrame, RpcMessage, RpcRequest, RpcResponse } from '@deepseek-ai/dsh-host-apiproxy'
 import { InProcessApiClient, RpcId, toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 
@@ -37,7 +37,7 @@ function scriptedApi(overrides: {
     sessions: {
       list: r => ok(r, { items: [] }),
       search: r => ok(r, { items: [], hasMore: false }),
-      create: r => ok(r, { sessionId: sid('s-new') }),
+      create: r => ok(r, { sessionId: sid('s-new'), profileId: DEFAULT_PROFILE_ID }),
       history: r => ok(r, {
         events: [],
         hasMore: false,
@@ -154,7 +154,7 @@ describe('unary round trip', () => {
       sessions: {
         list: (r) => {
           seen = r
-          return ok(r, { items: [{ sessionId: sid('s1'), updatedAt: 7, running: false, blank: false }] })
+          return ok(r, { items: [{ sessionId: sid('s1'), profileId: DEFAULT_PROFILE_ID, updatedAt: 7, running: false, blank: false }] })
         },
       },
     })
@@ -493,7 +493,7 @@ describe('SSE stream path', () => {
     const api = scriptedApi({
       events: {
         async *host(request): AsyncGenerator<RpcRequest<HostFrame>> {
-          yield { rpcId: RpcId(`p-${request.rpcId}`), payload: { type: 'host/session-added', sessionId: sid('s1'), blank: true } }
+          yield { rpcId: RpcId(`p-${request.rpcId}`), payload: { type: 'host/session-added', sessionId: sid('s1'), profileId: DEFAULT_PROFILE_ID, blank: true } }
           throw new Error('impl died mid-stream')
         },
       },
